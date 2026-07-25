@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.subNets import BertTextEncoder
-from models.subNets.transformer import TransformerEncoder
+from models.subNets1 import BertTextEncoder
+from models.subNets1.transformer import TransformerEncoder
 
 
 class DistributionEncoder(nn.Module):
