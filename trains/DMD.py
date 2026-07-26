@@ -85,7 +85,7 @@ class DMD():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.sim_loss = HingeLoss()
+        # self.sim_loss = HingeLoss()
 
     def do_train(self, model, dataloader, return_epoch_results=False):
 
@@ -230,7 +230,7 @@ class DMD():
                         ids.append(labels[i].view(1, -1))
                     feats = torch.cat(feats, dim=0)
                     ids = torch.cat(ids, dim=0)
-                    loss_sim = self.sim_loss(ids, feats)
+                    # loss_sim = self.sim_loss(ids, feats)
 
                     # homo GD loss
                     loss_reg_homo, loss_logit_homo, loss_repr_homo = \
@@ -242,10 +242,13 @@ class DMD():
                         model[2].distillation_loss(logits_hetero, reprs_hetero, edges_hetero)
                     graph_distill_loss_hetero = 0.05 * (loss_logit_hetero + loss_repr_hetero + loss_reg_hetero)
 
+                    # combined_loss = loss_task + \
+                    #                 graph_distill_loss_homo + graph_distill_loss_hetero + \
+                    #                 (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
+
                     combined_loss = loss_task + \
                                     graph_distill_loss_homo + graph_distill_loss_hetero + \
-                                    (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
-
+                                    (loss_s_sr + loss_recon + (loss_ort) * 0.1) * 0.1
                     combined_loss.backward()
 
 
