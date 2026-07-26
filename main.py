@@ -11,7 +11,7 @@ import torch
 
 from config import get_config_regression, normalize_dataset_name
 from data_loader import MMDataLoader
-from trains.ATIO import ATIO, DecAlignTrainer, MISA
+from trains.ATIO import ATIO
 from utils import assign_gpu, count_parameters, setup_seed
 from models import build_model
 
@@ -131,6 +131,8 @@ def DMD_run(
             
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
     args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
+
+    # Running results
     res_save_dir = Path(res_save_dir) / "normal"
     res_save_dir.mkdir(parents=True, exist_ok=True)
     model_results = []

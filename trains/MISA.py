@@ -32,12 +32,14 @@ class MISA():
             }
         min_or_max = 'min' if self.args.KeyEval in ['Loss'] else 'max'
         best_valid = 1e8 if min_or_max == 'min' else 0
+
         while True: 
             epochs += 1
             # train
             y_pred, y_true = [], []
             losses = []
             model.train()
+            
             train_loss = 0.0
             left_epochs = self.args.update_epochs
             with tqdm(dataloader['train']) as td:

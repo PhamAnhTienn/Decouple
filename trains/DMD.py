@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-from ..utils import MetricsTop, dict_to_str
+from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
 
@@ -95,7 +95,7 @@ class DMD():
                  list(model[2].parameters())
 
         optimizer = optim.Adam(params, lr=self.args.learning_rate)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, verbose=True, patience=self.args.patience)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=self.args.patience)
 
         epochs, best_epoch = 0, 0
         if return_epoch_results:
@@ -126,7 +126,6 @@ class DMD():
             left_epochs = self.args.update_epochs
             with tqdm(dataloader['train']) as td:
                 for batch_data in td:
-
                     if left_epochs == self.args.update_epochs:
                         optimizer.zero_grad()
                     left_epochs -= 1
@@ -134,7 +133,10 @@ class DMD():
                     audio = batch_data['audio'].to(self.args.device)
                     text = batch_data['text'].to(self.args.device)
                     labels = batch_data['labels']['M'].to(self.args.device)
-                    labels = labels.view(-1, 1)
+                    if self.args.train_mode == 'classification':
+                        labels = labels.view(-1).long()
+                    else:
+                        labels = labels.view(-1, 1)
 
                     logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
@@ -196,12 +198,21 @@ class DMD():
                     loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
 
                     # ort loss
-                    cosine_similarity_s_c_l = self.cosine(output['s_l'], output['c_l'],
-                                                          torch.tensor([-1]).cuda()).mean(0)
-                    cosine_similarity_s_c_v = self.cosine(output['s_v'], output['c_v'],
-                                                          torch.tensor([-1]).cuda()).mean(0)
-                    cosine_similarity_s_c_a = self.cosine(output['s_a'], output['c_a'],
-                                                          torch.tensor([-1]).cuda()).mean(0)
+                    s_l = output['s_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                    c_l = output['c_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+
+                    s_v = output['s_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                    c_v = output['c_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+
+                    s_a = output['s_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                    c_a = output['c_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+
+                    target = -torch.ones(labels.size(0), device=labels.device)
+
+                    cosine_similarity_s_c_l = self.cosine(s_l, c_l, target)
+                    cosine_similarity_s_c_v = self.cosine(s_v, c_v, target)
+                    cosine_similarity_s_c_a = self.cosine(s_a, c_a, target)
+
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
                     # margin loss
@@ -263,18 +274,14 @@ class DMD():
             )
             # validation
             val_results = self.do_test(model[0], dataloader['valid'], mode="VAL")
-            test_results = self.do_test(model[0], dataloader['test'], mode="TEST")
             cur_valid = val_results[self.args.KeyEval]
             scheduler.step(val_results['Loss'])
-            # save each epoch model
-            torch.save(model[0].state_dict(), './pt/' + str(epochs) + '.pth')
             # save best model
             isBetter = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
             if isBetter:
                 best_valid, best_epoch = cur_valid, epochs
                 # save model
-                model_save_path = './pt/dmd.pth'
-                torch.save(model[0].state_dict(), model_save_path)
+                torch.save(model[0].state_dict(), self.args.model_save_path)
 
             if return_epoch_results:
                 train_results["Loss"] = train_loss
@@ -287,7 +294,6 @@ class DMD():
                 return epoch_results if return_epoch_results else None
 
     def do_test(self, model, dataloader, mode="VAL", return_sample_results=False):
-
         model.eval()
         y_pred, y_true = [], []
 
@@ -309,8 +315,12 @@ class DMD():
                     audio = batch_data['audio'].to(self.args.device)
                     text = batch_data['text'].to(self.args.device)
                     labels = batch_data['labels']['M'].to(self.args.device)
-                    labels = labels.view(-1, 1)
+                    if self.args.train_mode == 'classification':
+                        labels = labels.view(-1).long()
+                    else:
+                        labels = labels.view(-1, 1)
                     output = model(text, audio, vision, is_distill=True)
+
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()
                     y_pred.append(output['output_logit'].cpu())
@@ -326,8 +336,8 @@ class DMD():
         if return_sample_results:
             eval_results["Ids"] = ids
             eval_results["SResults"] = sample_results
-            for k in features.keys():
-                features[k] = np.concatenate(features[k], axis=0)
+            # for k in features.keys():
+            #     features[k] = np.concatenate(features[k], axis=0)
             eval_results['Features'] = features
             eval_results['Labels'] = all_labels
 
