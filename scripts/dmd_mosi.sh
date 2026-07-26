@@ -1,5 +1,6 @@
 #!/bin/bash
 python main-dmd.py \
+    --data_missing \
     --model dmd \
     --dataset mosi \
     --mode train \
