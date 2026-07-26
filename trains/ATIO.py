@@ -1,6 +1,7 @@
 import logging
 from .MISA import MISA
 from .DecAlign import DecAlignTrainer
+from .DMD import DMD
 
 __all__ = ["ATIO"]
 
@@ -11,6 +12,7 @@ class ATIO():
         self.TRAIN_MAP = {
             'misa': MISA,
             'decalign': DecAlignTrainer,
+            'dmd': DMD,
         }
 
     def getTrain(self, args):

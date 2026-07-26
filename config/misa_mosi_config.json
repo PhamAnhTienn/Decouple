@@ -1,6 +1,6 @@
 {
     "model_name": "misa",
-    "need_data_aligned": false,
+    "need_data_aligned": true,
     "need_model_aligned": false,
     "use_finetune": true,
     "use_bert": true,
