@@ -390,6 +390,8 @@ def main():
     parser.add_argument('--output', type=str, default='', help='Output image path')
     parser.add_argument('--config_override', action='append', default=[],
                         help='Override config values, e.g. hidden_size=128')
+    parser.add_argument('--missing_data', action='store_true', help='Use missing data')
+    parser.add_argument('--missing_rate', type=float, default=0.7, help='Missing rate')
     args = parser.parse_args()
     
     setup_seed(args.seed)
@@ -404,8 +406,8 @@ def main():
     model_args.device = device
     model_args.model_save_path = args.checkpoint
     
-    model_args.data_missing = True
-    model_args.missing_rate_eval_test = 0.7
+    model_args.data_missing = args.missing_data
+    model_args.missing_rate_eval_test = args.missing_rate
     model_args.cur_seed = 1111
     
     # Apply config overrides
@@ -474,6 +476,9 @@ if __name__ == '__main__':
     main()
 
 # python scripts/visualize_tsne_shared_space.py \
+#     --checkpoint /home/tien/NCKH/DecAlign/pt/misa-mosi-missing0.0.pth \
 #     --config_file config/misa_mosi_config.json \
 #     --dataset mosi \
+#     --missing_data \
+#     --missing_rate 0.0 \
 #     --split test

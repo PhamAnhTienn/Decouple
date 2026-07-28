@@ -186,7 +186,7 @@ class DMD(nn.Module):
         c_a = c_a.permute(2, 0, 1)
 
         hs_l_low = c_l.transpose(0, 1).contiguous().view(x_l.size(0), -1)
-        repr_l_low = self.proj1_l_low(hs_l_low)
+        repr_l_low = self.proj1_l_low(hs_l_low) # batch * d_l
         hs_proj_l_low = self.proj2_l_low(
             F.dropout(F.relu(repr_l_low, inplace=True), p=self.output_dropout, training=self.training))
         hs_proj_l_low += hs_l_low

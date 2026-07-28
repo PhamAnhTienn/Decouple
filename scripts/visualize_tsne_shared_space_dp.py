@@ -63,13 +63,13 @@ def extract_shared_features(model, dataloader, device):
 
             # DP forward: (text, audio, video, is_distill)
             # Use missing-rate inputs to match evaluation setting
-            output = model(text_m, audio_m, vision_m, is_distill=False)
+            output = model(text, audio, vision, is_distill=False)
 
             # c_l, c_v, c_a have shape (seq_len, batch, d) after permute in DP.forward
             # Take the last time-step as the utterance-level representation
-            c_l = output['c_l'][-1]  # (batch, d)
-            c_v = output['c_v'][-1]  # (batch, d)
-            c_a = output['c_a'][-1]  # (batch, d)
+            c_l = output['repr_l_homo']  # (batch, d)
+            c_v = output['repr_v_homo']  # (batch, d)
+            c_a = output['repr_a_homo']  # (batch, d)
 
             all_shared_t.append(c_l.cpu().numpy())
             all_shared_v.append(c_v.cpu().numpy())
