@@ -143,7 +143,7 @@ class DMD():
 
                     logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
-                    output = model[0](text_m, audio_m, vision_m, is_distill=True)
+                    output = model[0](text, audio, vision, is_distill=True)
 
                     # logits for homo GD
                     logits_homo.append(output['logits_l_homo'])
@@ -246,6 +246,9 @@ class DMD():
                                     graph_distill_loss_homo + graph_distill_loss_hetero + \
                                     (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
 
+                    # combined_loss = loss_task + \
+                    #                 graph_distill_loss_homo + graph_distill_loss_hetero + \
+                    #                 (loss_s_sr + loss_recon + (loss_ort) * 0.1) * 0.1
                     combined_loss.backward()
 
 
@@ -315,17 +318,17 @@ class DMD():
             with tqdm(dataloader) as td:
                 for batch_data in td:
                     text = batch_data['text'].to(self.args.device)
-                    text_m = batch_data['text_m'].to(self.args.device)
                     audio = batch_data['audio'].to(self.args.device)
-                    audio_m = batch_data['audio_m'].to(self.args.device)
                     vision = batch_data['vision'].to(self.args.device)
+                    text_m = batch_data['text_m'].to(self.args.device)
+                    audio_m = batch_data['audio_m'].to(self.args.device)
                     vision_m = batch_data['vision_m'].to(self.args.device)
                     labels = batch_data['labels']['M'].to(self.args.device)
                     if self.args.train_mode == 'classification':
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text_m, audio_m, vision_m, is_distill=True)
+                    output = model(text, audio, vision, is_distill=True)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()
