@@ -16,6 +16,8 @@
         50,
         10
     ],
+    "nmb_prototypes": 7,
+    "freeze_prototypes_niters": 300,
     "batch_size": 16,
     "learning_rate": 0.0001,
     "nlevels": 4,

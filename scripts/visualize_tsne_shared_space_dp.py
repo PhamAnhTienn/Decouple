@@ -149,11 +149,11 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
     # Run t-SNE on the combined features
     tsne = TSNE(
         n_components=2,
-        perplexity=perplexity,
+        perplexity=perplexity, # 30
         random_state=seed,
         max_iter=2000,
-        learning_rate='auto',
-        init='pca',
+        # learning_rate='auto',
+        # init='pca',
     )
     embeddings = tsne.fit_transform(all_features)
     print(f"t-SNE completed. KL divergence: {tsne.kl_divergence_:.4f}")
@@ -408,7 +408,7 @@ def main():
     
     # Load config — use 'dp' model name instead of 'misa'
     config_file = args.config_file if args.config_file else ''
-    model_args = get_config_regression('dmd', args.dataset, config_file, data_dir=args.data_dir)
+    model_args = get_config_regression('dp', args.dataset, config_file, data_dir=args.data_dir)
     model_args.device = device
     model_args.model_save_path = args.checkpoint
     
