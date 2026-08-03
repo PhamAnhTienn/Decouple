@@ -2,6 +2,7 @@ import logging
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from torch import optim
 from tqdm import tqdm
@@ -9,6 +10,9 @@ from tqdm import tqdm
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
+
+LAMBDA_CLUSTER = 0.1
+LAMBDA_PUSH = 0.1
 
 class MISA():
     def __init__(self, args):
@@ -59,6 +63,12 @@ class MISA():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
+                    # # normalize the prototypes before forward pass
+                    # with torch.no_grad():
+                    #     w = model.prototypes.weight.data.clone()
+                    #     w = F.normalize(w, dim=1, p=2)
+                    #     model.prototypes.weight.copy_(w)
+
                     # forward
                     outputs = model(text, audio, vision, text_m, audio_m, vision_m)['M']
                     # compute loss
@@ -67,6 +77,13 @@ class MISA():
                     domain_loss = self.get_domain_loss()
                     recon_loss = self.get_recon_loss()
                     cmd_loss = self.get_cmd_loss()
+
+                    # # cluster loss (OT-based)
+                    # loss_cluster = model.compute_cluster_loss(
+                    #     tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                    # )
+                    # # prototype separation loss
+                    # loss_push = model.compute_push_loss(t=1.0)
 
                     if self.args.use_cmd_sim:
                         similarity_loss = cmd_loss
@@ -77,6 +94,8 @@ class MISA():
                            self.args.diff_weight * diff_loss + \
                            self.args.sim_weight * similarity_loss + \
                            self.args.recon_weight * recon_loss
+                        #    LAMBDA_CLUSTER * loss_cluster + \
+                        #    LAMBDA_PUSH * loss_push
                     # backward
                     loss.backward()
                     if self.args.grad_clip != -1.0:

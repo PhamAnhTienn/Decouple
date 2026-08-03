@@ -5,6 +5,38 @@ import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
+class CMD(nn.Module):
+    """
+    Central Moment Discrepancy (CMD).
+    Adapted from https://github.com/wzell/cmd/blob/master/models/domain_regularizer.py
+    """
+
+    def __init__(self):
+        super(CMD, self).__init__()
+
+    def forward(self, x1, x2, n_moments):
+        mx1 = torch.mean(x1, 0)
+        mx2 = torch.mean(x2, 0)
+        sx1 = x1 - mx1
+        sx2 = x2 - mx2
+        dm = self.matchnorm(mx1, mx2)
+        scms = dm
+        for i in range(n_moments - 1):
+            scms += self.scm(sx1, sx2, i + 2)
+        return scms
+
+    def matchnorm(self, x1, x2):
+        power = torch.pow(x1 - x2, 2)
+        summed = torch.sum(power)
+        sqrt = summed ** (0.5)
+        return sqrt
+
+    def scm(self, sx1, sx2, k):
+        ss1 = torch.mean(torch.pow(sx1, k), 0)
+        ss2 = torch.mean(torch.pow(sx2, k), 0)
+        return self.matchnorm(ss1, ss2)
+
+
 class DP(nn.Module):
     def __init__(self, args):
         super(DP, self).__init__()
@@ -276,10 +308,14 @@ class DP(nn.Module):
 
         # --- Cluster & prototype features ---
         # c_l, c_v, c_a are (T, B, D) at this point
-        # Mean-pool over timestep dimension to get (B, D)
-        h_c_l = F.normalize(c_l.mean(dim=0), dim=1, p=2)  # (B, D)
-        h_c_v = F.normalize(c_v.mean(dim=0), dim=1, p=2)  # (B, D)
-        h_c_a = F.normalize(c_a.mean(dim=0), dim=1, p=2)  # (B, D)
+        # Raw mean-pool over timestep dimension (for CMD loss)
+        utt_shared_l = c_l.mean(dim=0)  # (B, D) — raw, no L2-norm
+        utt_shared_v = c_v.mean(dim=0)  # (B, D)
+        utt_shared_a = c_a.mean(dim=0)  # (B, D)
+        # L2-normalized versions (for cluster/prototype losses)
+        h_c_l = F.normalize(utt_shared_l, dim=1, p=2)  # (B, D)
+        h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
+        h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
 
         # Fused shared representation (average of 3 modalities, then L2-norm)
         h_shared = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
@@ -319,9 +355,13 @@ class DP(nn.Module):
             'output_logit': output,
             # Cluster-related features
             'h_shared': h_shared,   # (B, D) fused shared representation
-            'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings
+            'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
             'h_c_v': h_c_v,
             'h_c_a': h_c_a,
+            # Raw mean-pooled shared features for CMD loss
+            'utt_shared_l': utt_shared_l,  # (B, D)
+            'utt_shared_v': utt_shared_v,
+            'utt_shared_a': utt_shared_a,
         }
         return res
 

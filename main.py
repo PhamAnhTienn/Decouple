@@ -90,7 +90,7 @@ def DMD_run(
         config_file = Path(config_file)
     else:  # use default config file
         if dataset_name == "mosi":
-            config_name = "dp_mosi_config.json"
+            config_name = "misa_mosi_config.json"
         elif dataset_name == "mosei":
             config_name = "dec_mosei_config.json"
         elif dataset_name == "iemocap":
