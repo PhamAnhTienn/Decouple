@@ -205,15 +205,14 @@ class DP():
                         )
 
                         # prototype separation loss
-                        loss_push = model.compute_push_loss(t=1.0)
+                        loss_push = model.compute_push_loss(margin=2.0)
 
-                        # CMD loss (shared-space distribution alignment)
-                        loss_cmd = self.get_cmd_loss(output, n_moments=5)
+                        # # CMD loss (shared-space distribution alignment)
+                        # loss_cmd = self.get_cmd_loss(output, n_moments=5)
 
                         combined_loss = loss_task + \
                                         (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
-                                        loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH + \
-                                        loss_cmd * LAMBDA_CMD
+                                        loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH
                         combined_loss.backward()
 
                         # --- Step-level W&B logging ---
@@ -223,7 +222,7 @@ class DP():
                         _loss_ort_val = loss_ort.item()
                         _loss_cluster_val = loss_cluster.item()
                         _loss_push_val = loss_push.item()
-                        _loss_cmd_val = loss_cmd.item()
+                        # _loss_cmd_val = loss_cmd.item()
                         _combined_val = combined_loss.item()
 
                         wandb.log({
@@ -234,7 +233,6 @@ class DP():
                             "step/loss_ort": _loss_ort_val,
                             "step/loss_cluster": _loss_cluster_val,
                             "step/loss_push": _loss_push_val,
-                            "step/loss_cmd": _loss_cmd_val,
                             "step/combined_loss": _combined_val,
                             # Weighted contributions to combined_loss
                             "step/weighted_recon": _loss_recon_val * LAMBDA_RECON_GROUP,
@@ -242,7 +240,7 @@ class DP():
                             "step/weighted_ort": _loss_ort_val * LAMBDA_RECON_GROUP * LAMBDA_ORT_INNER,
                             "step/weighted_cluster": _loss_cluster_val * LAMBDA_CLUSTER,
                             "step/weighted_push": _loss_push_val * LAMBDA_PUSH,
-                            "step/weighted_cmd": _loss_cmd_val * LAMBDA_CMD,
+                            # "step/weighted_cmd": _loss_cmd_val * LAMBDA_CMD,
                         })
 
                         # Accumulate for epoch-level averages
@@ -252,7 +250,7 @@ class DP():
                         epoch_loss_ort += _loss_ort_val
                         epoch_loss_cluster += _loss_cluster_val
                         epoch_loss_push += _loss_push_val
-                        epoch_loss_cmd += _loss_cmd_val
+                        # epoch_loss_cmd += _loss_cmd_val
                         num_batches += 1
 
                         # Freeze prototypes during warmup iterations

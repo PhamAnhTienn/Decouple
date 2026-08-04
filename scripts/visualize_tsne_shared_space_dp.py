@@ -86,40 +86,25 @@ def extract_shared_features(model, dataloader, device):
 
 def create_sentiment_bins(labels):
     """
-    Bin continuous sentiment scores into discrete categories for visualization.
-    MOSI scores range from -3 to 3. We use rounded integer bins as in acc computation.
-    Then group into broader categories for clearer visualization.
+    Bin continuous sentiment scores into 7 discrete categories for visualization,
+    matching the Acc_7 metric in metricsTop.py.
+    
+    MOSI scores are clipped to [-3, 3] and rounded to the nearest integer,
+    yielding 7 bins: {-3, -2, -1, 0, +1, +2, +3}.
     
     Returns:
-        bin_labels: array of string labels per sample
-        bin_ids: array of integer bin indices per sample
+        bin_ids: array of integer bin indices per sample (0–6)
     """
     rounded = np.round(labels).astype(int)
     rounded = np.clip(rounded, -3, 3)
     
-    # Map to broader sentiment categories for visual clarity
-    # Strong Negative: [-3, -2], Negative: [-1], Neutral: [0], 
-    # Positive: [1], Strong Positive: [2, 3]
-    bin_labels = []
-    bin_ids = []
-    for r in rounded:
-        if r <= -2:
-            bin_labels.append("Strong Neg (-3,-2)")
-            bin_ids.append(0)
-        elif r == -1:
-            bin_labels.append("Negative (-1)")
-            bin_ids.append(1)
-        elif r == 0:
-            bin_labels.append("Neutral (0)")
-            bin_ids.append(2)
-        elif r == 1:
-            bin_labels.append("Positive (1)")
-            bin_ids.append(3)
-        else:  # r >= 2
-            bin_labels.append("Strong Pos (2,3)")
-            bin_ids.append(4)
+    # Each integer from -3 to +3 maps to a unique bin index (0–6)
+    # This mirrors metricsTop.__multiclass_acc used for Acc_7
+    bin_map = {-3: 0, -2: 1, -1: 2, 0: 3, 1: 4, 2: 5, 3: 6}
     
-    return np.array(bin_labels), np.array(bin_ids)
+    bin_ids = np.array([bin_map[r] for r in rounded])
+    
+    return bin_ids
 
 
 def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, seed=42):
@@ -127,15 +112,21 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
     Create publication-quality t-SNE visualization of the shared feature space.
     
     Layout: Single plot showing all three modalities with:
-      - Color = sentiment intensity bin  
+      - Color = sentiment intensity bin (7-class, matching Acc_7)
       - Marker shape = modality (Text / Audio / Video)
     """
     from sklearn.manifold import TSNE
     import matplotlib
-    # matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     from matplotlib.lines import Line2D
+    
+    # ── Publication rcParams ──────────────────────────────────────────
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Helvetica'],
+        'mathtext.fontset': 'dejavusans',
+    })
     
     print("Running t-SNE dimensionality reduction...")
     
@@ -149,38 +140,39 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
     # Run t-SNE on the combined features
     tsne = TSNE(
         n_components=2,
-        perplexity=perplexity, # 30
+        perplexity=perplexity,
         random_state=seed,
         max_iter=2000,
-        # learning_rate='auto',
-        # init='pca',
     )
     embeddings = tsne.fit_transform(all_features)
     print(f"t-SNE completed. KL divergence: {tsne.kl_divergence_:.4f}")
     
-    # Create sentiment bins
-    bin_labels, bin_ids = create_sentiment_bins(all_labels)
+    # Create sentiment bins (7-class)
+    bin_ids = create_sentiment_bins(all_labels)
     
     # =============================================
-    # Publication-quality plot
+    # Publication-quality plot (7 bins)
     # =============================================
     
-    # Color palette — sequential diverging to match sentiment polarity
-    # Strong Neg → Neg → Neutral → Pos → Strong Pos
+    # Diverging 7-color palette: cool → neutral → warm
     sentiment_colors = {
-        0: '#1b4f72',   # Strong Negative — deep navy blue
-        1: '#5dade2',   # Negative — sky blue
-        2: '#7d8c8e',   # Neutral — muted gray
-        3: '#e74c3c',   # Positive — warm red
-        4: '#922b21',   # Strong Positive — dark crimson
+        0: '#08306b',   # -3  Very Strong Neg — darkest navy
+        1: '#2171b5',   # -2  Strong Neg — medium blue
+        2: '#6baed6',   # -1  Negative — light blue
+        3: '#969696',   #  0  Neutral — mid gray
+        4: '#fb6a4a',   # +1  Positive — salmon red
+        5: '#cb181d',   # +2  Strong Pos — crimson
+        6: '#67000d',   # +3  Very Strong Pos — darkest red
     }
     
     sentiment_names = {
-        0: 'Strong Neg (≤-2)',
-        1: 'Negative (-1)',
-        2: 'Neutral (0)',
-        3: 'Positive (+1)',
-        4: 'Strong Pos (≥+2)',
+        0: '−3  (Very Strong Neg)',
+        1: '−2  (Strong Neg)',
+        2: '−1  (Negative)',
+        3: ' 0  (Neutral)',
+        4: '+1  (Positive)',
+        5: '+2  (Strong Pos)',
+        6: '+3  (Very Strong Pos)',
     }
     
     modality_markers = {
@@ -190,11 +182,19 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
     }
     modality_names = {0: 'Text', 1: 'Video', 2: 'Audio'}
     
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8.5))
+    # ── Figure & axes ─────────────────────────────────────────────────
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
     fig.patch.set_facecolor('white')
     ax.set_facecolor('#fafafa')
     
-    # Plot each modality × sentiment bin combination
+    # ── Spines: keep only left & bottom, thicken ─────────────────────
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
+    for spine in ['left', 'bottom']:
+        ax.spines[spine].set_linewidth(1.2)
+        ax.spines[spine].set_color('#333333')
+    
+    # ── Plot each modality × sentiment bin combination ────────────────
     for mod_id in [0, 1, 2]:
         for sent_id in sorted(sentiment_colors.keys()):
             mask = (modality_ids == mod_id) & (bin_ids == sent_id)
@@ -205,33 +205,39 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
                 embeddings[mask, 1],
                 c=sentiment_colors[sent_id],
                 marker=modality_markers[mod_id],
-                s=28,
-                alpha=0.65,
+                s=22,
+                alpha=0.70,
                 edgecolors='white',
-                linewidths=0.3,
+                linewidths=0.25,
                 zorder=3,
+                rasterized=True,
             )
     
-    # ---- Legends ----
-    # Sentiment legend (colors)
+    # ── Legends ───────────────────────────────────────────────────────
+    # Sentiment legend (colors) — 7 entries
     color_handles = [
         mpatches.Patch(
             facecolor=sentiment_colors[sid],
-            edgecolor='gray',
-            linewidth=0.5,
-            label=sentiment_names[sid]
+            edgecolor='#888888',
+            linewidth=0.6,
+            label=sentiment_names[sid],
         )
         for sid in sorted(sentiment_colors.keys())
     ]
     legend1 = ax.legend(
         handles=color_handles,
-        title='Sentiment Intensity',
+        title='Sentiment Bin',
         loc='upper left',
-        fontsize=9,
-        title_fontsize=10,
-        framealpha=0.9,
-        edgecolor='#cccccc',
+        fontsize=7.5,
+        title_fontsize=8.5,
+        framealpha=0.92,
+        edgecolor='#bbbbbb',
+        borderpad=0.6,
+        handlelength=1.0,
+        handleheight=0.8,
+        labelspacing=0.35,
     )
+    legend1.get_title().set_fontweight('bold')
     ax.add_artist(legend1)
     
     # Modality legend (markers)
@@ -241,48 +247,60 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
             marker=modality_markers[mid],
             color='w',
             markerfacecolor='#555555',
-            markeredgecolor='gray',
-            markersize=8,
+            markeredgecolor='#888888',
+            markersize=7,
             label=modality_names[mid],
             linewidth=0,
         )
         for mid in sorted(modality_markers.keys())
     ]
-    ax.legend(
+    legend2 = ax.legend(
         handles=marker_handles,
         title='Modality',
         loc='upper right',
-        fontsize=9,
-        title_fontsize=10,
-        framealpha=0.9,
-        edgecolor='#cccccc',
+        fontsize=7.5,
+        title_fontsize=8.5,
+        framealpha=0.92,
+        edgecolor='#bbbbbb',
+        borderpad=0.6,
+        handlelength=1.0,
+        labelspacing=0.35,
     )
+    legend2.get_title().set_fontweight('bold')
     ax.add_artist(legend1)  # re-add legend1 after overwrite
     
+    # ── Title & axis labels ───────────────────────────────────────────
     ax.set_title(
         't-SNE of DP Shared Feature Space (Modality-Invariant Encoder)\n'
         'Shared Encoder (encoder_c) on CMU-MOSI Test Set',
-        fontsize=13,
+        fontsize=12,
         fontweight='bold',
-        pad=14,
+        pad=12,
     )
-    ax.set_xlabel('t-SNE Dimension 1', fontsize=11)
-    ax.set_ylabel('t-SNE Dimension 2', fontsize=11)
-    ax.tick_params(labelsize=9)
+    ax.set_xlabel('t-SNE Dimension 1', fontsize=10.5, labelpad=6)
+    ax.set_ylabel('t-SNE Dimension 2', fontsize=10.5, labelpad=6)
+    ax.tick_params(axis='both', labelsize=9, width=1.0, length=4,
+                   direction='out', color='#555555')
     
     # Light grid
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
+    ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.4)
     ax.set_axisbelow(True)
     
-    plt.tight_layout()
+    plt.tight_layout(pad=1.0)
     plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-    # plt.show()
     print(f"Saved t-SNE plot to: {save_path}")
     plt.close()
     
     # =============================================
     # Quantitative analysis: cross-modality misalignment
     # =============================================
+    # Local bin-name lookup for the 7-class scheme
+    _bin_names = {
+        0: '-3 (VStrNeg)', 1: '-2 (StrNeg)', 2: '-1 (Neg)',
+        3: ' 0 (Neutral)', 4: '+1 (Pos)',    5: '+2 (StrPos)',
+        6: '+3 (VStrPos)',
+    }
+    
     print("\n" + "="*70)
     print("QUANTITATIVE ANALYSIS: Sentiment Conditional Alignment Quality")
     print("="*70)
@@ -290,12 +308,12 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
     emb_t = embeddings[:N]
     emb_v = embeddings[N:2*N]
     emb_a = embeddings[2*N:]
-    _, sample_bin_ids = create_sentiment_bins(labels)
+    sample_bin_ids = create_sentiment_bins(labels)
     
     unique_bins = np.unique(sample_bin_ids)
     
-    print(f"\n{'Sentiment Bin':<25} {'N':>5} {'Text↔Video':>12} {'Text↔Audio':>12} {'Video↔Audio':>12}")
-    print("-" * 70)
+    print(f"\n{'Sentiment Bin':<20} {'N':>5} {'Text↔Video':>12} {'Text↔Audio':>12} {'Video↔Audio':>12}")
+    print("-" * 65)
     
     for bid in unique_bins:
         mask = sample_bin_ids == bid
@@ -309,7 +327,7 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
         d_ta = np.mean(np.linalg.norm(emb_t[mask] - emb_a[mask], axis=1))
         d_va = np.mean(np.linalg.norm(emb_v[mask] - emb_a[mask], axis=1))
         
-        print(f"{sentiment_names[bid]:<25} {n_samples:>5} {d_tv:>12.2f} {d_ta:>12.2f} {d_va:>12.2f}")
+        print(f"{_bin_names[bid]:<20} {n_samples:>5} {d_tv:>12.2f} {d_ta:>12.2f} {d_va:>12.2f}")
     
     # Cross-bin analysis: how close are DIFFERENT sentiment samples across modalities?
     print(f"\n{'Cross-Sentiment Centroid Distance Matrix (Text↔Video pairs)':}")
@@ -324,14 +342,14 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
             centroids_v[bid] = emb_v[mask].mean(axis=0)
     
     bid_list = sorted(centroids_t.keys())
-    header = f"{'':>25}" + "".join(f"{'Video-'+sentiment_names[b][:8]:>16}" for b in bid_list)
+    header = f"{'':>20}" + "".join(f"{'V-'+_bin_names[b][:8]:>14}" for b in bid_list)
     print(header)
     for bt in bid_list:
-        row = f"{'Text-'+sentiment_names[bt][:12]:>25}"
+        row = f"{'T-'+_bin_names[bt][:12]:>20}"
         for bv in bid_list:
             dist = np.linalg.norm(centroids_t[bt] - centroids_v[bv])
             marker = " ◄" if bt != bv and dist < np.linalg.norm(centroids_t[bt] - centroids_v[bt]) else ""
-            row += f"{dist:>13.2f}{marker:>3}"
+            row += f"{dist:>11.2f}{marker:>3}"
         print(row)
     
     print("\n◄ = Cross-sentiment centroid distance SMALLER than same-sentiment distance")
