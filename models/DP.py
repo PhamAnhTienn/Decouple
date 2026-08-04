@@ -351,6 +351,8 @@ class DP(nn.Module):
             'last_h_l': h_ls[-1],
             'last_h_v': h_vs[-1],
             'last_h_a': h_as[-1],
+            'c_fusion': c_fusion,          # gated, (B, 3*d)
+            'last_hs_proj': last_hs_proj,  # (B, combined_dim) — pre-classifier repr    
             'logits_c': logits_c,
             'output_logit': output,
             # Cluster-related features
@@ -423,10 +425,11 @@ class DP(nn.Module):
         loss_cluster /= 3.0  # average over 3 modalities
         return loss_cluster
 
-    def compute_push_loss(self, t=1.0):
+    def compute_push_loss(self, margin=2.0):
         """
-        Compute L_push: prototype separation loss.
-        Encourages prototypes to be far apart from each other.
+        Compute L_push: margin-based prototype separation loss.
+        L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+        Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
         """
         C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
         K = C.shape[0]
@@ -441,6 +444,6 @@ class DP(nn.Module):
         mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
         sq_dists_off = sq_dists[mask]  # K*(K-1)
 
-        # L_push = log( (1 / K(K-1)) * sum_{i!=j} exp(-t * ||c_i - c_j||^2) )
-        loss_push = torch.logsumexp(-t * sq_dists_off, dim=0) - math.log(K * (K - 1))
+        # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+        loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
         return loss_push

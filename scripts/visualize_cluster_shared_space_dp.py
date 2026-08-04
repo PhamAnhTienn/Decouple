@@ -79,9 +79,12 @@ def extract_features(model, dataloader, device):
 
             out = model(text, audio, vision, is_distill=False)
 
-            h_l_all.append(out["repr_l_homo"].cpu().numpy())
-            h_v_all.append(out["repr_v_homo"].cpu().numpy())
-            h_a_all.append(out["repr_a_homo"].cpu().numpy())
+            # h_l_all.append(out["repr_l_homo"].cpu().numpy())
+            # h_v_all.append(out["repr_v_homo"].cpu().numpy())
+            # h_a_all.append(out["repr_a_homo"].cpu().numpy())
+            h_l_all.append(out["h_c_l"].cpu().numpy())
+            h_v_all.append(out["h_c_v"].cpu().numpy())
+            h_a_all.append(out["h_c_a"].cpu().numpy())
             h_shared_all.append(out["h_shared"].cpu().numpy())
             labels_all.append(batch["labels"]["M"].numpy().reshape(-1))
 
