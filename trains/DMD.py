@@ -143,7 +143,7 @@ class DMD():
 
                     logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
-                    output = model[0](text, audio, vision, is_distill=True)
+                    output = model[0](text_m, audio_m, vision_m, is_distill=True)
 
                     # logits for homo GD
                     logits_homo.append(output['logits_l_homo'])
@@ -328,7 +328,7 @@ class DMD():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text, audio, vision, is_distill=True)
+                    output = model(text_m, audio_m, vision_m, is_distill=True)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()

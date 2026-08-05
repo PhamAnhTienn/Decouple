@@ -1,6 +1,7 @@
 python main.py \
     --data_missing \
     --model dp \
+    --config_file "/home/tien/NCKH/DecAlign/config/dp_mosi_config.json" \
     --dataset mosi \
     --mode train \
     --seeds 1111 \

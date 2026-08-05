@@ -1,7 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
@@ -91,9 +92,12 @@ class DP(nn.Module):
         self.decoder_v = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
         self.decoder_a = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
 
-        # init prototype
-        self.nmb_prototypes = args.nmb_prototypes
-        self.prototypes = nn.Linear(self.d_a, args.nmb_prototypes, bias=False)
+        # GMM + OT hyperparameters (for heterogeneity alignment on shared space)
+        self.num_prototypes = args.nmb_prototypes
+        self.gmm_em_iters = getattr(args, 'gmm_em_iters', 5)
+        self.gmm_var_floor = getattr(args, 'gmm_var_floor', 1e-4)
+        self.ot_reg = getattr(args, 'lambda_ot', 0.1)
+        self.ot_num_iters = getattr(args, 'ot_num_iters', 50)
 
         # for align c_l, c_v, c_a
         self.self_attentions_c_l = self.get_network(self_type='l')
@@ -306,19 +310,11 @@ class DP(nn.Module):
 
         output = self.out_layer(last_hs_proj)
 
-        # --- Cluster & prototype features ---
+        # --- Shared-space utterance features (for CMD loss) ---
         # c_l, c_v, c_a are (T, B, D) at this point
-        # Raw mean-pool over timestep dimension (for CMD loss)
-        utt_shared_l = c_l.mean(dim=0)  # (B, D) — raw, no L2-norm
+        utt_shared_l = c_l.mean(dim=0)  # (B, D)
         utt_shared_v = c_v.mean(dim=0)  # (B, D)
         utt_shared_a = c_a.mean(dim=0)  # (B, D)
-        # L2-normalized versions (for cluster/prototype losses)
-        h_c_l = F.normalize(utt_shared_l, dim=1, p=2)  # (B, D)
-        h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
-        h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
-
-        # Fused shared representation (average of 3 modalities, then L2-norm)
-        h_shared = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
 
         res = {
             'logits_l_homo': logits_l_low,
@@ -334,7 +330,7 @@ class DP(nn.Module):
             's_v': s_v,
             's_a': s_a,
             'c_l': c_l,
-            'c_v': c_v, # T, B, D
+            'c_v': c_v,  # T, B, D
             'c_a': c_a,
             's_l_r': s_l_r,
             's_v_r': s_v_r,
@@ -353,11 +349,6 @@ class DP(nn.Module):
             'last_h_a': h_as[-1],
             'logits_c': logits_c,
             'output_logit': output,
-            # Cluster-related features
-            'h_shared': h_shared,   # (B, D) fused shared representation
-            'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
-            'h_c_v': h_c_v,
-            'h_c_a': h_c_a,
             # Raw mean-pooled shared features for CMD loss
             'utt_shared_l': utt_shared_l,  # (B, D)
             'utt_shared_v': utt_shared_v,
@@ -365,82 +356,175 @@ class DP(nn.Module):
         }
         return res
 
-    @torch.no_grad()
-    def sinkhorn_knopp(self, S, epsilon=0.05, sinkhorn_iterations=3):
-        """
-        Sinkhorn-Knopp algorithm for entropic OT.
+    # ==================== GMM + Optimal Transport ====================
+
+    def _init_gmm(self, x):
+        """Initialize GMM parameters (means, diagonal variances, mixture coefficients).
+
         Args:
-            S: similarity matrix (B, K)
-            epsilon: entropic regularization
-            sinkhorn_iterations: number of normalization iterations
+            x: (B, D) feature matrix.
         Returns:
-            Q: transport plan (B, K), rows sum to 1/B, cols sum to 1/K
+            pi: (K,) mixture coefficients.
+            mu: (K, D) means.
+            var: (K, D) diagonal variances.
         """
-        Q = torch.exp(S / epsilon).t()  # (K, B)
-        B = Q.shape[1]
-        K = Q.shape[0]
+        batch_size, dim = x.shape
+        k = self.num_prototypes
+        if batch_size >= k:
+            indices = torch.linspace(0, batch_size - 1, steps=k, device=x.device).round().long()
+            mu = x.index_select(0, indices)
+        else:
+            repeat = math.ceil(k / batch_size)
+            mu = x.repeat(repeat, 1)[:k]
 
-        # Make the matrix sums to 1
-        sum_Q = torch.sum(Q)
-        Q /= sum_Q
+        var = x.var(dim=0, unbiased=False).clamp_min(self.gmm_var_floor)
+        var = var.unsqueeze(0).expand(k, dim).clone()
+        pi = torch.full((k,), 1.0 / k, device=x.device, dtype=x.dtype)
+        return pi, mu, var
 
-        for _ in range(sinkhorn_iterations):
-            # Normalize rows: total weight per prototype must be 1/K
-            Q /= torch.sum(Q, dim=1, keepdim=True)
-            Q /= K
-            # Normalize columns: total weight per sample must be 1/B
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
+    def _gmm_log_prob(self, x, pi, mu, var):
+        """Compute per-component log-probabilities under diagonal-covariance GMM.
 
-        Q *= B  # columns sum to 1
-        return Q.t()  # (B, K)
-
-    def compute_cluster_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
+        Args:
+            x: (B, D) samples.
+            pi: (K,) mixture coefficients.
+            mu: (K, D) component means.
+            var: (K, D) component variances.
+        Returns:
+            (B, K) log-probabilities (unnormalized by mixture).
         """
-        Compute L_cluster: OT-based cross-entropy between soft assignments Q*
-        and per-modality cluster predictions.
+        diff = x.unsqueeze(1) - mu.unsqueeze(0)            # (B, K, D)
+        mahalanobis = (diff.pow(2) / var.unsqueeze(0)).sum(dim=2)  # (B, K)
+        log_det = var.log().sum(dim=1).unsqueeze(0)         # (1, K)
+        log_norm = x.size(1) * math.log(2.0 * math.pi)
+        return pi.clamp_min(1e-8).log().unsqueeze(0) - 0.5 * (mahalanobis + log_det + log_norm)
+
+    def _fit_gmm_em(self, x):
+        """Fit a GMM to *x* via Expectation-Maximization.
+
+        Args:
+            x: (B, D) feature matrix.
+        Returns:
+            dict with keys 'pi', 'mu', 'var', 'posterior'.
         """
-        h_shared = output['h_shared']  # (B, D)
-        h_c_l = output['h_c_l']        # (B, D)
-        h_c_v = output['h_c_v']        # (B, D)
-        h_c_a = output['h_c_a']        # (B, D)
+        pi, mu, var = self._init_gmm(x)
+        for _ in range(self.gmm_em_iters):
+            # E-step
+            gamma = F.softmax(self._gmm_log_prob(x, pi, mu, var), dim=1)  # (B, K)
+            nk = gamma.sum(dim=0).clamp_min(1e-6)  # (K,)
+            # M-step
+            pi = nk / x.size(0)
+            mu = gamma.transpose(0, 1).matmul(x) / nk.unsqueeze(1)       # (K, D)
+            second_moment = gamma.transpose(0, 1).matmul(x.pow(2)) / nk.unsqueeze(1)
+            var = (second_moment - mu.pow(2)).clamp_min(self.gmm_var_floor)
+        # Final posterior
+        gamma = F.softmax(self._gmm_log_prob(x, pi, mu, var), dim=1)
+        return {'pi': pi, 'mu': mu, 'var': var, 'posterior': gamma}
 
-        # Prototype weights (K, D), already L2-normalized in training loop
-        C = self.prototypes.weight  # (K, D)
+    def _gaussian_cost(self, mu1, var1, mu2, var2):
+        """Wasserstein-2 inspired cost between pairs of diagonal Gaussians.
 
-        # --- Compute OT target Q* from fused representation ---
-        S_bar = h_shared @ C.t()  # (B, K)
-        Q_star = self.sinkhorn_knopp(S_bar, epsilon=epsilon,
-                                      sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        C(k_i, k_j) = ||mu_i - mu_j||^2 + Tr(Σ_i + Σ_j - 2(Σ_i Σ_j)^{1/2})
+        For diagonal covariances this simplifies element-wise.
 
-        # --- Per-modality cluster predictions ---
-        loss_cluster = 0.0
-        for h_m in [h_c_l, h_c_v, h_c_a]:
-            s_m = h_m @ C.t()  # (B, K)
-            log_p_m = F.log_softmax(s_m / tau, dim=1)  # (B, K)
-            loss_cluster -= torch.mean(torch.sum(Q_star * log_p_m, dim=1))
-
-        loss_cluster /= 3.0  # average over 3 modalities
-        return loss_cluster
-
-    def compute_push_loss(self, t=1.0):
+        Returns:
+            (K, K) cost matrix.
         """
-        Compute L_push: prototype separation loss.
-        Encourages prototypes to be far apart from each other.
+        diff = mu1.unsqueeze(1) - mu2.unsqueeze(0)          # (K, K, D)
+        mean_cost = diff.pow(2).mean(dim=2)                  # (K, K)
+        cov_cost = (
+            var1.unsqueeze(1)
+            + var2.unsqueeze(0)
+            - 2.0 * torch.sqrt(var1.unsqueeze(1) * var2.unsqueeze(0) + 1e-8)
+        ).mean(dim=2)                                        # (K, K)
+        return mean_cost + cov_cost
+
+    def _sample_to_proto_cost(self, x, mu, var):
+        """Squared-distance cost from each sample to each prototype.
+
+        Args:
+            x: (B, D) samples.
+            mu: (K, D) prototype means.
+            var: (K, D) prototype variances (unused unless Mahalanobis).
+        Returns:
+            (B, K) cost matrix.
         """
-        C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-        K = C.shape[0]
+        diff = x.unsqueeze(1) - mu.unsqueeze(0)  # (B, K, D)
+        return diff.pow(2).mean(dim=2)
 
-        # Pairwise squared L2 distances
-        # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-        # Since C is L2-normalized: ||c_i||^2 = 1
-        dots = C @ C.t()  # (K, K)
-        sq_dists = 2.0 - 2.0 * dots  # (K, K)
+    def _multi_marginal_sinkhorn(self, cost, nu_l, nu_a, nu_v):
+        """Multi-marginal Sinkhorn solver for 3-modality prototype alignment.
 
-        # Mask out diagonal
-        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-        sq_dists_off = sq_dists[mask]  # K*(K-1)
+        Args:
+            cost: (K, K, K) joint cost tensor.
+            nu_l, nu_a, nu_v: (K,) marginal distributions.
+        Returns:
+            Scalar OT loss (transport cost + entropy regularization).
+        """
+        k = cost.size(0)
+        kernel = torch.exp(-cost / max(self.ot_reg, 1e-6)).clamp_min(1e-30)
+        u = torch.ones(k, device=cost.device, dtype=cost.dtype)
+        v = torch.ones_like(u)
+        w = torch.ones_like(u)
 
-        # L_push = log( (1 / K(K-1)) * sum_{i!=j} exp(-t * ||c_i - c_j||^2) )
-        loss_push = torch.logsumexp(-t * sq_dists_off, dim=0) - math.log(K * (K - 1))
-        return loss_push
+        for _ in range(self.ot_num_iters):
+            u = nu_l / (torch.sum(kernel * v.view(1, k, 1) * w.view(1, 1, k), dim=(1, 2)) + 1e-8)
+            v = nu_a / (torch.sum(kernel * u.view(k, 1, 1) * w.view(1, 1, k), dim=(0, 2)) + 1e-8)
+            w = nu_v / (torch.sum(kernel * u.view(k, 1, 1) * v.view(1, k, 1), dim=(0, 1)) + 1e-8)
+
+        plan = u.view(k, 1, 1) * v.view(1, k, 1) * w.view(1, 1, k) * kernel
+        entropy = (plan * (plan.clamp_min(1e-8).log() - 1.0)).sum()
+        return (plan * cost).sum() + self.ot_reg * entropy
+
+    def compute_hetero_loss(self, c_l, c_a, c_v):
+        """Heterogeneity alignment loss on the shared space.
+
+        Combines:
+          - L_OT:    Multi-marginal OT aligning GMM prototypes across modalities.
+          - L_Proto:  Sample-to-prototype calibration (weighted by GMM posterior).
+
+        Args:
+            c_l, c_a, c_v: shared features, each (T, B, D).
+        Returns:
+            Scalar L_hete = L_OT + L_Proto.
+        """
+        # Mean-pool over temporal dimension → (B, D)
+        x_l = c_l.mean(dim=0)
+        x_a = c_a.mean(dim=0)
+        x_v = c_v.mean(dim=0)
+
+        # Fit per-modality GMMs
+        g_l = self._fit_gmm_em(x_l)
+        g_a = self._fit_gmm_em(x_a)
+        g_v = self._fit_gmm_em(x_v)
+
+        # Marginal distributions from posteriors
+        nu_l = g_l['posterior'].mean(dim=0)
+        nu_a = g_a['posterior'].mean(dim=0)
+        nu_v = g_v['posterior'].mean(dim=0)
+        nu_l = nu_l / nu_l.sum().clamp_min(1e-8)
+        nu_a = nu_a / nu_a.sum().clamp_min(1e-8)
+        nu_v = nu_v / nu_v.sum().clamp_min(1e-8)
+
+        # Pairwise Gaussian costs → joint 3D cost tensor
+        cost_la = self._gaussian_cost(g_l['mu'], g_l['var'], g_a['mu'], g_a['var'])  # (K, K)
+        cost_lv = self._gaussian_cost(g_l['mu'], g_l['var'], g_v['mu'], g_v['var'])  # (K, K)
+        cost_av = self._gaussian_cost(g_a['mu'], g_a['var'], g_v['mu'], g_v['var'])  # (K, K)
+        joint_cost = cost_la.unsqueeze(2) + cost_lv.unsqueeze(1) + cost_av.unsqueeze(0)  # (K, K, K)
+
+        # L_OT: global prototype alignment
+        ot_loss = self._multi_marginal_sinkhorn(joint_cost, nu_l, nu_a, nu_v)
+
+        # L_Proto: local sample-to-prototype calibration
+        # Each source modality's samples are aligned to target modality prototypes
+        local_losses = [
+            (g_l['posterior'] * self._sample_to_proto_cost(x_l, g_a['mu'], g_a['var'])).sum(dim=1).mean(),
+            (g_l['posterior'] * self._sample_to_proto_cost(x_l, g_v['mu'], g_v['var'])).sum(dim=1).mean(),
+            (g_a['posterior'] * self._sample_to_proto_cost(x_a, g_l['mu'], g_l['var'])).sum(dim=1).mean(),
+            (g_a['posterior'] * self._sample_to_proto_cost(x_a, g_v['mu'], g_v['var'])).sum(dim=1).mean(),
+            (g_v['posterior'] * self._sample_to_proto_cost(x_v, g_l['mu'], g_l['var'])).sum(dim=1).mean(),
+            (g_v['posterior'] * self._sample_to_proto_cost(x_v, g_a['mu'], g_a['var'])).sum(dim=1).mean(),
+        ]
+        local_proto_loss = torch.stack(local_losses).mean()
+
+        return ot_loss + local_proto_loss

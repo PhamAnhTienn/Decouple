@@ -6,16 +6,15 @@ from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import wandb
-from models.DP import CMD
+# from models.DP import CMD
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
 
 LAMBDA_RECON_GROUP = 0.1
 LAMBDA_ORT_INNER   = 0.1
-LAMBDA_CLUSTER     = 0.1
-LAMBDA_PUSH        = 0.1
-LAMBDA_CMD         = 0.1
+LAMBDA_HETE        = 0.1
+# LAMBDA_CMD         = 0.1
 
 
 class MSE(nn.Module):
@@ -35,34 +34,31 @@ class DP():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.loss_cmd = CMD()
+        # self.loss_cmd = CMD()
 
-    def get_cmd_loss(self, output, n_moments=5):
-        """CMD loss between shared states (utt-level mean-pooled, no L2-norm)."""
-        loss = self.loss_cmd(output['utt_shared_l'], output['utt_shared_v'], n_moments)
-        loss += self.loss_cmd(output['utt_shared_l'], output['utt_shared_a'], n_moments)
-        loss += self.loss_cmd(output['utt_shared_a'], output['utt_shared_v'], n_moments)
-        loss = loss / 3.0
-        return loss
+    # def get_cmd_loss(self, output, n_moments=5):
+    #     """CMD loss between shared states (utt-level mean-pooled, no L2-norm)."""
+    #     loss = self.loss_cmd(output['utt_shared_l'], output['utt_shared_v'], n_moments)
+    #     loss += self.loss_cmd(output['utt_shared_l'], output['utt_shared_a'], n_moments)
+    #     loss += self.loss_cmd(output['utt_shared_a'], output['utt_shared_v'], n_moments)
+    #     loss = loss / 3.0
+    #     return loss
 
     def do_train(self, model, dataloader, return_epoch_results=False):
         # --- W&B Init ---
         wandb.init(
             entity="anhtien130805-vietnam-national-university-hanoi",
             project="Decouple",
-            name=f"{getattr(self.args,'dataset_name','NA')}_seed{getattr(self.args,'cur_seed','NA')}_lc{LAMBDA_CLUSTER}_lp{LAMBDA_PUSH}",
+            name=f"{getattr(self.args,'dataset_name','NA')}_seed{getattr(self.args,'cur_seed','NA')}_lhete{LAMBDA_HETE}",
             group=getattr(self.args, 'model_name', None),
             config={
                 **(vars(self.args) if hasattr(self.args, '__dict__') else {}),
                 "lambda_recon_group": LAMBDA_RECON_GROUP,
                 "lambda_ort_inner": LAMBDA_ORT_INNER,
-                "lambda_cluster": LAMBDA_CLUSTER,
-                "lambda_push": LAMBDA_PUSH,
-                "lambda_cmd": LAMBDA_CMD,
+                "lambda_hete": LAMBDA_HETE
             },
             reinit="finish_previous",
         )
-        wandb.watch(model.prototypes, log='gradients', log_freq=50)
 
         optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=self.args.patience)
@@ -77,9 +73,7 @@ class DP():
         min_or_max = 'min' if self.args.KeyEval in ['Loss'] else 'max'
         best_valid = 1e8 if min_or_max == 'min' else 0
 
-        # Number of initial iterations to freeze prototype weights
-        freeze_prototypes_niters = getattr(self.args, 'freeze_prototypes_niters', -1)
-        global_iter = 0
+
 
         try:
             while True:
@@ -93,9 +87,8 @@ class DP():
                 epoch_loss_recon = 0.0
                 epoch_loss_s_sr = 0.0
                 epoch_loss_ort = 0.0
-                epoch_loss_cluster = 0.0
-                epoch_loss_push = 0.0
-                epoch_loss_cmd = 0.0
+                epoch_loss_hete = 0.0
+                # epoch_loss_cmd = 0.0
                 num_batches = 0
 
                 left_epochs = self.args.update_epochs
@@ -118,7 +111,7 @@ class DP():
 
                         logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
-                        output = model(text, audio, vision, is_distill=True)
+                        output = model(text_m, audio_m, vision_m, is_distill=True)
 
                         # logits for homo GD
                         logits_homo.append(output['logits_l_homo'])
@@ -151,12 +144,6 @@ class DP():
 
                         # # edges for hetero distill
                         # edges_hetero, edges_origin_hetero = model[2](logits_hetero, reprs_hetero)
-
-                        # normalize the prototypes
-                        with torch.no_grad():
-                            w = model.prototypes.weight.data.clone()
-                            w = F.normalize(w, dim=1, p=2)
-                            model.prototypes.weight.copy_(w)
 
                         # task loss
                         loss_task_all = self.criterion(output['output_logit'], labels)
@@ -199,21 +186,17 @@ class DP():
 
                         loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                        # cluster loss (OT-based)
-                        loss_cluster = model.compute_cluster_loss(
-                            output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                        # heterogeneity alignment loss (GMM + OT on shared space)
+                        loss_hete = model.compute_hetero_loss(
+                            output['c_l'], output['c_a'], output['c_v']
                         )
 
-                        # prototype separation loss
-                        loss_push = model.compute_push_loss(t=1.0)
-
-                        # CMD loss (shared-space distribution alignment)
-                        loss_cmd = self.get_cmd_loss(output, n_moments=5)
+                        # # CMD loss (shared-space distribution alignment)
+                        # loss_cmd = self.get_cmd_loss(output, n_moments=5)
 
                         combined_loss = loss_task + \
                                         (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
-                                        loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH + \
-                                        loss_cmd * LAMBDA_CMD
+                                        loss_hete * LAMBDA_HETE
                         combined_loss.backward()
 
                         # --- Step-level W&B logging ---
@@ -221,9 +204,8 @@ class DP():
                         _loss_recon_val = loss_recon.item()
                         _loss_s_sr_val = loss_s_sr.item()
                         _loss_ort_val = loss_ort.item()
-                        _loss_cluster_val = loss_cluster.item()
-                        _loss_push_val = loss_push.item()
-                        _loss_cmd_val = loss_cmd.item()
+                        _loss_hete_val = loss_hete.item()
+                        # _loss_cmd_val = loss_cmd.item()
                         _combined_val = combined_loss.item()
 
                         wandb.log({
@@ -232,17 +214,13 @@ class DP():
                             "step/loss_recon": _loss_recon_val,
                             "step/loss_s_sr": _loss_s_sr_val,
                             "step/loss_ort": _loss_ort_val,
-                            "step/loss_cluster": _loss_cluster_val,
-                            "step/loss_push": _loss_push_val,
-                            "step/loss_cmd": _loss_cmd_val,
+                            "step/loss_hete": _loss_hete_val,
                             "step/combined_loss": _combined_val,
                             # Weighted contributions to combined_loss
                             "step/weighted_recon": _loss_recon_val * LAMBDA_RECON_GROUP,
                             "step/weighted_s_sr": _loss_s_sr_val * LAMBDA_RECON_GROUP,
                             "step/weighted_ort": _loss_ort_val * LAMBDA_RECON_GROUP * LAMBDA_ORT_INNER,
-                            "step/weighted_cluster": _loss_cluster_val * LAMBDA_CLUSTER,
-                            "step/weighted_push": _loss_push_val * LAMBDA_PUSH,
-                            "step/weighted_cmd": _loss_cmd_val * LAMBDA_CMD,
+                            "step/weighted_hete": _loss_hete_val * LAMBDA_HETE,
                         })
 
                         # Accumulate for epoch-level averages
@@ -250,21 +228,11 @@ class DP():
                         epoch_loss_recon += _loss_recon_val
                         epoch_loss_s_sr += _loss_s_sr_val
                         epoch_loss_ort += _loss_ort_val
-                        epoch_loss_cluster += _loss_cluster_val
-                        epoch_loss_push += _loss_push_val
-                        epoch_loss_cmd += _loss_cmd_val
+                        epoch_loss_hete += _loss_hete_val
                         num_batches += 1
-
-                        # Freeze prototypes during warmup iterations
-                        if freeze_prototypes_niters > 0 and global_iter < freeze_prototypes_niters:
-                            for name, p in model.named_parameters():
-                                if "prototypes" in name:
-                                    p.grad = None
 
                         if self.args.grad_clip != -1.0:
                             nn.utils.clip_grad_value_(model.parameters(), self.args.grad_clip)
-
-                        global_iter += 1
 
                         train_loss += combined_loss.item()
 
@@ -297,9 +265,8 @@ class DP():
                 avg_recon = epoch_loss_recon / n
                 avg_s_sr = epoch_loss_s_sr / n
                 avg_ort = epoch_loss_ort / n
-                avg_cluster = epoch_loss_cluster / n
-                avg_push = epoch_loss_push / n
-                avg_cmd = epoch_loss_cmd / n
+                avg_hete = epoch_loss_hete / n
+                # avg_cmd = epoch_loss_cmd / n
 
                 epoch_log = {
                     "epoch": epochs,
@@ -308,19 +275,13 @@ class DP():
                     "epoch/loss_recon": avg_recon,
                     "epoch/loss_s_sr": avg_s_sr,
                     "epoch/loss_ort": avg_ort,
-                    "epoch/loss_cluster": avg_cluster,
-                    "epoch/loss_push": avg_push,
-                    "epoch/loss_cmd": avg_cmd,
+                    "epoch/loss_hete": avg_hete,
                     "epoch/combined_loss": train_loss,
                     # Weighted contributions (epoch avg)
-                    "epoch/weighted_recon_group": (avg_s_sr + avg_recon + avg_ort * 0.1) * 0.1,
-                    "epoch/weighted_cluster": avg_cluster * LAMBDA_CLUSTER,
-                    "epoch/weighted_push": avg_push * LAMBDA_PUSH,
-                    "epoch/weighted_cmd": avg_cmd * LAMBDA_CMD,
+                    "epoch/weighted_recon_group": (avg_s_sr + avg_recon + avg_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP,
+                    "epoch/weighted_hete": avg_hete * LAMBDA_HETE,
                     # Relative magnitudes to task loss
-                    "epoch/cluster_to_task_ratio": (avg_cluster * LAMBDA_CLUSTER) / (avg_task + 1e-8),
-                    "epoch/push_to_task_ratio": (avg_push * LAMBDA_PUSH) / (avg_task + 1e-8),
-                    "epoch/cmd_to_task_ratio": (avg_cmd * LAMBDA_CMD) / (avg_task + 1e-8),
+                    "epoch/hete_to_task_ratio": (avg_hete * LAMBDA_HETE) / (avg_task + 1e-8),
                     # Learning rate
                     "epoch/learning_rate": optimizer.param_groups[0]['lr'],
                 }
@@ -330,17 +291,6 @@ class DP():
                 # Validation metrics
                 for k, v in val_results.items():
                     epoch_log[f"val/{k}"] = v
-
-                # Prototype statistics
-                with torch.no_grad():
-                    C = F.normalize(model.prototypes.weight.data, dim=1, p=2)
-                    dots = C @ C.t()
-                    K = C.shape[0]
-                    mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-                    pairwise_cosines = dots[mask]
-                    epoch_log["epoch/proto_cosine_mean"] = pairwise_cosines.mean().item()
-                    epoch_log["epoch/proto_cosine_max"] = pairwise_cosines.max().item()
-                    epoch_log["epoch/proto_cosine_min"] = pairwise_cosines.min().item()
 
                 wandb.log(epoch_log)
 
@@ -392,7 +342,7 @@ class DP():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text, audio, vision, is_distill=True)
+                    output = model(text_m, audio_m, vision_m, is_distill=True)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()
