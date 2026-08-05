@@ -6,7 +6,7 @@ from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import wandb
-from models.DP import CMD
+# from models.DP import CMD
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
@@ -14,7 +14,7 @@ logger = logging.getLogger('DecAlign')
 LAMBDA_RECON_GROUP = 0.1
 LAMBDA_ORT_INNER   = 0.1
 LAMBDA_CLUSTER     = 0.1
-LAMBDA_PUSH        = 0.1
+LAMBDA_LOCAL       = 0.1
 LAMBDA_CMD         = 0.1
 
 
@@ -35,7 +35,7 @@ class DP():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.loss_cmd = CMD()
+        # self.loss_cmd = CMD()
 
     def get_cmd_loss(self, output, n_moments=5):
         """CMD loss between shared states (utt-level mean-pooled, no L2-norm)."""
@@ -50,19 +50,18 @@ class DP():
         wandb.init(
             entity="anhtien130805-vietnam-national-university-hanoi",
             project="Decouple",
-            name=f"{getattr(self.args,'dataset_name','NA')}_seed{getattr(self.args,'cur_seed','NA')}_lc{LAMBDA_CLUSTER}_lp{LAMBDA_PUSH}",
+            name=f"{getattr(self.args,'dataset_name','NA')}_seed{getattr(self.args,'cur_seed','NA')}_lc{LAMBDA_CLUSTER}_ll{LAMBDA_LOCAL}",
             group=getattr(self.args, 'model_name', None),
             config={
                 **(vars(self.args) if hasattr(self.args, '__dict__') else {}),
                 "lambda_recon_group": LAMBDA_RECON_GROUP,
                 "lambda_ort_inner": LAMBDA_ORT_INNER,
                 "lambda_cluster": LAMBDA_CLUSTER,
-                "lambda_push": LAMBDA_PUSH,
+                "lambda_local": LAMBDA_LOCAL,
                 "lambda_cmd": LAMBDA_CMD,
             },
             reinit="finish_previous",
         )
-        wandb.watch(model.prototypes, log='gradients', log_freq=50)
 
         optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=self.args.patience)
@@ -77,8 +76,10 @@ class DP():
         min_or_max = 'min' if self.args.KeyEval in ['Loss'] else 'max'
         best_valid = 1e8 if min_or_max == 'min' else 0
 
-        # Number of initial iterations to freeze prototype weights
-        freeze_prototypes_niters = getattr(self.args, 'freeze_prototypes_niters', -1)
+        # Warm-up and centroid re-computation schedule
+        warmup_epochs = getattr(self.args, 'warmup_epochs', 4)
+        centroid_recompute_every = getattr(self.args, 'centroid_recompute_every', 1)
+        centroid_momentum = getattr(self.args, 'centroid_momentum', 0.999)
         global_iter = 0
 
         try:
@@ -94,9 +95,21 @@ class DP():
                 epoch_loss_s_sr = 0.0
                 epoch_loss_ort = 0.0
                 epoch_loss_cluster = 0.0
-                epoch_loss_push = 0.0
+                epoch_loss_local = 0.0
                 epoch_loss_cmd = 0.0
                 num_batches = 0
+
+                # Determine if we are past the warm-up phase
+                past_warmup = epochs > warmup_epochs
+
+                # Re-compute K-means centroids after warm-up
+                if past_warmup and (epochs - warmup_epochs - 1) % centroid_recompute_every == 0:
+                    logger.info(f">> Epoch {epochs}: Re-computing K-means centroids...")
+                    model.recompute_centroids(
+                        dataloader['train'], self.args.device,
+                        alpha=centroid_momentum
+                    )
+                    logger.info(f">> Centroids updated (initialized={model.centroids_initialized}).")
 
                 left_epochs = self.args.update_epochs
                 with tqdm(dataloader['train']) as td:
@@ -152,12 +165,6 @@ class DP():
                         # # edges for hetero distill
                         # edges_hetero, edges_origin_hetero = model[2](logits_hetero, reprs_hetero)
 
-                        # normalize the prototypes
-                        with torch.no_grad():
-                            w = model.prototypes.weight.data.clone()
-                            w = F.normalize(w, dim=1, p=2)
-                            model.prototypes.weight.copy_(w)
-
                         # task loss
                         loss_task_all = self.criterion(output['output_logit'], labels)
                         loss_task_l_homo = self.criterion(output['logits_l_homo'], labels)
@@ -199,20 +206,30 @@ class DP():
 
                         loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                        # cluster loss (OT-based)
-                        loss_cluster = model.compute_cluster_loss(
-                            output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
-                        )
+                        # Compute cluster and local losses only after warm-up
+                        if past_warmup:
+                            # cluster loss (OT-based Global Pull Loss)
+                            loss_cluster = model.compute_cluster_loss(
+                                output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                            )
 
-                        # prototype separation loss
-                        loss_push = model.compute_push_loss(margin=2.0)
+                            # local pull loss (instance-level contrastive)
+                            loss_local = model.compute_local_loss(output, tau_l=0.05)
+
+                            combined_loss = loss_task + \
+                                            (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
+                                            loss_cluster * LAMBDA_CLUSTER + \
+                                            loss_local * LAMBDA_LOCAL
+                        else:
+                            # Warm-up: only task + recon + diff (ort) losses
+                            loss_cluster = torch.tensor(0.0, device=labels.device)
+                            loss_local = torch.tensor(0.0, device=labels.device)
+
+                            combined_loss = loss_task + \
+                                            (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP
 
                         # # CMD loss (shared-space distribution alignment)
                         # loss_cmd = self.get_cmd_loss(output, n_moments=5)
-
-                        combined_loss = loss_task + \
-                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
-                                        loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH
                         combined_loss.backward()
 
                         # --- Step-level W&B logging ---
@@ -221,7 +238,7 @@ class DP():
                         _loss_s_sr_val = loss_s_sr.item()
                         _loss_ort_val = loss_ort.item()
                         _loss_cluster_val = loss_cluster.item()
-                        _loss_push_val = loss_push.item()
+                        _loss_local_val = loss_local.item()
                         # _loss_cmd_val = loss_cmd.item()
                         _combined_val = combined_loss.item()
 
@@ -232,14 +249,15 @@ class DP():
                             "step/loss_s_sr": _loss_s_sr_val,
                             "step/loss_ort": _loss_ort_val,
                             "step/loss_cluster": _loss_cluster_val,
-                            "step/loss_push": _loss_push_val,
+                            "step/loss_local": _loss_local_val,
                             "step/combined_loss": _combined_val,
+                            "step/past_warmup": past_warmup,
                             # Weighted contributions to combined_loss
                             "step/weighted_recon": _loss_recon_val * LAMBDA_RECON_GROUP,
                             "step/weighted_s_sr": _loss_s_sr_val * LAMBDA_RECON_GROUP,
                             "step/weighted_ort": _loss_ort_val * LAMBDA_RECON_GROUP * LAMBDA_ORT_INNER,
                             "step/weighted_cluster": _loss_cluster_val * LAMBDA_CLUSTER,
-                            "step/weighted_push": _loss_push_val * LAMBDA_PUSH,
+                            "step/weighted_local": _loss_local_val * LAMBDA_LOCAL,
                             # "step/weighted_cmd": _loss_cmd_val * LAMBDA_CMD,
                         })
 
@@ -249,15 +267,10 @@ class DP():
                         epoch_loss_s_sr += _loss_s_sr_val
                         epoch_loss_ort += _loss_ort_val
                         epoch_loss_cluster += _loss_cluster_val
-                        epoch_loss_push += _loss_push_val
+                        epoch_loss_local += _loss_local_val
                         # epoch_loss_cmd += _loss_cmd_val
                         num_batches += 1
 
-                        # Freeze prototypes during warmup iterations
-                        if freeze_prototypes_niters > 0 and global_iter < freeze_prototypes_niters:
-                            for name, p in model.named_parameters():
-                                if "prototypes" in name:
-                                    p.grad = None
 
                         if self.args.grad_clip != -1.0:
                             nn.utils.clip_grad_value_(model.parameters(), self.args.grad_clip)
@@ -296,29 +309,30 @@ class DP():
                 avg_s_sr = epoch_loss_s_sr / n
                 avg_ort = epoch_loss_ort / n
                 avg_cluster = epoch_loss_cluster / n
-                avg_push = epoch_loss_push / n
-                avg_cmd = epoch_loss_cmd / n
+                avg_local = epoch_loss_local / n
+                # avg_cmd = epoch_loss_cmd / n
 
                 epoch_log = {
                     "epoch": epochs,
+                    "epoch/past_warmup": past_warmup,
                     # Average raw losses per epoch
                     "epoch/loss_task": avg_task,
                     "epoch/loss_recon": avg_recon,
                     "epoch/loss_s_sr": avg_s_sr,
                     "epoch/loss_ort": avg_ort,
                     "epoch/loss_cluster": avg_cluster,
-                    "epoch/loss_push": avg_push,
-                    "epoch/loss_cmd": avg_cmd,
+                    "epoch/loss_local": avg_local,
+                    # "epoch/loss_cmd": avg_cmd,
                     "epoch/combined_loss": train_loss,
                     # Weighted contributions (epoch avg)
                     "epoch/weighted_recon_group": (avg_s_sr + avg_recon + avg_ort * 0.1) * 0.1,
                     "epoch/weighted_cluster": avg_cluster * LAMBDA_CLUSTER,
-                    "epoch/weighted_push": avg_push * LAMBDA_PUSH,
-                    "epoch/weighted_cmd": avg_cmd * LAMBDA_CMD,
+                    "epoch/weighted_local": avg_local * LAMBDA_LOCAL,
+                    # "epoch/weighted_cmd": avg_cmd * LAMBDA_CMD,
                     # Relative magnitudes to task loss
                     "epoch/cluster_to_task_ratio": (avg_cluster * LAMBDA_CLUSTER) / (avg_task + 1e-8),
-                    "epoch/push_to_task_ratio": (avg_push * LAMBDA_PUSH) / (avg_task + 1e-8),
-                    "epoch/cmd_to_task_ratio": (avg_cmd * LAMBDA_CMD) / (avg_task + 1e-8),
+                    "epoch/local_to_task_ratio": (avg_local * LAMBDA_LOCAL) / (avg_task + 1e-8),
+                    # "epoch/cmd_to_task_ratio": (avg_cmd * LAMBDA_CMD) / (avg_task + 1e-8),
                     # Learning rate
                     "epoch/learning_rate": optimizer.param_groups[0]['lr'],
                 }
@@ -329,16 +343,17 @@ class DP():
                 for k, v in val_results.items():
                     epoch_log[f"val/{k}"] = v
 
-                # Prototype statistics
-                with torch.no_grad():
-                    C = F.normalize(model.prototypes.weight.data, dim=1, p=2)
-                    dots = C @ C.t()
-                    K = C.shape[0]
-                    mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-                    pairwise_cosines = dots[mask]
-                    epoch_log["epoch/proto_cosine_mean"] = pairwise_cosines.mean().item()
-                    epoch_log["epoch/proto_cosine_max"] = pairwise_cosines.max().item()
-                    epoch_log["epoch/proto_cosine_min"] = pairwise_cosines.min().item()
+                # Centroid statistics (if initialized)
+                if model.centroids_initialized:
+                    with torch.no_grad():
+                        C = model.centroids  # already L2-normalized
+                        dots = C @ C.t()
+                        K = C.shape[0]
+                        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
+                        pairwise_cosines = dots[mask]
+                        epoch_log["epoch/centroid_cosine_mean"] = pairwise_cosines.mean().item()
+                        epoch_log["epoch/centroid_cosine_max"] = pairwise_cosines.max().item()
+                        epoch_log["epoch/centroid_cosine_min"] = pairwise_cosines.min().item()
 
                 wandb.log(epoch_log)
 

@@ -454,4 +454,7 @@ class DecAlign(nn.Module):
             "fusion_rep_hete": torch.cat([h_l, h_a, h_v], dim=1),
             "fusion_rep_homo": torch.cat([c_l_avg, c_a_avg, c_v_avg], dim=1),
             "final_rep": final_rep,
+            "repr_l_homo": c_l_avg,
+            "repr_a_homo": c_a_avg,
+            "repr_v_homo": c_v_avg
         }

@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
+from sklearn.cluster import KMeans
+from scipy.optimize import linear_sum_assignment
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
@@ -91,9 +94,10 @@ class DP(nn.Module):
         self.decoder_v = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
         self.decoder_a = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
 
-        # init prototype
+        # init cluster centroids (fixed, not trainable)
         self.nmb_prototypes = args.nmb_prototypes
-        self.prototypes = nn.Linear(self.d_a, args.nmb_prototypes, bias=False)
+        self.register_buffer('centroids', torch.zeros(args.nmb_prototypes, self.d_a))
+        self.centroids_initialized = False
 
         # for align c_l, c_v, c_a
         self.self_attentions_c_l = self.get_network(self_type='l')
@@ -399,16 +403,17 @@ class DP(nn.Module):
 
     def compute_cluster_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
         """
-        Compute L_cluster: OT-based cross-entropy between soft assignments Q*
-        and per-modality cluster predictions.
+        Compute L_cluster (Global Pull Loss): OT-based cross-entropy between
+        soft assignments Q* and per-modality cluster predictions.
+        Uses fixed K-means centroids instead of trainable prototypes.
         """
         h_shared = output['h_shared']  # (B, D)
         h_c_l = output['h_c_l']        # (B, D)
         h_c_v = output['h_c_v']        # (B, D)
         h_c_a = output['h_c_a']        # (B, D)
 
-        # Prototype weights (K, D), already L2-normalized in training loop
-        C = self.prototypes.weight  # (K, D)
+        # Fixed centroids (K, D), L2-normalized during K-means re-computation
+        C = self.centroids  # (K, D)
 
         # --- Compute OT target Q* from fused representation ---
         S_bar = h_shared @ C.t()  # (B, K)
@@ -425,25 +430,139 @@ class DP(nn.Module):
         loss_cluster /= 3.0  # average over 3 modalities
         return loss_cluster
 
-    def compute_push_loss(self, margin=2.0):
+    def compute_local_loss(self, output, tau_l=0.05, epsilon=0.05, sinkhorn_iterations=3):
         """
-        Compute L_push: margin-based prototype separation loss.
-        L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
+        Compute L_local: instance-level contrastive loss that pulls each
+        modality embedding h_i^{c,m} toward its own aggregated anchor sg(h̄_i^c),
+        with cluster-overlap-weighted negatives for semantic discrimination.
+
+        L_local = -1/(3B) Σ_i Σ_m log [
+            exp(cos(sg(h̄_i^c), h_i^{c,m}) / τ_l)
+            / Σ_j exp((1 - s_ij) · cos(sg(h̄_i^c), h_j^{c,m}) / τ_l)
+        ]
+
+        where s_ij = q_i^T q_j is the cluster overlap between samples i,j
+        and q_i = L1-normalize(Q*_i).
+
+        The stop-gradient on h̄_i^c prevents the trivial collapse solution.
         """
-        C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-        K = C.shape[0]
+        h_c_l = output['h_c_l']  # (B, D), L2-normalized
+        h_c_v = output['h_c_v']
+        h_c_a = output['h_c_a']
+        h_shared = output['h_shared']  # (B, D), L2-normalized
 
-        # Pairwise squared L2 distances
-        # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-        # Since C is L2-normalized: ||c_i||^2 = 1
-        dots = C @ C.t()  # (K, K)
-        sq_dists = 2.0 - 2.0 * dots  # (K, K)
+        # --- Compute OT soft assignments Q* ---
+        C = self.centroids  # (K, D) — fixed centroids
+        S_bar = h_shared @ C.t()  # (B, K)
+        Q_star = self.sinkhorn_knopp(S_bar, epsilon=epsilon,
+                                      sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
 
-        # Mask out diagonal
-        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-        sq_dists_off = sq_dists[mask]  # K*(K-1)
+        # L1-normalize Q* row-wise → soft cluster distribution per sample
+        q = F.normalize(Q_star, p=1, dim=1)  # (B, K), rows sum to 1
 
-        # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-        return loss_push
+        # Cluster overlap matrix: s_ij ∈ [0, 1]
+        s_ij = q @ q.t()  # (B, B)
+
+        # Cross-modal mean anchor with stop-gradient
+        h_bar = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
+        h_bar = h_bar.detach()  # sg(h̄) — prevents collapse
+
+        B = h_c_l.size(0)
+        loss = 0.0
+        for h_m in [h_c_l, h_c_v, h_c_a]:
+            # cos(sg(h̄_i), h_j^m) for all (i, j) pairs
+            # h_bar[i] dot h_m[j] → (B, B) where [i,j] = cos(sg(h̄_i), h_j^m)
+            cos_sim = h_bar @ h_m.t()  # (B, B)
+
+            # Negative weighting: (1 - s_ij) downweights same-cluster negatives
+            neg_weight = 1.0 - s_ij  # (B, B)
+            # Positive (diagonal) keeps full weight = 1.0
+            neg_weight = neg_weight.fill_diagonal_(1.0)
+
+            logits = neg_weight * cos_sim / tau_l  # (B, B)
+
+            # Target: sample i matches anchor i (diagonal)
+            labels = torch.arange(B, device=h_m.device)
+            loss += F.cross_entropy(logits, labels)
+
+        loss /= 3.0
+        return loss
+
+    @torch.no_grad()
+    def recompute_centroids(self, dataloader, device, alpha=0.999, text_key='text',
+                            audio_key='audio', video_key='vision'):
+        """
+        Re-compute cluster centroids by performing a no-gradient forward pass
+        over the entire training set, then running K-means.
+
+        Steps:
+        1. Collect all h_shared embeddings from the training set.
+        2. Run K-means (warm-started from previous centroids if available).
+        3. Apply Hungarian matching to preserve cluster index consistency.
+        4. Apply inter-epoch momentum update for smoother centroid evolution.
+
+        Args:
+            dataloader: training dataloader
+            device: torch device
+            alpha: momentum coefficient for inter-epoch centroid smoothing
+        """
+        was_training = self.training
+        self.eval()
+
+        all_h_shared = []
+        for batch_data in dataloader:
+            text = batch_data[text_key].to(device)
+            audio = batch_data[audio_key].to(device)
+            vision = batch_data[video_key].to(device)
+
+            output = self.forward(text, audio, vision, is_distill=False)
+            all_h_shared.append(output['h_shared'].cpu())  # (B, D)
+
+        all_h_shared = torch.cat(all_h_shared, dim=0).numpy()  # (N, D)
+
+        K = self.nmb_prototypes
+
+        # Determine initialization strategy
+        if self.centroids_initialized:
+            # Warm-start from previous centroids
+            init_centroids = self.centroids.cpu().numpy()  # (K, D)
+            kmeans = KMeans(n_clusters=K, init=init_centroids, n_init=1,
+                            max_iter=300, random_state=42)
+        else:
+            # First time: use k-means++
+            kmeans = KMeans(n_clusters=K, init='k-means++', n_init=10,
+                            max_iter=300, random_state=42)
+
+        kmeans.fit(all_h_shared)
+        new_centroids = kmeans.cluster_centers_  # (K, D)
+
+        # L2-normalize centroids
+        norms = np.linalg.norm(new_centroids, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        new_centroids = new_centroids / norms
+
+        new_centroids_tensor = torch.from_numpy(new_centroids).float().to(device)
+
+        if self.centroids_initialized:
+            # Hungarian matching: preserve cluster index consistency
+            old_centroids = self.centroids  # (K, D)
+            # Cost matrix: ||c_new_k - c_old_k'||^2
+            cost_matrix = torch.cdist(new_centroids_tensor, old_centroids, p=2).pow(2)  # (K, K)
+            row_ind, col_ind = linear_sum_assignment(cost_matrix.cpu().numpy())
+            # Reorder new centroids to match old cluster indices
+            new_centroids_tensor = new_centroids_tensor[row_ind][torch.argsort(torch.tensor(col_ind))]
+
+            # Inter-epoch momentum update
+            self.centroids.copy_(
+                alpha * old_centroids + (1 - alpha) * new_centroids_tensor
+            )
+            # Re-normalize after momentum blending
+            self.centroids.copy_(
+                F.normalize(self.centroids, dim=1, p=2)
+            )
+        else:
+            self.centroids.copy_(new_centroids_tensor)
+            self.centroids_initialized = True
+
+        if was_training:
+            self.train()

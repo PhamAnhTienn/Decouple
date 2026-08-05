@@ -401,6 +401,7 @@ def plot_tsne(shared_t, shared_v, shared_a, labels, save_path, perplexity=30, se
 
 def main():
     parser = argparse.ArgumentParser(description='t-SNE visualization of DP shared space')
+    parser.add_argument("--model", type=str, default="dp")
     parser.add_argument('--checkpoint', type=str, default='pt/dp-mosi.pth',
                         help='Path to trained DP model checkpoint')
     parser.add_argument('--dataset', type=str, default='mosi', help='Dataset name')
@@ -426,7 +427,7 @@ def main():
     
     # Load config — use 'dp' model name instead of 'misa'
     config_file = args.config_file if args.config_file else ''
-    model_args = get_config_regression('dp', args.dataset, config_file, data_dir=args.data_dir)
+    model_args = get_config_regression(args.model, args.dataset, config_file, data_dir=args.data_dir)
     model_args.device = device
     model_args.model_save_path = args.checkpoint
     
@@ -474,7 +475,7 @@ def main():
         save_path = args.output
     else:
         os.makedirs(str(PROJECT_ROOT / 'result' / 'figures'), exist_ok=True)
-        save_path = str(PROJECT_ROOT / 'result' / 'figures' / f'tsne_dp_shared_{args.dataset}_{args.split}_{model_args.missing_rate_eval_test:.1f}.png')
+        save_path = str(PROJECT_ROOT / 'result' / 'figures' / f'tsne_{args.model}_shared_{args.dataset}_{args.split}_{model_args.missing_rate_eval_test:.1f}.png')
     
     # Generate t-SNE plot
     plot_tsne(
@@ -500,6 +501,7 @@ if __name__ == '__main__':
     main()
 
 # python scripts/visualize_tsne_shared_space_dp.py \
+#     --model dp \
 #     --checkpoint /home/tien/NCKH/DecAlign/pt/dp-mosi-missing0.0.pth \
 #     --config_file config/dp_mosi_config.json \
 #     --missing_data \
