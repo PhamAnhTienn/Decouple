@@ -1,40 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
-
-class CMD(nn.Module):
-    """
-    Central Moment Discrepancy (CMD).
-    Adapted from https://github.com/wzell/cmd/blob/master/models/domain_regularizer.py
-    """
-
-    def __init__(self):
-        super(CMD, self).__init__()
-
-    def forward(self, x1, x2, n_moments):
-        mx1 = torch.mean(x1, 0)
-        mx2 = torch.mean(x2, 0)
-        sx1 = x1 - mx1
-        sx2 = x2 - mx2
-        dm = self.matchnorm(mx1, mx2)
-        scms = dm
-        for i in range(n_moments - 1):
-            scms += self.scm(sx1, sx2, i + 2)
-        return scms
-
-    def matchnorm(self, x1, x2):
-        power = torch.pow(x1 - x2, 2)
-        summed = torch.sum(power)
-        sqrt = summed ** (0.5)
-        return sqrt
-
-    def scm(self, sx1, sx2, k):
-        ss1 = torch.mean(torch.pow(sx1, k), 0)
-        ss2 = torch.mean(torch.pow(sx2, k), 0)
-        return self.matchnorm(ss1, ss2)
 
 
 class DP(nn.Module):
@@ -91,9 +59,18 @@ class DP(nn.Module):
         self.decoder_v = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
         self.decoder_a = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
 
-        # init prototype
-        self.nmb_prototypes = args.nmb_prototypes
-        self.prototypes = nn.Linear(self.d_a, args.nmb_prototypes, bias=False)
+        # Temporal prototype infrastructure
+        self.T_l = self.len_l - args.conv1d_kernel_size_l + 1
+        self.T_v = self.len_v - args.conv1d_kernel_size_v + 1
+        self.T_a = self.len_a - args.conv1d_kernel_size_a + 1
+        self.num_classes = 7
+        self.register_buffer('proto_l', torch.zeros(7, self.T_l, self.d_l))
+        self.register_buffer('proto_v', torch.zeros(7, self.T_v, self.d_v))
+        self.register_buffer('proto_a', torch.zeros(7, self.T_a, self.d_a))
+        self.register_buffer('proto_initialized', torch.zeros(1, dtype=torch.bool))
+        self.cache_l = [[] for _ in range(7)]
+        self.cache_v = [[] for _ in range(7)]
+        self.cache_a = [[] for _ in range(7)]
 
         # for align c_l, c_v, c_a
         self.self_attentions_c_l = self.get_network(self_type='l')
@@ -306,20 +283,6 @@ class DP(nn.Module):
 
         output = self.out_layer(last_hs_proj)
 
-        # --- Cluster & prototype features ---
-        # c_l, c_v, c_a are (T, B, D) at this point
-        # Raw mean-pool over timestep dimension (for CMD loss)
-        utt_shared_l = c_l.mean(dim=0)  # (B, D) — raw, no L2-norm
-        utt_shared_v = c_v.mean(dim=0)  # (B, D)
-        utt_shared_a = c_a.mean(dim=0)  # (B, D)
-        # L2-normalized versions (for cluster/prototype losses)
-        h_c_l = F.normalize(utt_shared_l, dim=1, p=2)  # (B, D)
-        h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
-        h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
-
-        # Fused shared representation (average of 3 modalities, then L2-norm)
-        h_shared = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
-
         res = {
             'logits_l_homo': logits_l_low,
             'logits_v_homo': logits_v_low,
@@ -355,95 +318,122 @@ class DP(nn.Module):
             'last_hs_proj': last_hs_proj,  # (B, combined_dim) — pre-classifier repr    
             'logits_c': logits_c,
             'output_logit': output,
-            # Cluster-related features
-            'h_shared': h_shared,   # (B, D) fused shared representation
-            'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
-            'h_c_v': h_c_v,
-            'h_c_a': h_c_a,
-            # Raw mean-pooled shared features for CMD loss
-            'utt_shared_l': utt_shared_l,  # (B, D)
-            'utt_shared_v': utt_shared_v,
-            'utt_shared_a': utt_shared_a,
         }
         return res
 
+    @staticmethod
+    def discretize_labels(y):
+        """Discretize continuous sentiment labels y ∈ [-3,3] into C=7 classes."""
+        return torch.clamp(torch.round(y + 3), 0, 6).long()
+
     @torch.no_grad()
-    def sinkhorn_knopp(self, S, epsilon=0.05, sinkhorn_iterations=3):
+    def cache_features(self, output, labels):
+        """Append current batch's common features to per-class caches."""
+        classes = self.discretize_labels(labels.view(-1))  # (B,)
+        # c_l, c_v, c_a are (T, B, D) — permute to (B, T, D)
+        c_l = output['c_l'].permute(1, 0, 2).detach()  # (B, T_l, D)
+        c_v = output['c_v'].permute(1, 0, 2).detach()  # (B, T_v, D)
+        c_a = output['c_a'].permute(1, 0, 2).detach()  # (B, T_a, D)
+        for i in range(classes.size(0)):
+            c = classes[i].item()
+            self.cache_l[c].append(c_l[i])  # (T_l, D)
+            self.cache_v[c].append(c_v[i])
+            self.cache_a[c].append(c_a[i])
+
+    def compute_proto_loss(self, output, labels, tau=0.07):
         """
-        Sinkhorn-Knopp algorithm for entropic OT.
-        Args:
-            S: similarity matrix (B, K)
-            epsilon: entropic regularization
-            sinkhorn_iterations: number of normalization iterations
-        Returns:
-            Q: transport plan (B, K), rows sum to 1/B, cols sum to 1/K
+        Compute InfoNCE loss between samples and class prototypes (Eq. 4-5).
+        Only active after prototypes have been initialized (epoch >= 2).
+        Returns 0 during the first epoch (cache-only phase).
         """
-        Q = torch.exp(S / epsilon).t()  # (K, B)
-        B = Q.shape[1]
-        K = Q.shape[0]
+        if not self.proto_initialized.item():
+            return torch.tensor(0.0, device=output['c_l'].device)
 
-        # Make the matrix sums to 1
-        sum_Q = torch.sum(Q)
-        Q /= sum_Q
+        classes = self.discretize_labels(labels.view(-1))  # (B,)
+        loss = 0.0
+        count = 0
 
-        for _ in range(sinkhorn_iterations):
-            # Normalize rows: total weight per prototype must be 1/K
-            Q /= torch.sum(Q, dim=1, keepdim=True)
-            Q /= K
-            # Normalize columns: total weight per sample must be 1/B
-            Q /= torch.sum(Q, dim=0, keepdim=True)
-            Q /= B
+        for c_feat, proto in [
+            (output['c_l'], self.proto_l),   # c_feat: (T, B, D), proto: (7, T_m, D)
+            (output['c_v'], self.proto_v),
+            (output['c_a'], self.proto_a),
+        ]:
+            feat = c_feat.permute(1, 0, 2)  # (B, T_m, D)
+            # Temporal mean: μ(X_i^m) = (1/T'_m) Σ_t X_{i,t}^m
+            mu_feat = feat.mean(dim=1)       # (B, D)
+            # Temporal mean of each prototype: μ(P_c^m)
+            mu_proto = proto.mean(dim=1)     # (7, D)
 
-        Q *= B  # columns sum to 1
-        return Q.t()  # (B, K)
+            # Valid prototypes = classes with non-zero prototype
+            valid_mask = (proto.abs().sum(dim=(1, 2)) > 0)  # (7,)
+            if valid_mask.sum() < 2:
+                continue
 
-    def compute_cluster_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
+            valid_indices = valid_mask.nonzero(as_tuple=True)[0]  # (R,)
+            mu_proto_valid = mu_proto[valid_indices]               # (R, D)
+
+            # Cosine similarities: s_c^m(X_i^m) = cos(μ(X_i^m), μ(P_c^m)) / τ
+            sim = F.cosine_similarity(
+                mu_feat.unsqueeze(1),          # (B, 1, D)
+                mu_proto_valid.unsqueeze(0),   # (1, R, D)
+                dim=2
+            ) / tau  # (B, R)
+
+            # Map class_id -> index in valid_indices
+            class_to_valid = {int(valid_indices[j].item()): j for j in range(len(valid_indices))}
+
+            # InfoNCE: ℓ_i^m = -log(exp(s_{c_i}) / Σ_j exp(s_j))
+            batch_loss = 0.0
+            n_valid = 0
+            for i in range(classes.size(0)):
+                ci = classes[i].item()
+                if ci in class_to_valid:
+                    pos_idx = class_to_valid[ci]
+                    log_softmax = F.log_softmax(sim[i], dim=0)  # (R,)
+                    batch_loss -= log_softmax[pos_idx]
+                    n_valid += 1
+
+            if n_valid > 0:
+                loss += batch_loss / n_valid
+                count += 1
+
+        # Average over modalities (Eq. 5)
+        return loss / max(count, 1)
+
+    @torch.no_grad()
+    def update_prototypes(self):
         """
-        Compute L_cluster: OT-based cross-entropy between soft assignments Q*
-        and per-modality cluster predictions.
+        Update prototypes from caches at end of epoch (Eq. 6-7).
+        Computes centroid, removes 5% farthest samples, averages remaining.
         """
-        h_shared = output['h_shared']  # (B, D)
-        h_c_l = output['h_c_l']        # (B, D)
-        h_c_v = output['h_c_v']        # (B, D)
-        h_c_a = output['h_c_a']        # (B, D)
+        for cache, proto_buf in [
+            (self.cache_l, self.proto_l),
+            (self.cache_v, self.proto_v),
+            (self.cache_a, self.proto_a),
+        ]:
+            for c in range(self.num_classes):
+                S = cache[c]
+                if len(S) == 0:
+                    continue
+                S_tensor = torch.stack(S)          # (N, T_m, D)
+                mu_samples = S_tensor.mean(dim=1)  # (N, D)
+                centroid = mu_samples.mean(dim=0)   # (D,)
 
-        # Prototype weights (K, D), already L2-normalized in training loop
-        C = self.prototypes.weight  # (K, D)
+                # Remove 5% farthest from centroid (Eq. 6)
+                dists = torch.norm(mu_samples - centroid.unsqueeze(0), dim=1)  # (N,)
+                k_remove = max(1, int(0.05 * len(S)))
+                if len(S) > k_remove:
+                    _, worst_indices = torch.topk(dists, k_remove, largest=True)
+                    keep_mask = torch.ones(len(S), dtype=torch.bool, device=S_tensor.device)
+                    keep_mask[worst_indices] = False
+                    S_tensor = S_tensor[keep_mask]
 
-        # --- Compute OT target Q* from fused representation ---
-        S_bar = h_shared @ C.t()  # (B, K)
-        Q_star = self.sinkhorn_knopp(S_bar, epsilon=epsilon,
-                                      sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+                # Update prototype: average remaining sequences (Eq. 7)
+                proto_buf[c] = S_tensor.mean(dim=0)  # (T_m, D)
 
-        # --- Per-modality cluster predictions ---
-        loss_cluster = 0.0
-        for h_m in [h_c_l, h_c_v, h_c_a]:
-            s_m = h_m @ C.t()  # (B, K)
-            log_p_m = F.log_softmax(s_m / tau, dim=1)  # (B, K)
-            loss_cluster -= torch.mean(torch.sum(Q_star * log_p_m, dim=1))
+        self.proto_initialized.fill_(True)
 
-        loss_cluster /= 3.0  # average over 3 modalities
-        return loss_cluster
-
-    def compute_push_loss(self, margin=2.0):
-        """
-        Compute L_push: margin-based prototype separation loss.
-        L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
-        """
-        C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-        K = C.shape[0]
-
-        # Pairwise squared L2 distances
-        # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-        # Since C is L2-normalized: ||c_i||^2 = 1
-        dots = C @ C.t()  # (K, K)
-        sq_dists = 2.0 - 2.0 * dots  # (K, K)
-
-        # Mask out diagonal
-        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-        sq_dists_off = sq_dists[mask]  # K*(K-1)
-
-        # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-        return loss_push
+        # Clear all caches
+        self.cache_l = [[] for _ in range(self.num_classes)]
+        self.cache_v = [[] for _ in range(self.num_classes)]
+        self.cache_a = [[] for _ in range(self.num_classes)]
