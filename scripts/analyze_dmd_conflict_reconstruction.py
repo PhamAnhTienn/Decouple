@@ -507,3 +507,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python scripts/analyze_dmd_conflict_reconstruction.py --checkpoint pt/dmd-mosi-missing0.0.pth --dataset mosi --data-dir data --config-file config/dmd_mosi_config.json --device cuda --seed 1111 --probe-epochs 200 --n-bins 10

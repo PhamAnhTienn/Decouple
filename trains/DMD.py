@@ -2,15 +2,14 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
-
-import torch
-import torch.nn as nn
 
 
 class HingeLoss(nn.Module):
@@ -143,7 +142,8 @@ class DMD():
 
                     logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
-                    output = model[0](text, audio, vision, is_distill=True)
+                    # output = model[0](text, audio, vision, is_distill=True)
+                    output = model[0](text_m, audio_m, vision_m, is_distill=True)
 
                     # logits for homo GD
                     logits_homo.append(output['logits_l_homo'])
@@ -193,12 +193,14 @@ class DMD():
                     loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
                     loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
                     loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
+                    # loss_recon = loss_recon_a + loss_recon_l
 
                     # cycle consistency loss between s_x and s_x_r
                     loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0), output['s_l_r'])
                     loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0), output['s_v_r'])
                     loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0), output['s_a_r'])
                     loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
+                    # loss_s_sr = loss_sl_slr + loss_sa_sla
 
                     # ort loss
                     s_l = output['s_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
@@ -246,9 +248,6 @@ class DMD():
                                     graph_distill_loss_homo + graph_distill_loss_hetero + \
                                     (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
 
-                    # combined_loss = loss_task + \
-                    #                 graph_distill_loss_homo + graph_distill_loss_hetero + \
-                    #                 (loss_s_sr + loss_recon + (loss_ort) * 0.1) * 0.1
                     combined_loss.backward()
 
 
@@ -297,6 +296,33 @@ class DMD():
                 epoch_results['test'].append(test_results)
             # early stop
             if epochs - best_epoch >= self.args.early_stop:
+                # ── Save per-sample scores for reconstruction benefit analysis ──
+                run_tag = getattr(self.args, 'run_tag', 'AllRec')
+                score_dir = Path(getattr(self.args, 'score_save_dir', 'result/dmd_scores'))
+                score_dir.mkdir(parents=True, exist_ok=True)
+                seed = getattr(self.args, 'cur_seed', 0)
+                dataset = getattr(self.args, 'dataset_name', 'unknown')
+                missing_rate = getattr(self.args, 'missing_rate_eval_test', 0.0)
+
+                # Load best checkpoint
+                best_state = torch.load(self.args.model_save_path, weights_only=True)
+                model[0].load_state_dict(best_state)
+                logger.info(f"[Scores] Loaded best checkpoint from epoch {best_epoch}")
+
+                # Run score extraction on test set
+                score_data = self.do_test_with_scores(model[0], dataloader['test'])
+                score_data['run_tag'] = run_tag
+                score_data['seed'] = seed
+                score_data['dataset'] = dataset
+                score_data['best_epoch'] = best_epoch
+                score_data['missing_rate'] = missing_rate
+
+                score_path = score_dir / f"{dataset}_dmd_scores_{run_tag}_missing{missing_rate:.1f}_seed{seed}.pt"
+                torch.save(score_data, score_path)
+                logger.info(f"[Scores] Saved {score_path}  "
+                            f"({score_data['predictions'].shape[0]} samples, "
+                            f"tag={run_tag}, missing_rate={missing_rate:.1f})")
+
                 return epoch_results if return_epoch_results else None
 
     def do_test(self, model, dataloader, mode="VAL", return_sample_results=False):
@@ -328,7 +354,8 @@ class DMD():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text, audio, vision, is_distill=True)
+                    # output = model(text, audio, vision, is_distill=True)
+                    output = model(text_m, audio_m, vision_m, is_distill=True)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()
@@ -351,3 +378,81 @@ class DMD():
             eval_results['Labels'] = all_labels
 
         return eval_results
+
+    @torch.no_grad()
+    def do_test_with_scores(self, model, dataloader):
+        """
+        Run the model on a dataloader and collect per-sample:
+          - predictions (ŷ_i)
+          - labels (y_i)
+          - per-modality conflict scores C_{i,m}
+          - overall conflict score C_i = (C_l + C_v + C_a) / 3
+
+        Conflict score definition:
+          h_m = Normalize(MeanPool_t(c_m))
+          C_m = 1 - (1/2) * Σ_{n≠m} cos(h_m, h_n)
+        """
+        model.eval()
+        all_preds, all_labels = [], []
+        all_shared = {'l': [], 'v': [], 'a': []}
+
+        for batch_data in tqdm(dataloader, desc="[Scores] Extracting"):
+            text = batch_data['text'].to(self.args.device)
+            audio = batch_data['audio'].to(self.args.device)
+            vision = batch_data['vision'].to(self.args.device)
+            labels = batch_data['labels']['M'].to(self.args.device).view(-1, 1)
+
+            output = model(text, audio, vision, is_distill=True)
+
+            all_preds.append(output['output_logit'].cpu())
+            all_labels.append(labels.cpu())
+
+            # c_m in forward output: (T, B, d) after permute
+            # → transpose to (B, d, T), then mean-pool over T → (B, d)
+            for m in ('l', 'v', 'a'):
+                c_m = output[f'c_{m}']                          # (T, B, d)
+                h_m = c_m.permute(1, 2, 0).mean(dim=2)         # (B, d)
+                all_shared[m].append(h_m.cpu())
+
+        predictions = torch.cat(all_preds, dim=0)               # (N, 1)
+        labels = torch.cat(all_labels, dim=0)                    # (N, 1)
+
+        # Normalize pooled shared features
+        pooled = {}
+        for m in ('l', 'v', 'a'):
+            h = torch.cat(all_shared[m], dim=0)                 # (N, d)
+            pooled[m] = F.normalize(h, dim=1, eps=1e-8)
+
+        # Compute per-modality conflict scores
+        modality_keys = ('l', 'v', 'a')
+        conflict = {}
+        for m in modality_keys:
+            others = [n for n in modality_keys if n != m]
+            cos_sum = sum(
+                F.cosine_similarity(pooled[m], pooled[n], dim=1)
+                for n in others
+            )
+            conflict[m] = 1.0 - cos_sum / 2.0                   # (N,)
+
+        # Overall conflict
+        conflict_overall = (conflict['l'] + conflict['v'] + conflict['a']) / 3.0
+
+        score_data = {
+            'predictions': predictions,          # (N, 1)
+            'labels': labels,                    # (N, 1)
+            'conflict_l': conflict['l'],         # (N,)
+            'conflict_v': conflict['v'],         # (N,)
+            'conflict_a': conflict['a'],         # (N,)
+            'conflict_overall': conflict_overall, # (N,)
+        }
+
+        # Log summary statistics
+        logger.info(f"[Scores] Collected {predictions.shape[0]} samples")
+        for m in modality_keys:
+            c = conflict[m]
+            logger.info(f"    C_{m}: mean={c.mean():.4f}, std={c.std():.4f}, "
+                        f"range=[{c.min():.4f}, {c.max():.4f}]")
+        logger.info(f"    C_overall: mean={conflict_overall.mean():.4f}, "
+                    f"std={conflict_overall.std():.4f}")
+
+        return score_data

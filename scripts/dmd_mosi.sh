@@ -1,5 +1,6 @@
 #!/bin/bash
 python main-dmd.py \
+    --run_tag AllRec \
     --data_missing \
     --model dmd \
     --dataset mosi \

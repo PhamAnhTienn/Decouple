@@ -282,6 +282,9 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate')
     parser.add_argument('--missing_rate_eval_test', type=float, default=0.0, help='Missing rate for evaluation and testing')
     parser.add_argument('--data_missing', action='store_true', help='Enable missing modality simulation')
+    parser.add_argument('--run_tag', type=str, default='AllRec',
+        help='Tag for this training run (e.g. AllRec, NoRecon, NoRecL, NoRecV, NoRecA). '
+             'Used to name the saved score files for reconstruction benefit analysis.')
     parser.add_argument(
         '--config_override',
         action='append',
@@ -301,7 +304,8 @@ def main():
             'batch_size': args.batch_size,
             'learning_rate': args.learning_rate,
             'missing_rate_eval_test': args.missing_rate_eval_test,
-            'data_missing': args.data_missing
+            'data_missing': args.data_missing,
+            'run_tag': args.run_tag,
         }.items()
         if value is not None
     })
