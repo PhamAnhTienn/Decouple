@@ -197,7 +197,7 @@ class DP():
 
                         combined_loss = loss_task + \
                                         (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
-                                        loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH
+                                        loss_cluster * LAMBDA_CLUSTER
                         combined_loss.backward()
 
                         # --- Step-level W&B logging ---
