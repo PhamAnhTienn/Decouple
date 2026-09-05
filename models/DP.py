@@ -362,33 +362,48 @@ class DP(nn.Module):
         Q *= B  # columns sum to 1
         return Q.t()  # (B, K)
 
-    def compute_cluster_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
+    def compute_cpa_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
         """
-        Compute L_cluster: OT-based cross-entropy between soft assignments Q*
-        and per-modality cluster predictions.
+        Cross-modal Prototype Alignment (CPA) loss for 3 modalities.
+
+        For each directed modality pair (m → n) where m ≠ n:
+          - q_m = sinkhorn_knopp(h_m @ C^T)   — soft cluster assignment (pseudo-label)
+          - p_n = softmax(h_n @ C^T / τ)       — softmax probability
+          - ℓ(h_n, q_m) = - Σ_k q_m^(k) log p_n^(k)
+
+        L_CPA = (1 / 6B) Σ over all 6 directed cross-modal pairs
         """
-        h_shared = output['h_shared']  # (B, D)
-        h_c_l = output['h_c_l']        # (B, D)
-        h_c_v = output['h_c_v']        # (B, D)
-        h_c_a = output['h_c_a']        # (B, D)
+        h_c_l = output['h_c_l']  # (B, D)
+        h_c_v = output['h_c_v']  # (B, D)
+        h_c_a = output['h_c_a']  # (B, D)
 
         # Prototype weights (K, D), already L2-normalized in training loop
         C = self.prototypes.weight  # (K, D)
 
-        # --- Compute OT target Q* from fused representation ---
-        S_bar = h_shared @ C.t()  # (B, K)
-        Q_star = self.sinkhorn_knopp(S_bar, epsilon=epsilon,
-                                      sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        # --- Soft cluster assignment codes via Sinkhorn-Knopp (detached pseudo-labels) ---
+        q_l = self.sinkhorn_knopp(h_c_l @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        q_v = self.sinkhorn_knopp(h_c_v @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        q_a = self.sinkhorn_knopp(h_c_a @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
 
-        # --- Per-modality cluster predictions ---
-        loss_cluster = 0.0
-        for h_m in [h_c_l, h_c_v, h_c_a]:
-            s_m = h_m @ C.t()  # (B, K)
-            log_p_m = F.log_softmax(s_m / tau, dim=1)  # (B, K)
-            loss_cluster -= torch.mean(torch.sum(Q_star * log_p_m, dim=1))
+        # --- Softmax probabilities (trained) ---
+        log_p_l = F.log_softmax(h_c_l @ C.t() / tau, dim=1)  # (B, K)
+        log_p_v = F.log_softmax(h_c_v @ C.t() / tau, dim=1)  # (B, K)
+        log_p_a = F.log_softmax(h_c_a @ C.t() / tau, dim=1)  # (B, K)
 
-        loss_cluster /= 3.0  # average over 3 modalities
-        return loss_cluster
+        # --- Cross-modal prediction (6 directed pairs, no self-prediction) ---
+        loss_cpa = 0.0
+        loss_cpa -= torch.mean(torch.sum(q_v * log_p_l, dim=1))  # q_v → train l
+        loss_cpa -= torch.mean(torch.sum(q_a * log_p_l, dim=1))  # q_a → train l
+        loss_cpa -= torch.mean(torch.sum(q_l * log_p_v, dim=1))  # q_l → train v
+        loss_cpa -= torch.mean(torch.sum(q_a * log_p_v, dim=1))  # q_a → train v
+        loss_cpa -= torch.mean(torch.sum(q_l * log_p_a, dim=1))  # q_l → train a
+        loss_cpa -= torch.mean(torch.sum(q_v * log_p_a, dim=1))  # q_v → train a
+
+        loss_cpa /= 6.0  # average over 6 cross-modal pairs
+        return loss_cpa
 
     def compute_push_loss(self, margin=2.0):
         """

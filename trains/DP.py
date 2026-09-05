@@ -187,8 +187,8 @@ class DP():
 
                         loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                        # cluster loss (OT-based)
-                        loss_cluster = model.compute_cluster_loss(
+                        # CPA loss (Cross-modal Prototype Alignment)
+                        loss_cluster = model.compute_cpa_loss(
                             output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
                         )
 
