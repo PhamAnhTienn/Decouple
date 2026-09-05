@@ -5,37 +5,6 @@ import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
-class CMD(nn.Module):
-    """
-    Central Moment Discrepancy (CMD).
-    Adapted from https://github.com/wzell/cmd/blob/master/models/domain_regularizer.py
-    """
-
-    def __init__(self):
-        super(CMD, self).__init__()
-
-    def forward(self, x1, x2, n_moments):
-        mx1 = torch.mean(x1, 0)
-        mx2 = torch.mean(x2, 0)
-        sx1 = x1 - mx1
-        sx2 = x2 - mx2
-        dm = self.matchnorm(mx1, mx2)
-        scms = dm
-        for i in range(n_moments - 1):
-            scms += self.scm(sx1, sx2, i + 2)
-        return scms
-
-    def matchnorm(self, x1, x2):
-        power = torch.pow(x1 - x2, 2)
-        summed = torch.sum(power)
-        sqrt = summed ** (0.5)
-        return sqrt
-
-    def scm(self, sx1, sx2, k):
-        ss1 = torch.mean(torch.pow(sx1, k), 0)
-        ss2 = torch.mean(torch.pow(sx2, k), 0)
-        return self.matchnorm(ss1, ss2)
-
 
 class DP(nn.Module):
     def __init__(self, args):
@@ -360,10 +329,6 @@ class DP(nn.Module):
             'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
             'h_c_v': h_c_v,
             'h_c_a': h_c_a,
-            # Raw mean-pooled shared features for CMD loss
-            'utt_shared_l': utt_shared_l,  # (B, D)
-            'utt_shared_v': utt_shared_v,
-            'utt_shared_a': utt_shared_a,
         }
         return res
 

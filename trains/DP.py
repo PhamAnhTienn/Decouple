@@ -6,7 +6,6 @@ from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import wandb
-from models.DP import CMD
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
@@ -15,7 +14,6 @@ LAMBDA_RECON_GROUP = 0.1
 LAMBDA_ORT_INNER   = 0.1
 LAMBDA_CLUSTER     = 0.1
 LAMBDA_PUSH        = 0.1
-LAMBDA_CMD         = 0.1
 
 
 class MSE(nn.Module):
@@ -35,15 +33,6 @@ class DP():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.loss_cmd = CMD()
-
-    def get_cmd_loss(self, output, n_moments=5):
-        """CMD loss between shared states (utt-level mean-pooled, no L2-norm)."""
-        loss = self.loss_cmd(output['utt_shared_l'], output['utt_shared_v'], n_moments)
-        loss += self.loss_cmd(output['utt_shared_l'], output['utt_shared_a'], n_moments)
-        loss += self.loss_cmd(output['utt_shared_a'], output['utt_shared_v'], n_moments)
-        loss = loss / 3.0
-        return loss
 
     def do_train(self, model, dataloader, return_epoch_results=False):
         # --- W&B Init ---
@@ -58,7 +47,6 @@ class DP():
                 "lambda_ort_inner": LAMBDA_ORT_INNER,
                 "lambda_cluster": LAMBDA_CLUSTER,
                 "lambda_push": LAMBDA_PUSH,
-                "lambda_cmd": LAMBDA_CMD,
             },
             reinit="finish_previous",
         )
@@ -207,9 +195,6 @@ class DP():
                         # prototype separation loss
                         loss_push = model.compute_push_loss(margin=2.0)
 
-                        # # CMD loss (shared-space distribution alignment)
-                        # loss_cmd = self.get_cmd_loss(output, n_moments=5)
-
                         combined_loss = loss_task + \
                                         (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
                                         loss_cluster * LAMBDA_CLUSTER + loss_push * LAMBDA_PUSH
@@ -222,7 +207,6 @@ class DP():
                         _loss_ort_val = loss_ort.item()
                         _loss_cluster_val = loss_cluster.item()
                         _loss_push_val = loss_push.item()
-                        # _loss_cmd_val = loss_cmd.item()
                         _combined_val = combined_loss.item()
 
                         wandb.log({
@@ -239,8 +223,7 @@ class DP():
                             "step/weighted_s_sr": _loss_s_sr_val * LAMBDA_RECON_GROUP,
                             "step/weighted_ort": _loss_ort_val * LAMBDA_RECON_GROUP * LAMBDA_ORT_INNER,
                             "step/weighted_cluster": _loss_cluster_val * LAMBDA_CLUSTER,
-                            "step/weighted_push": _loss_push_val * LAMBDA_PUSH,
-                            # "step/weighted_cmd": _loss_cmd_val * LAMBDA_CMD,
+                            "step/weighted_push": _loss_push_val * LAMBDA_PUSH
                         })
 
                         # Accumulate for epoch-level averages
@@ -250,7 +233,6 @@ class DP():
                         epoch_loss_ort += _loss_ort_val
                         epoch_loss_cluster += _loss_cluster_val
                         epoch_loss_push += _loss_push_val
-                        # epoch_loss_cmd += _loss_cmd_val
                         num_batches += 1
 
                         # Freeze prototypes during warmup iterations
@@ -314,11 +296,9 @@ class DP():
                     "epoch/weighted_recon_group": (avg_s_sr + avg_recon + avg_ort * 0.1) * 0.1,
                     "epoch/weighted_cluster": avg_cluster * LAMBDA_CLUSTER,
                     "epoch/weighted_push": avg_push * LAMBDA_PUSH,
-                    "epoch/weighted_cmd": avg_cmd * LAMBDA_CMD,
                     # Relative magnitudes to task loss
                     "epoch/cluster_to_task_ratio": (avg_cluster * LAMBDA_CLUSTER) / (avg_task + 1e-8),
                     "epoch/push_to_task_ratio": (avg_push * LAMBDA_PUSH) / (avg_task + 1e-8),
-                    "epoch/cmd_to_task_ratio": (avg_cmd * LAMBDA_CMD) / (avg_task + 1e-8),
                     # Learning rate
                     "epoch/learning_rate": optimizer.param_groups[0]['lr'],
                 }
