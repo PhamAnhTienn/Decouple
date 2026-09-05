@@ -9,9 +9,6 @@ from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
 
-import torch
-import torch.nn as nn
-
 
 class HingeLoss(nn.Module):
     def __init__(self):
