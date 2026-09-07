@@ -1,6 +1,7 @@
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
@@ -8,8 +9,10 @@ from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
 
-import torch
-import torch.nn as nn
+LAMBDA_RECON_GROUP = 0.1
+LAMBDA_ORT_INNER   = 0.1
+LAMBDA_CLUSTER     = 0.1
+LAMBDA_PUSH        = 0.1
 
 
 class MSE(nn.Module):
@@ -31,6 +34,7 @@ class DP():
         self.MSE = MSE()
 
     def do_train(self, model, dataloader, return_epoch_results=False):
+
         optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=self.args.patience)
 
@@ -44,170 +48,183 @@ class DP():
         min_or_max = 'min' if self.args.KeyEval in ['Loss'] else 'max'
         best_valid = 1e8 if min_or_max == 'min' else 0
 
+        # Number of initial iterations to freeze prototype weights
+        freeze_prototypes_niters = getattr(self.args, 'freeze_prototypes_niters', -1)
+        global_iter = 0
+
         while True:
-            epochs += 1
-            y_pred, y_true = [], []
-            model.train()
+                epochs += 1
+                y_pred, y_true = [], []
+                model.train()
 
-            train_loss = 0.0
-            left_epochs = self.args.update_epochs
-            with tqdm(dataloader['train']) as td:
-                for batch_data in td:
-                    if left_epochs == self.args.update_epochs:
-                        optimizer.zero_grad()
-                    left_epochs -= 1
-                    text = batch_data['text'].to(self.args.device)
-                    text_m = batch_data['text_m'].to(self.args.device)
-                    audio = batch_data['audio'].to(self.args.device)
-                    audio_m = batch_data['audio_m'].to(self.args.device)
-                    vision = batch_data['vision'].to(self.args.device)
-                    vision_m = batch_data['vision_m'].to(self.args.device)
-                    labels = batch_data['labels']['M'].to(self.args.device)
-                    if self.args.train_mode == 'classification':
-                        labels = labels.view(-1).long()
-                    else:
-                        labels = labels.view(-1, 1)
+                train_loss = 0.0
 
-                    logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
+                left_epochs = self.args.update_epochs
+                with tqdm(dataloader['train']) as td:
+                    for batch_data in td:
+                        if left_epochs == self.args.update_epochs:
+                            optimizer.zero_grad()
+                        left_epochs -= 1
+                        text = batch_data['text'].to(self.args.device)
+                        text_m = batch_data['text_m'].to(self.args.device)
+                        audio = batch_data['audio'].to(self.args.device)
+                        audio_m = batch_data['audio_m'].to(self.args.device)
+                        vision = batch_data['vision'].to(self.args.device)
+                        vision_m = batch_data['vision_m'].to(self.args.device)
+                        labels = batch_data['labels']['M'].to(self.args.device)
+                        if self.args.train_mode == 'classification':
+                            labels = labels.view(-1).long()
+                        else:
+                            labels = labels.view(-1, 1)
 
-                    output = model(text_m, audio_m, vision_m, is_distill=True)
+                        logits_homo, reprs_homo, logits_hetero, reprs_hetero = [], [], [], []
 
-                    # logits for homo GD
-                    logits_homo.append(output['logits_l_homo'])
-                    logits_homo.append(output['logits_v_homo'])
-                    logits_homo.append(output['logits_a_homo'])
+                        output = model(text, audio, vision, is_distill=True)
 
-                    # reprs for homo GD
-                    reprs_homo.append(output['repr_l_homo'])
-                    reprs_homo.append(output['repr_v_homo'])
-                    reprs_homo.append(output['repr_a_homo'])
+                        # logits for homo GD
+                        logits_homo.append(output['logits_l_homo'])
+                        logits_homo.append(output['logits_v_homo'])
+                        logits_homo.append(output['logits_a_homo'])
 
-                    # logits for hetero GD
-                    logits_hetero.append(output['logits_l_hetero'])
-                    logits_hetero.append(output['logits_v_hetero'])
-                    logits_hetero.append(output['logits_a_hetero'])
+                        # reprs for homo GD
+                        reprs_homo.append(output['repr_l_homo'])
+                        reprs_homo.append(output['repr_v_homo'])
+                        reprs_homo.append(output['repr_a_homo'])
 
-                    # reprs for hetero GD
-                    reprs_hetero.append(output['repr_l_hetero'])
-                    reprs_hetero.append(output['repr_v_hetero'])
-                    reprs_hetero.append(output['repr_a_hetero'])
+                        # logits for hetero GD
+                        logits_hetero.append(output['logits_l_hetero'])
+                        logits_hetero.append(output['logits_v_hetero'])
+                        logits_hetero.append(output['logits_a_hetero'])
 
-                    logits_homo = torch.stack(logits_homo)
-                    reprs_homo = torch.stack(reprs_homo)
+                        # reprs for hetero GD
+                        reprs_hetero.append(output['repr_l_hetero'])
+                        reprs_hetero.append(output['repr_v_hetero'])
+                        reprs_hetero.append(output['repr_a_hetero'])
 
-                    logits_hetero = torch.stack(logits_hetero)
-                    reprs_hetero = torch.stack(reprs_hetero)
+                        logits_homo = torch.stack(logits_homo)
+                        reprs_homo = torch.stack(reprs_homo)
 
-                    # # edges for homo distill
-                    # edges_homo, edges_origin_homo = model[1](logits_homo, reprs_homo)
+                        logits_hetero = torch.stack(logits_hetero)
+                        reprs_hetero = torch.stack(reprs_hetero)
 
-                    # # edges for hetero distill
-                    # edges_hetero, edges_origin_hetero = model[2](logits_hetero, reprs_hetero)
+                        # # edges for homo distill
+                        # edges_homo, edges_origin_homo = model[1](logits_homo, reprs_homo)
 
-                    # task loss
-                    loss_task_all = self.criterion(output['output_logit'], labels)
-                    loss_task_l_homo = self.criterion(output['logits_l_homo'], labels)
-                    loss_task_v_homo = self.criterion(output['logits_v_homo'], labels)
-                    loss_task_a_homo = self.criterion(output['logits_a_homo'], labels)
-                    loss_task_l_hetero = self.criterion(output['logits_l_hetero'], labels)
-                    loss_task_v_hetero = self.criterion(output['logits_v_hetero'], labels)
-                    loss_task_a_hetero = self.criterion(output['logits_a_hetero'], labels)
-                    loss_task_c = self.criterion(output['logits_c'], labels)
-                    loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
+                        # # edges for hetero distill
+                        # edges_hetero, edges_origin_hetero = model[2](logits_hetero, reprs_hetero)
 
-                    # reconstruction loss
-                    loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
-                    loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
-                    loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
-                    loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
+                        # normalize the prototypes
+                        with torch.no_grad():
+                            w = model.prototypes.weight.data.clone()
+                            w = F.normalize(w, dim=1, p=2)
+                            model.prototypes.weight.copy_(w)
 
-                    # cycle consistency loss between s_x and s_x_r
-                    loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0), output['s_l_r'])
-                    loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0), output['s_v_r'])
-                    loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0), output['s_a_r'])
-                    loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
+                        # task loss
+                        loss_task_all = self.criterion(output['output_logit'], labels)
+                        loss_task_l_homo = self.criterion(output['logits_l_homo'], labels)
+                        loss_task_v_homo = self.criterion(output['logits_v_homo'], labels)
+                        loss_task_a_homo = self.criterion(output['logits_a_homo'], labels)
+                        loss_task_l_hetero = self.criterion(output['logits_l_hetero'], labels)
+                        loss_task_v_hetero = self.criterion(output['logits_v_hetero'], labels)
+                        loss_task_a_hetero = self.criterion(output['logits_a_hetero'], labels)
+                        loss_task_c = self.criterion(output['logits_c'], labels)
+                        loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
 
-                    # ort loss
-                    s_l = output['s_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
-                    c_l = output['c_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        # reconstruction loss
+                        loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
+                        loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
+                        loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
+                        loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
-                    s_v = output['s_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
-                    c_v = output['c_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        # cycle consistency loss between s_x and s_x_r
+                        loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0), output['s_l_r'])
+                        loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0), output['s_v_r'])
+                        loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0), output['s_a_r'])
+                        loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
 
-                    s_a = output['s_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
-                    c_a = output['c_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        # ort loss
+                        s_l = output['s_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        c_l = output['c_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
 
-                    target = -torch.ones(labels.size(0), device=labels.device)
+                        s_v = output['s_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        c_v = output['c_v'].transpose(0, 1).contiguous().view(labels.size(0), -1)
 
-                    cosine_similarity_s_c_l = self.cosine(s_l, c_l, target)
-                    cosine_similarity_s_c_v = self.cosine(s_v, c_v, target)
-                    cosine_similarity_s_c_a = self.cosine(s_a, c_a, target)
+                        s_a = output['s_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
+                        c_a = output['c_a'].transpose(0, 1).contiguous().view(labels.size(0), -1)
 
-                    loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
+                        target = -torch.ones(labels.size(0), device=labels.device)
 
-                    # # homo GD loss
-                    # loss_reg_homo, loss_logit_homo, loss_repr_homo = \
-                    #     model[1].distillation_loss(logits_homo, reprs_homo, edges_homo)
-                    # graph_distill_loss_homo = 0.05 * (loss_logit_homo + loss_reg_homo)
+                        cosine_similarity_s_c_l = self.cosine(s_l, c_l, target)
+                        cosine_similarity_s_c_v = self.cosine(s_v, c_v, target)
+                        cosine_similarity_s_c_a = self.cosine(s_a, c_a, target)
 
-                    # # hetero GD loss
-                    # loss_reg_hetero, loss_logit_hetero, loss_repr_hetero = \
-                    #     model[2].distillation_loss(logits_hetero, reprs_hetero, edges_hetero)
-                    # graph_distill_loss_hetero = 0.05 * (loss_logit_hetero + loss_repr_hetero + loss_reg_hetero)
+                        loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                    # combined_loss = loss_task + \
-                    #                 graph_distill_loss_homo + graph_distill_loss_hetero + \
-                    #                 (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
+                        # CPA loss (Cross-modal Prototype Alignment)
+                        loss_cluster = model.compute_cpa_loss(
+                            output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                        )
 
-                    combined_loss = loss_task + \
-                                    (loss_s_sr + loss_recon + loss_ort * 0.1) * 0.1
+                        # prototype separation loss
+                        loss_push = model.compute_push_loss(margin=2.0)
 
-                    combined_loss.backward()
+                        combined_loss = loss_task + \
+                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
+                                        loss_cluster * LAMBDA_CLUSTER
+                        combined_loss.backward()
 
+                        # Freeze prototypes during warmup iterations
+                        if freeze_prototypes_niters > 0 and global_iter < freeze_prototypes_niters:
+                            for name, p in model.named_parameters():
+                                if "prototypes" in name:
+                                    p.grad = None
 
-                    if self.args.grad_clip != -1.0:
-                        nn.utils.clip_grad_value_(model.parameters(), self.args.grad_clip)
+                        if self.args.grad_clip != -1.0:
+                            nn.utils.clip_grad_value_(model.parameters(), self.args.grad_clip)
 
-                    train_loss += combined_loss.item()
+                        global_iter += 1
 
-                    y_pred.append(output['output_logit'].cpu())
-                    y_true.append(labels.cpu())
+                        train_loss += combined_loss.item()
+
+                        y_pred.append(output['output_logit'].cpu())
+                        y_true.append(labels.cpu())
+                        if not left_epochs:
+                            optimizer.step()
+                            left_epochs = self.args.update_epochs
                     if not left_epochs:
+                        # update
                         optimizer.step()
-                        left_epochs = self.args.update_epochs
-                if not left_epochs:
-                    # update
-                    optimizer.step()
 
-            train_loss = train_loss / len(dataloader['train'])
-            pred, true = torch.cat(y_pred), torch.cat(y_true)
-            train_results = self.metrics(pred, true)
-            logger.info(
-                f">> Epoch: {epochs} "
-                f"TRAIN-({self.args.model_name}) [{epochs - best_epoch}/{epochs}/{self.args.cur_seed}] "
-                f">> total_loss: {round(train_loss, 4)} "
-                f"{dict_to_str(train_results)}"
-            )
-            # validation
-            val_results = self.do_test(model, dataloader['valid'], mode="VAL")
-            cur_valid = val_results[self.args.KeyEval]
-            scheduler.step(val_results['Loss'])
-            # save best model
-            isBetter = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
-            if isBetter:
-                best_valid, best_epoch = cur_valid, epochs
-                # save model
-                torch.save(model.state_dict(), self.args.model_save_path)
+                train_loss = train_loss / len(dataloader['train'])
+                pred, true = torch.cat(y_pred), torch.cat(y_true)
+                train_results = self.metrics(pred, true)
+                logger.info(
+                    f">> Epoch: {epochs} "
+                    f"TRAIN-({self.args.model_name}) [{epochs - best_epoch}/{epochs}/{self.args.cur_seed}] "
+                    f">> total_loss: {round(train_loss, 4)} "
+                    f"{dict_to_str(train_results)}"
+                )
+                # validation
+                val_results = self.do_test(model, dataloader['valid'], mode="VAL")
+                cur_valid = val_results[self.args.KeyEval]
+                scheduler.step(val_results['Loss'])
 
-            if return_epoch_results:
-                train_results["Loss"] = train_loss
-                epoch_results['train'].append(train_results)
-                epoch_results['valid'].append(val_results)
-                test_results = self.do_test(model, dataloader['test'], mode="TEST")
-                epoch_results['test'].append(test_results)
-            # early stop
-            if epochs - best_epoch >= self.args.early_stop:
-                return epoch_results if return_epoch_results else None
+                # save best model
+                isBetter = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
+                if isBetter:
+                    best_valid, best_epoch = cur_valid, epochs
+                    # save model
+                    torch.save(model.state_dict(), self.args.model_save_path)
+
+                if return_epoch_results:
+                    train_results["Loss"] = train_loss
+                    epoch_results['train'].append(train_results)
+                    epoch_results['valid'].append(val_results)
+                    test_results = self.do_test(model, dataloader['test'], mode="TEST")
+                    epoch_results['test'].append(test_results)
+                # early stop
+                if epochs - best_epoch >= self.args.early_stop:
+                    return epoch_results if return_epoch_results else None
 
     def do_test(self, model, dataloader, mode="VAL", return_sample_results=False):
         model.eval()
@@ -238,7 +255,7 @@ class DP():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text_m, audio_m, vision_m, is_distill=True)
+                    output = model(text, audio, vision, is_distill=True)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()

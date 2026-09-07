@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
+
 
 class DP(nn.Module):
     def __init__(self, args):
@@ -57,6 +59,10 @@ class DP(nn.Module):
         self.decoder_l = nn.Conv1d(self.d_l * 2, self.d_l, kernel_size=1, padding=0, bias=False)
         self.decoder_v = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
         self.decoder_a = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
+
+        # init prototype
+        self.nmb_prototypes = args.nmb_prototypes
+        self.prototypes = nn.Linear(self.d_a, args.nmb_prototypes, bias=False)
 
         # for align c_l, c_v, c_a
         self.self_attentions_c_l = self.get_network(self_type='l')
@@ -140,7 +146,7 @@ class DP(nn.Module):
         if self.use_bert:
             text = self.text_model(text)
         x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training)
-        x_a = audio.transpose(1, 2)
+        x_a = audio.transpose(1, 2) # (B, D, T)
         x_v = video.transpose(1, 2)
 
         proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
@@ -164,7 +170,7 @@ class DP(nn.Module):
         s_v_r = self.encoder_s_v(recon_v)
         s_a_r = self.encoder_s_a(recon_a)
 
-        s_l = s_l.permute(2, 0, 1)
+        s_l = s_l.permute(2, 0, 1) # (T, B, D)
         s_v = s_v.permute(2, 0, 1)
         s_a = s_a.permute(2, 0, 1)
 
@@ -196,7 +202,7 @@ class DP(nn.Module):
         c_l_att = self.self_attentions_c_l(c_l)
         if type(c_l_att) == tuple:
             c_l_att = c_l_att[0]
-        c_l_att = c_l_att[-1]
+        c_l_att = c_l_att[-1] # B, D
         c_v_att = self.self_attentions_c_v(c_v)
         if type(c_v_att) == tuple:
             c_v_att = c_v_att[0]
@@ -269,6 +275,20 @@ class DP(nn.Module):
 
         output = self.out_layer(last_hs_proj)
 
+        # --- Cluster & prototype features ---
+        # c_l, c_v, c_a are (T, B, D) at this point
+        # Raw mean-pool over timestep dimension (for CMD loss)
+        utt_shared_l = c_l.mean(dim=0)  # (B, D) — raw, no L2-norm
+        utt_shared_v = c_v.mean(dim=0)  # (B, D)
+        utt_shared_a = c_a.mean(dim=0)  # (B, D)
+        # L2-normalized versions (for cluster/prototype losses)
+        h_c_l = F.normalize(utt_shared_l, dim=1, p=2)  # (B, D)
+        h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
+        h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
+
+        # Fused shared representation (average of 3 modalities, then L2-norm)
+        h_shared = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
+
         res = {
             'logits_l_homo': logits_l_low,
             'logits_v_homo': logits_v_low,
@@ -283,7 +303,7 @@ class DP(nn.Module):
             's_v': s_v,
             's_a': s_a,
             'c_l': c_l,
-            'c_v': c_v,
+            'c_v': c_v, # T, B, D
             'c_a': c_a,
             's_l_r': s_l_r,
             's_v_r': s_v_r,
@@ -300,7 +320,110 @@ class DP(nn.Module):
             'last_h_l': h_ls[-1],
             'last_h_v': h_vs[-1],
             'last_h_a': h_as[-1],
+            'c_fusion': c_fusion,          # gated, (B, 3*d)
+            'last_hs_proj': last_hs_proj,  # (B, combined_dim) — pre-classifier repr    
             'logits_c': logits_c,
-            'output_logit': output
+            'output_logit': output,
+            # Cluster-related features
+            'h_shared': h_shared,   # (B, D) fused shared representation
+            'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
+            'h_c_v': h_c_v,
+            'h_c_a': h_c_a,
         }
         return res
+
+    @torch.no_grad()
+    def sinkhorn_knopp(self, S, epsilon=0.05, sinkhorn_iterations=3):
+        """
+        Sinkhorn-Knopp algorithm for entropic OT.
+        Args:
+            S: similarity matrix (B, K)
+            epsilon: entropic regularization
+            sinkhorn_iterations: number of normalization iterations
+        Returns:
+            Q: transport plan (B, K), rows sum to 1/B, cols sum to 1/K
+        """
+        Q = torch.exp(S / epsilon).t()  # (K, B)
+        B = Q.shape[1]
+        K = Q.shape[0]
+
+        # Make the matrix sums to 1
+        sum_Q = torch.sum(Q)
+        Q /= sum_Q
+
+        for _ in range(sinkhorn_iterations):
+            # Normalize rows: total weight per prototype must be 1/K
+            Q /= torch.sum(Q, dim=1, keepdim=True)
+            Q /= K
+            # Normalize columns: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
+
+        Q *= B  # columns sum to 1
+        return Q.t()  # (B, K)
+
+    def compute_cpa_loss(self, output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3):
+        """
+        Cross-modal Prototype Alignment (CPA) loss for 3 modalities.
+
+        For each directed modality pair (m → n) where m ≠ n:
+          - q_m = sinkhorn_knopp(h_m @ C^T)   — soft cluster assignment (pseudo-label)
+          - p_n = softmax(h_n @ C^T / τ)       — softmax probability
+          - ℓ(h_n, q_m) = - Σ_k q_m^(k) log p_n^(k)
+
+        L_CPA = (1 / 6B) Σ over all 6 directed cross-modal pairs
+        """
+        h_c_l = output['h_c_l']  # (B, D)
+        h_c_v = output['h_c_v']  # (B, D)
+        h_c_a = output['h_c_a']  # (B, D)
+
+        # Prototype weights (K, D), already L2-normalized in training loop
+        C = self.prototypes.weight  # (K, D)
+
+        # --- Soft cluster assignment codes via Sinkhorn-Knopp (detached pseudo-labels) ---
+        q_l = self.sinkhorn_knopp(h_c_l @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        q_v = self.sinkhorn_knopp(h_c_v @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+        q_a = self.sinkhorn_knopp(h_c_a @ C.t(), epsilon=epsilon,
+                                  sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
+
+        # --- Softmax probabilities (trained) ---
+        log_p_l = F.log_softmax(h_c_l @ C.t() / tau, dim=1)  # (B, K)
+        log_p_v = F.log_softmax(h_c_v @ C.t() / tau, dim=1)  # (B, K)
+        log_p_a = F.log_softmax(h_c_a @ C.t() / tau, dim=1)  # (B, K)
+
+        # --- Cross-modal prediction (6 directed pairs, no self-prediction) ---
+        loss_cpa = 0.0
+        loss_cpa -= torch.mean(torch.sum(q_v * log_p_l, dim=1))  # q_v → train l
+        loss_cpa -= torch.mean(torch.sum(q_a * log_p_l, dim=1))  # q_a → train l
+        loss_cpa -= torch.mean(torch.sum(q_l * log_p_v, dim=1))  # q_l → train v
+        loss_cpa -= torch.mean(torch.sum(q_a * log_p_v, dim=1))  # q_a → train v
+        loss_cpa -= torch.mean(torch.sum(q_l * log_p_a, dim=1))  # q_l → train a
+        loss_cpa -= torch.mean(torch.sum(q_v * log_p_a, dim=1))  # q_v → train a
+
+        loss_cpa /= 6.0  # average over 6 cross-modal pairs
+        return loss_cpa
+
+    def compute_push_loss(self, margin=2.0):
+        """
+        Compute L_push: margin-based prototype separation loss.
+        L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+        Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
+        """
+        C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
+        K = C.shape[0]
+
+        # Pairwise squared L2 distances
+        # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
+        # Since C is L2-normalized: ||c_i||^2 = 1
+        dots = C @ C.t()  # (K, K)
+        sq_dists = 2.0 - 2.0 * dots  # (K, K)
+
+        # Mask out diagonal
+        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
+        sq_dists_off = sq_dists[mask]  # K*(K-1)
+
+        # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+        loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
+        return loss_push
