@@ -1,11 +1,9 @@
 import os
-import time
 import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-import numpy as np
 from utils.metricsTop import MetricsTop
 
 logger = logging.getLogger('DecAlign')
@@ -163,12 +161,17 @@ class DecAlignTrainer():
             train_loss = 0.0
             
             for i_batch, batch_data in enumerate(dataloader['train']):
-                text, audio, video = batch_data['text'].to(device), batch_data['audio'].to(device), batch_data['vision'].to(device)
+                text = batch_data['text'].to(device)
+                text_m = batch_data['text_m'].to(device)
+                audio = batch_data['audio'].to(device)
+                audio_m = batch_data['audio_m'].to(device)
+                vision = batch_data['vision'].to(device)
+                vision_m = batch_data['vision_m'].to(device)
                 labels = batch_data['labels']['M'].to(device)
 
                 model.zero_grad()
 
-                outputs = model(text, audio, video)
+                outputs = model(text_m, audio_m, vision_m)
                 logits = outputs['output_logit']
                 
                 # Main task loss
@@ -241,10 +244,15 @@ class DecAlignTrainer():
         
         with torch.no_grad():
             for i_batch, batch_data in enumerate(dataloader):
-                text, audio, video = batch_data['text'].to(device), batch_data['audio'].to(device), batch_data['vision'].to(device)
+                text = batch_data['text'].to(device)
+                text_m = batch_data['text_m'].to(device)
+                audio = batch_data['audio'].to(device)
+                audio_m = batch_data['audio_m'].to(device)
+                vision = batch_data['vision'].to(device)
+                vision_m = batch_data['vision_m'].to(device)
                 labels = batch_data['labels']['M'].to(device)
 
-                outputs = model(text, audio, video)
+                outputs = model(text_m, audio_m, vision_m)
                 logits = outputs['output_logit']
                 
                 loss = self._main_loss(logits, labels)
