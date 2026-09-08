@@ -108,15 +108,27 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
 
     # Dataset specific configurations
     if dataset_name.lower() == 'mosi':
+        mosi_candidates = [
+            os.path.join(data_dir, 'MOSI/aligned_50.pkl'),
+            os.path.join(data_dir, 'MOSI/Processed/aligned_50.pkl'),
+            os.path.join(data_dir, 'MOSI/mosi_data.pkl'),
+        ]
+        mosi_feature_path = next((p for p in mosi_candidates if os.path.exists(p)), mosi_candidates[0])
         dataset_config = {
-            'featurePath': os.path.join(data_dir, 'MOSI/aligned_50.pkl'),
+            'featurePath': mosi_feature_path,
             'seq_lens': [50, 50, 50],
             'feature_dims': [768, 5, 20],
             'train_mode': 'regression',
         }
     elif dataset_name.lower() == 'mosei':
+        mosei_candidates = [
+            os.path.join(data_dir, 'MOSEI/aligned_50.pkl'),
+            os.path.join(data_dir, 'MOSEI/Processed/aligned_50.pkl'),
+            os.path.join(data_dir, 'MOSEI/mosei_data.pkl'),
+        ]
+        mosei_feature_path = next((p for p in mosei_candidates if os.path.exists(p)), mosei_candidates[0])
         dataset_config = {
-            'featurePath': os.path.join(data_dir, 'MOSEI/aligned_50.pkl'),
+            'featurePath': mosei_feature_path,
             'seq_lens': [50, 50, 50],
             'feature_dims': [768, 74, 35],
             'train_mode': 'regression',

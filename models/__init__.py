@@ -3,20 +3,24 @@ from .DecAlign import DecAlign
 from .DMD import DMD
 from .DAR import DAR
 from .DP import DP
+from .missingTask import TFR_NET
 
 MODEL_MAP = {
     'misa': MISA,
     'decalign': DecAlign,
     'dmd': DMD,
     'dar': DAR,
-    'dp': DP
+    'dp': DP,
+    'tfr_net': TFR_NET,
+    'tfrnet': TFR_NET,
 }
 
 
 def build_model(args):
-    if args.model_name not in MODEL_MAP:
-        raise ValueError("Unsupported model name")
-    return MODEL_MAP[args.model_name](args)
+    model_name = args.model_name.lower()
+    if model_name not in MODEL_MAP:
+        raise ValueError(f"Unsupported model name: {args.model_name}")
+    return MODEL_MAP[model_name](args)
 
 
-__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'build_model']
+__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'TFR_NET', 'build_model']
