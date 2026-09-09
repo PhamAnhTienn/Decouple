@@ -5,6 +5,7 @@ from .DMD import DMD
 from .DAR import DAR
 from .DP import DP
 from .TFR_NET import TFR_NET
+from .MULT import MULT as MULTTrainer
 
 __all__ = ["ATIO"]
 
@@ -18,6 +19,7 @@ class ATIO():
             'dmd': DMD,
             'dar': DAR,
             'dp': DP,
+            'mult': MULTTrainer,
             'tfr_net': TFR_NET,
             'tfrnet': TFR_NET,
         }

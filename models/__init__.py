@@ -3,6 +3,7 @@ from .DecAlign import DecAlign
 from .DMD import DMD
 from .DAR import DAR
 from .DP import DP
+from .MULT import MULT
 from .missingTask import TFR_NET
 
 MODEL_MAP = {
@@ -11,6 +12,7 @@ MODEL_MAP = {
     'dmd': DMD,
     'dar': DAR,
     'dp': DP,
+    'mult': MULT,
     'tfr_net': TFR_NET,
     'tfrnet': TFR_NET,
 }
@@ -23,4 +25,4 @@ def build_model(args):
     return MODEL_MAP[model_name](args)
 
 
-__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'TFR_NET', 'build_model']
+__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'MULT', 'TFR_NET', 'build_model']
