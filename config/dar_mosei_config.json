@@ -4,7 +4,7 @@
     "need_model_aligned": false,
     "use_finetune": true,
     "use_bert": true,
-    "early_stop": 10,
+    "early_stop": 5,
     "update_epochs": 10,
     "attn_mask": true,
     "attn_dropout_a": 0.0,
