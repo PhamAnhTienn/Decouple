@@ -7,6 +7,9 @@ set -e
 DATASET=${1:-mosi}
 GPU_ID=${2:-0}
 DATA_DIR=${3:-./data}
+BATCH_SIZE=${4}
+
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DECOUPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -19,10 +22,18 @@ fi
 SEEDS=(1111 1112 1113 1114 1115)
 RATES=(0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9)
 
+EXTRA_ARGS=()
+if [ -n "${BATCH_SIZE}" ]; then
+    EXTRA_ARGS+=(--batch_size "${BATCH_SIZE}")
+fi
+
 echo "======================================================================"
 echo "Starting TFRNet Benchmark: Dataset=${DATASET}, GPU=${GPU_ID}"
 echo "Seeds: ${SEEDS[*]}"
 echo "Missing Rates: ${RATES[*]}"
+if [ -n "${BATCH_SIZE}" ]; then
+    echo "Batch Size: ${BATCH_SIZE}"
+fi
 echo "======================================================================"
 
 cd "${DECOUPLE_ROOT}"
@@ -53,7 +64,8 @@ for seed in "${SEEDS[@]}"; do
             --data_dir "${DATA_DIR}" \
             --model_save_dir "${MODEL_SAVE_DIR}" \
             --res_save_dir "${RES_SAVE_DIR}" \
-            --log_dir "${LOG_DIR}"
+            --log_dir "${LOG_DIR}" \
+            "${EXTRA_ARGS[@]}"
     done
 done
 

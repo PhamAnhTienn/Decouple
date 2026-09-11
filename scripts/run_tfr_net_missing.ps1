@@ -10,10 +10,12 @@ param(
     [int]$Gpu = 0,
     [string]$DataDir = "./data",
     [string]$ConfigFile = "",
+    [int]$BatchSize = 0,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DecoupleRoot = Split-Path -Parent $ScriptDir
 
@@ -70,8 +72,13 @@ foreach ($seed in $Seeds) {
             "--data_dir", $DataDir,
             "--model_save_dir", $ModelSaveDir,
             "--res_save_dir", $ResSaveDir,
-            "--log_dir", $LogDir
+            "--log_dir", $LogDir,
+            "--num_workers", 0
         )
+
+        if ($BatchSize -gt 0) {
+            $ArgsList += @("--batch_size", $BatchSize)
+        }
 
         Write-Host "$PythonExec $($ArgsList -join ' ')" -ForegroundColor Gray
 

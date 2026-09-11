@@ -11,6 +11,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def get_default_python():
     """Detect python executable, preferring decouple_env if available."""
@@ -34,6 +36,8 @@ def parse_args():
         default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
         help="Missing rates to evaluate",
     )
+    parser.add_argument("--batch_size", type=int, default=None, help="Override batch size (recommended: 8 or 12 for 4GB VRAM)")
+    parser.add_argument("--num_workers", type=int, default=0 if os.name == 'nt' else 4, help="Number of workers (default: 0 on Windows, 4 on Linux)")
     parser.add_argument("--num_epochs", type=int, default=None, help="Override number of epochs if desired")
     parser.add_argument("--resume", action="store_true", default=True, help="Skip completed runs (default: True)")
     parser.add_argument("--no_resume", action="store_false", dest="resume", help="Do not skip completed runs")
@@ -143,7 +147,11 @@ def main():
                 "--model_save_dir", str(decouple_root / "pt" / f"seed_{seed}"),
                 "--res_save_dir", str(decouple_root / "result" / f"seed_{seed}"),
                 "--log_dir", str(decouple_root / "log" / f"seed_{seed}"),
+                "--num_workers", str(args.num_workers),
             ]
+
+            if args.batch_size is not None:
+                cmd.extend(["--batch_size", str(args.batch_size)])
 
             if args.num_epochs is not None:
                 cmd.extend(["--num_epochs", str(args.num_epochs)])

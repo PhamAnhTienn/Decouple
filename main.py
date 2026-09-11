@@ -19,6 +19,7 @@ import sys
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:2"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 logger = logging.getLogger('DecAlign')
 
 
@@ -225,7 +226,7 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Run mode')
     parser.add_argument('--seeds', type=int, nargs='+', default=[1111], help='Random seeds')
     parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0], help='GPU IDs to use')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--num_workers', type=int, default=0 if os.name == 'nt' else 4, help='Number of data loader workers')
     parser.add_argument('--num_epochs', type=int, default=None, help='Override number of training epochs')
     parser.add_argument('--batch_size', type=int, default=None, help='Override batch size')
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate')

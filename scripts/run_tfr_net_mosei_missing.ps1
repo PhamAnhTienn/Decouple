@@ -9,6 +9,7 @@ param(
     [int]$Gpu = 0,
     [string]$DataDir = "./data",
     [string]$ConfigFile = "",
+    [int]$BatchSize = 0,
     [switch]$DryRun
 )
 
@@ -21,6 +22,9 @@ $Params = @{
     DataDir = $DataDir
 }
 
+if ($BatchSize -gt 0) {
+    $Params["BatchSize"] = $BatchSize
+}
 if ($ConfigFile) {
     $Params["ConfigFile"] = $ConfigFile
 }
