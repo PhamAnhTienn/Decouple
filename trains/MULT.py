@@ -19,7 +19,7 @@ class MULT():
 
     def do_train(self, model, dataloader, return_epoch_results=False):
         optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, verbose=True, patience=self.args.patience)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=self.args.patience)
         # initilize results
         epochs, best_epoch = 0, 0
         if return_epoch_results:
