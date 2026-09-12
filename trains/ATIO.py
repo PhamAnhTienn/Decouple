@@ -4,7 +4,7 @@ from .DecAlign import DecAlignTrainer
 from .DMD import DMD
 from .DAR import DAR
 from .DP import DP
-
+from .LNLN import LNLN
 __all__ = ["ATIO"]
 
 logger = logging.getLogger('DecAlign')
@@ -16,7 +16,8 @@ class ATIO():
             'decalign': DecAlignTrainer,
             'dmd': DMD,
             'dar': DAR,
-            'dp': DP
+            'dp': DP,
+            'lnln': LNLN
         }
 
     def getTrain(self, args):
