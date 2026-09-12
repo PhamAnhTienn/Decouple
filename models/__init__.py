@@ -4,6 +4,7 @@ from .DMD import DMD
 from .DAR import DAR
 from .DP import DP
 from .LNLN import LNLN
+from .MFM import MFM
 
 MODEL_MAP = {
     'misa': MISA,
@@ -11,7 +12,8 @@ MODEL_MAP = {
     'dmd': DMD,
     'dar': DAR,
     'dp': DP,
-    'lnln': LNLN
+    'lnln': LNLN,
+    'mfm': MFM
 }
 
 
@@ -21,4 +23,4 @@ def build_model(args):
     return MODEL_MAP[args.model_name](args)
 
 
-__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'LNLN', 'build_model']
+__all__ = ['MISA', 'DecAlign', 'DMD', 'DAR', 'DP', 'LNLN', 'MFM', 'build_model']

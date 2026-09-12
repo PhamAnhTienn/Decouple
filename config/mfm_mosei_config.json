@@ -1,0 +1,57 @@
+{
+    "model_name": "mfm",
+    "need_data_aligned": true,
+    "need_model_aligned": true,
+    "need_normalized": false,
+    "early_stop": 8,
+    "hidden_dims": [
+        256,
+        32,
+        256
+    ],
+    "zy_size": 32,
+    "zl_size": 256,
+    "za_size": 80,
+    "zv_size": 80,
+    "fy_size": 16,
+    "fl_size": 32,
+    "fa_size": 80,
+    "fv_size": 32,
+    "zy_to_fy_dropout": 0.2,
+    "zl_to_fl_dropout": 0.7,
+    "za_to_fa_dropout": 0.7,
+    "zv_to_fv_dropout": 0.7,
+    "fy_to_y_dropout": 0.2,
+    "lda_mmd": 10,
+    "lda_xl": 5.0,
+    "lda_xa": 2.0,
+    "lda_xv": 5.0,
+    "memsize": 64,
+    "windowsize": 2,
+    "NN1Config": {
+        "drop": 0.5,
+        "shapes": 1278
+    },
+    "NN2Config": {
+        "drop": 0.7,
+        "shapes": 32
+    },
+    "gamma1Config": {
+        "drop": 0.5,
+        "shapes": 64
+    },
+    "gamma2Config": {
+        "drop": 0.2,
+        "shapes": 128
+    },
+    "outConfig": {
+        "drop": 0.0,
+        "shapes": 256
+    },
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0005,
+    "KeyEval": "Loss",
+    "selection_metric": "MOSI",
+    "scheduler_metric": "MOSI"
+}
