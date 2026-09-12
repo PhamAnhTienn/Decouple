@@ -10,6 +10,7 @@ param(
     [string]$DataDir = "./data",
     [string]$ConfigFile = "",
     [int]$BatchSize = 0,
+    [switch]$NoResume,
     [switch]$DryRun
 )
 
@@ -27,6 +28,9 @@ if ($BatchSize -gt 0) {
 }
 if ($ConfigFile) {
     $Params["ConfigFile"] = $ConfigFile
+}
+if ($NoResume) {
+    $Params["NoResume"] = $true
 }
 if ($DryRun) {
     $Params["DryRun"] = $true
