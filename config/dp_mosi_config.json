@@ -1,5 +1,5 @@
 {
-    "model_name": "dmd",
+    "model_name": "dp",
     "need_data_aligned": true,
     "need_model_aligned": false,
     "use_finetune": true,

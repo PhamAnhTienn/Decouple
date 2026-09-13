@@ -76,7 +76,7 @@ class DP():
                     else:
                         labels = labels.view(-1, 1)
 
-                    output = model(text, audio, vision, is_distill=True)
+                    output = model(text_m, audio_m, vision_m, text, audio, vision)
 
                     # normalize the prototypes
                     with torch.no_grad():
@@ -102,9 +102,9 @@ class DP():
                     loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
                     # cycle consistency loss between s_x and s_x_r
-                    loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0), output['s_l_r'])
-                    loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0), output['s_v_r'])
-                    loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0), output['s_a_r'])
+                    loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0).detach(), output['s_l_r'])
+                    loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0).detach(), output['s_v_r'])
+                    loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0).detach(), output['s_a_r'])
                     loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
 
                     # ort loss
@@ -218,7 +218,7 @@ class DP():
                         labels = labels.view(-1).long()
                     else:
                         labels = labels.view(-1, 1)
-                    output = model(text, audio, vision, is_distill=True)
+                    output = model(text_m, audio_m, vision_m, text, audio, vision)
 
                     loss = self.criterion(output['output_logit'], labels)
                     eval_loss += loss.item()

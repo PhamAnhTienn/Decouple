@@ -142,16 +142,25 @@ class DP(nn.Module):
                                   embed_dropout=self.embed_dropout,
                                   attn_mask=self.attn_mask)
 
-    def forward(self, text, audio, video, is_distill=False):
+    def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
             text = self.text_model(text)
+            text_c = self.text_model(text_c)
         x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training)
         x_a = audio.transpose(1, 2) # (B, D, T)
         x_v = video.transpose(1, 2)
 
+        x_l_c = F.dropout(text_c.transpose(1, 2), p=self.text_dropout, training=self.training)
+        x_a_c = audio_c.transpose(1, 2)
+        x_v_c = video_c.transpose(1, 2)
+
         proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
         proj_x_a = x_a if self.orig_d_a == self.d_a else self.proj_a(x_a)
         proj_x_v = x_v if self.orig_d_v == self.d_v else self.proj_v(x_v)
+
+        proj_x_l_c = x_l_c if self.orig_d_l == self.d_l else self.proj_l(x_l_c)
+        proj_x_a_c = x_a_c if self.orig_d_a == self.d_a else self.proj_a(x_a_c)
+        proj_x_v_c = x_v_c if self.orig_d_v == self.d_v else self.proj_v(x_v_c)
 
         s_l = self.encoder_s_l(proj_x_l)
         s_v = self.encoder_s_v(proj_x_v)
@@ -286,8 +295,6 @@ class DP(nn.Module):
         h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
         h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
 
-        # Fused shared representation (average of 3 modalities, then L2-norm)
-        h_shared = F.normalize((h_c_l + h_c_v + h_c_a) / 3.0, dim=1, p=2)  # (B, D)
 
         res = {
             'logits_l_homo': logits_l_low,
@@ -296,9 +303,9 @@ class DP(nn.Module):
             'repr_l_homo': repr_l_low,
             'repr_v_homo': repr_v_low,
             'repr_a_homo': repr_a_low,
-            'origin_l': proj_x_l,
-            'origin_v': proj_x_v,
-            'origin_a': proj_x_a,
+            'origin_l': proj_x_l_c,
+            'origin_v': proj_x_v_c,
+            'origin_a': proj_x_a_c,
             's_l': s_l,
             's_v': s_v,
             's_a': s_a,
@@ -324,8 +331,6 @@ class DP(nn.Module):
             'last_hs_proj': last_hs_proj,  # (B, combined_dim) — pre-classifier repr    
             'logits_c': logits_c,
             'output_logit': output,
-            # Cluster-related features
-            'h_shared': h_shared,   # (B, D) fused shared representation
             'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
             'h_c_v': h_c_v,
             'h_c_a': h_c_a,
