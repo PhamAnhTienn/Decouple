@@ -9,3 +9,13 @@ python main.py \
     --res_save_dir ./result \
     --log_dir ./log \
     --missing_rate_eval_test 0.0
+
+
+python main.py \
+    --data_missing \
+    --seeds 1111 \
+    --model dp \
+    --config_file "/home/tien/NCKH/DecAlign/config/dp_mosi_config.json" \
+    --dataset mosi \
+    --mode uncertainty \
+    --missing_rate_eval_test 0.0

@@ -131,6 +131,7 @@ def DMD_run(
             
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
     args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
+    args.res_save_dir = str(res_save_dir)
 
     # Running results
     res_save_dir = Path(res_save_dir) / "normal"
@@ -142,6 +143,9 @@ def DMD_run(
         args.cur_seed = seed
         result = _run(args, num_workers, is_tune)
         model_results.append(result)
+    if args.mode == 'uncertainty':
+        return
+
     # Save results to CSV file
     criterions = list(model_results[0].keys())
     csv_file = res_save_dir / f"{dataset_name}.csv"
@@ -200,6 +204,13 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
         sys.stdout.flush()
         input('[Press Any Key to start another run]')
+    elif args.mode == 'uncertainty':
+        model.load_state_dict(torch.load(args.model_save_path))
+        K = getattr(args, 'K_neighbors', 10)
+        res_dir = getattr(args, 'res_save_dir', './result')
+        trainer.do_test_uncertainty(model, dataloader['test'], save_dir=res_dir, K=K)
+        # Also run standard test for reference
+        results = trainer.do_test(model, dataloader['test'], mode="TEST")
     else:
         epoch_results = trainer.do_train(model, dataloader, return_epoch_results=from_sena)
         model.load_state_dict(torch.load(args.model_save_path))
@@ -222,7 +233,8 @@ def parse_args():
     parser.add_argument('--model_save_dir', type=str, default='./pt', help='Directory to save models')
     parser.add_argument('--res_save_dir', type=str, default='./result', help='Directory to save results')
     parser.add_argument('--log_dir', type=str, default='./log', help='Directory to save logs')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Run mode')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test', 'uncertainty'], help='Run mode')
+    parser.add_argument('--K_neighbors', type=int, default=10, help='K for neighbor uncertainty metric')
     parser.add_argument('--seeds', type=int, nargs='+', default=[1111], help='Random seeds')
     parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0], help='GPU IDs to use')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
@@ -250,7 +262,8 @@ def main():
             'batch_size': args.batch_size,
             'learning_rate': args.learning_rate,
             'missing_rate_eval_test': args.missing_rate_eval_test,
-            'data_missing': args.data_missing
+            'data_missing': args.data_missing,
+            'K_neighbors': args.K_neighbors,
         }.items()
         if value is not None
     })

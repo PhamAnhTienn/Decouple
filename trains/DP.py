@@ -1,4 +1,6 @@
 import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,17 +127,17 @@ class DP():
 
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                    # CPA loss (Cross-modal Prototype Alignment)
-                    loss_cluster = model.compute_cpa_loss(
-                        output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
-                    )
+                    # # CPA loss (Cross-modal Prototype Alignment)
+                    # loss_cluster = model.compute_cpa_loss(
+                    #     output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                    # )
 
-                    # prototype separation loss
-                    loss_push = model.compute_push_loss(margin=2.0)
+                    # # prototype separation loss
+                    # loss_push = model.compute_push_loss(margin=2.0)
 
                     combined_loss = loss_task + \
-                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP + \
-                                        loss_cluster * LAMBDA_CLUSTER
+                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP
+                                        # + loss_cluster * LAMBDA_CLUSTER
                     combined_loss.backward()
 
                     # Freeze prototypes during warmup iterations
@@ -241,3 +243,27 @@ class DP():
             eval_results['Labels'] = all_labels
 
         return eval_results
+
+    def do_test_uncertainty(self, model, dataloader, save_dir, K=10):
+        """
+        Compute and save all uncertainty metrics on a dataset split.
+
+        Args:
+            model: trained model (already loaded with best weights)
+            dataloader: DataLoader for the target split (typically test)
+            save_dir: root directory to save results
+            K: number of neighbors for the specific neighbor metric
+        """
+        from utils.uncertainty_metrics import UncertaintyMetrics
+
+        missing_rate = getattr(self.args, 'missing_rate_eval_test', 0.0)
+        seed = getattr(self.args, 'cur_seed', -1)
+        dataset = self.args.dataset_name
+
+        save_path = (
+            Path(save_dir) / 'uncertainty' /
+            f'uncertainty_{dataset}_mr{missing_rate:.1f}_seed{seed}.pt'
+        )
+
+        um = UncertaintyMetrics(model, dataloader, self.args, K=K)
+        return um.compute_and_save(str(save_path))

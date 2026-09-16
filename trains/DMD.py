@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -351,3 +352,27 @@ class DMD():
             eval_results['Labels'] = all_labels
 
         return eval_results
+
+    def do_test_uncertainty(self, model, dataloader, save_dir, K=10):
+        """
+        Compute and save all uncertainty metrics on a dataset split for DMD.
+
+        Args:
+            model: trained model (already loaded with best weights)
+            dataloader: DataLoader for the target split (typically test)
+            save_dir: root directory to save results
+            K: number of neighbors for the specific neighbor metric
+        """
+        from utils.uncertainty_metrics import UncertaintyMetrics
+
+        missing_rate = getattr(self.args, 'missing_rate_eval_test', 0.0)
+        seed = getattr(self.args, 'cur_seed', -1)
+        dataset = self.args.dataset_name
+
+        save_path = (
+            Path(save_dir) / 'uncertainty_dmd' /
+            f'uncertainty_{dataset}_mr{missing_rate:.1f}_seed{seed}.pt'
+        )
+
+        um = UncertaintyMetrics(model, dataloader, self.args, K=K)
+        return um.compute_and_save(str(save_path))

@@ -208,19 +208,23 @@ class DP(nn.Module):
         hs_proj_a_low += hs_a_low
         logits_a_low = self.out_layer_a_low(hs_proj_a_low)
 
+        # self-attention for shared feature
         c_l_att = self.self_attentions_c_l(c_l)
         if type(c_l_att) == tuple:
             c_l_att = c_l_att[0]
         c_l_att = c_l_att[-1] # B, D
+
         c_v_att = self.self_attentions_c_v(c_v)
         if type(c_v_att) == tuple:
             c_v_att = c_v_att[0]
         c_v_att = c_v_att[-1]
+
         c_a_att = self.self_attentions_c_a(c_a)
         if type(c_a_att) == tuple:
             c_a_att = c_a_att[0]
         c_a_att = c_a_att[-1]
-        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
+
+        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1) # B, 3 * d_l
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -228,7 +232,7 @@ class DP(nn.Module):
         c_proj += c_fusion
         logits_c = self.out_layer_c(c_proj)
 
-        # cross-modal attention
+        # cross-modal attention between specific
         # (V,A) --> L
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # Dimension (L, N, d_l)
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # Dimension (L, N, d_l)
@@ -277,6 +281,7 @@ class DP(nn.Module):
         last_h_a = torch.sigmoid(self.weight_a(last_h_a))
         c_fusion = torch.sigmoid(self.weight_c(c_fusion))
 
+        # Last concat of shared and specific
         last_hs = torch.cat([last_h_l, last_h_v, last_h_a, c_fusion], dim=1)
         last_hs_proj = self.proj2(
             F.dropout(F.relu(self.proj1(last_hs), inplace=True), p=self.output_dropout, training=self.training))
