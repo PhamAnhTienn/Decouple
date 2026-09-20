@@ -6,6 +6,7 @@ from .DAR import DAR
 from .DP import DP
 from .LNLN import LNLN
 from .MFM import MFM
+from .CACR import CACR
 __all__ = ["ATIO"]
 
 logger = logging.getLogger('DecAlign')
@@ -19,7 +20,8 @@ class ATIO():
             'dar': DAR,
             'dp': DP,
             'lnln': LNLN,
-            'mfm': MFM
+            'mfm': MFM,
+            'cacr': CACR
         }
 
     def getTrain(self, args):
