@@ -28,6 +28,25 @@ class MSE(nn.Module):
         mse = torch.sum(diffs.pow(2)) / n
         return mse
 
+
+class WeightedMSE(nn.Module):
+    """Per-sample weighted MSE: L_m = Σ_i w_i ℓ_i / Σ_i w_i."""
+    def __init__(self):
+        super(WeightedMSE, self).__init__()
+
+    def forward(self, pred, real, weights):
+        """
+        Args:
+            pred: (B, D, T) or (B, ...)
+            real: same shape as pred
+            weights: (B,) per-sample reliability weights
+        Returns:
+            scalar weighted MSE loss
+        """
+        # Per-sample MSE: average over all dims except batch
+        per_sample_mse = (pred - real).pow(2).flatten(1).mean(dim=1)  # (B,)
+        return (weights * per_sample_mse).sum() / weights.sum().clamp(min=1e-8)
+
 class DP():
     def __init__(self, args):
         self.args = args
@@ -35,6 +54,7 @@ class DP():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
+        self.weighted_MSE = WeightedMSE()
 
     def do_train(self, model, dataloader, return_epoch_results=False):
         optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
@@ -97,10 +117,13 @@ class DP():
                     loss_task_c = self.criterion(output['logits_c'], labels)
                     loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
 
-                    # reconstruction loss
-                    loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
-                    loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
-                    loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
+                    # reconstruction loss (uncertainty-reweighted)
+                    # w_m^i = r_m^{c,i} * r_m^{s,i} — suppresses recon under uncertainty
+                    # L_m = Σ_i w_m^i ℓ_m^i / Σ_i w_m^i,  L_recon = Σ_m L_m
+                    recon_w = output['recon_weights']  # dict m → (B,)
+                    loss_recon_l = self.weighted_MSE(output['recon_l'], output['origin_l'], recon_w['l'])
+                    loss_recon_v = self.weighted_MSE(output['recon_v'], output['origin_v'], recon_w['v'])
+                    loss_recon_a = self.weighted_MSE(output['recon_a'], output['origin_a'], recon_w['a'])
                     loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
                     # cycle consistency loss between s_x and s_x_r
@@ -127,17 +150,17 @@ class DP():
 
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                    # # CPA loss (Cross-modal Prototype Alignment)
-                    # loss_cluster = model.compute_cpa_loss(
-                    #     output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
-                    # )
+                    # CPA loss (Cross-modal Prototype Alignment)
+                    loss_cluster = model.compute_cpa_loss(
+                        output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                    )
 
                     # # prototype separation loss
                     # loss_push = model.compute_push_loss(margin=2.0)
 
                     combined_loss = loss_task + \
-                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP
-                                        # + loss_cluster * LAMBDA_CLUSTER
+                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
+                                        + loss_cluster * LAMBDA_CLUSTER
                     combined_loss.backward()
 
                     # Freeze prototypes during warmup iterations

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
@@ -37,6 +36,14 @@ class DP(nn.Module):
         self.output_dropout = args.output_dropout
         self.text_dropout = args.text_dropout
         self.attn_mask = args.attn_mask
+
+        # Uncertainty hyperparameters
+        self.tau_c = getattr(args, 'tau_c', 1.0)    # temperature for shared reliability
+        self.tau_s = getattr(args, 'tau_s', 1.0)    # temperature for specific reliability
+        self.tau_f = getattr(args, 'tau_f', 1.0)    # temperature for shared fusion softmax
+        self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
+        self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
+
         combined_dim_low = self.d_a
         combined_dim_high = 2 * self.d_a
         combined_dim = 2 * (self.d_l + self.d_a + self.d_v) + self.d_l * 3
@@ -142,6 +149,191 @@ class DP(nn.Module):
                                   embed_dropout=self.embed_dropout,
                                   attn_mask=self.attn_mask)
 
+    # ==================================================================
+    # Uncertainty computation (all online, within each batch)
+    # ==================================================================
+
+    def _pool_norm(self, h):
+        """MeanPool over time dim + L2 normalize.
+        Args:
+            h: (B, D, T) — Conv1d format
+        Returns:
+            z: (B, D) — L2-normalized pooled representation
+        """
+        return F.normalize(h.mean(dim=2), dim=1)
+
+    def _shared_consensus(self, z_c_dict):
+        """
+        u_m^{c,con,i} = 1 - (1/(|M|-1)) * Σ_{n≠m} cos(z_m^c, z_n^c)
+
+        Args:
+            z_c_dict: dict m → (B, D) — L2-normed shared pooled repr
+        Returns:
+            dict m → (B,) consensus uncertainty
+        """
+        modalities = list(z_c_dict.keys())
+        scores = {}
+        for m in modalities:
+            others = [n for n in modalities if n != m]
+            cos_sum = sum(
+                F.cosine_similarity(z_c_dict[m], z_c_dict[n], dim=1)
+                for n in others
+            )
+            scores[m] = 1.0 - cos_sum / len(others)
+        return scores
+
+    def _cycle_uncertainty(self, z_dict, zt_dict):
+        """
+        u_m^{*,cy,i} = 1 - cos(z_m, z̃_m)
+        Works for both shared and specific.
+
+        Args:
+            z_dict:  dict m → (B, D) — original pooled repr
+            zt_dict: dict m → (B, D) — cycle-reconstructed pooled repr
+        Returns:
+            dict m → (B,) cycle uncertainty
+        """
+        return {
+            m: 1.0 - F.cosine_similarity(z_dict[m], zt_dict[m], dim=1)
+            for m in z_dict
+        }
+
+    def _neighbor_uncertainty(self, z_c_dict, z_s_dict, K):
+        """
+        In-batch neighbor uncertainty for specific representations.
+
+        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)
+        N_K^m(i) = TopK_{j≠i}[cos(z_{-m}^{c,i}, z_{-m}^{c,j})]
+        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(z_m^{s,j}))
+
+        Args:
+            z_c_dict: dict m → (B, D) — shared pooled repr (normed)
+            z_s_dict: dict m → (B, D) — specific pooled repr (normed)
+            K: number of neighbors
+        Returns:
+            dict m → (B,) neighbor uncertainty
+        """
+        modalities = list(z_c_dict.keys())
+        B = z_c_dict[modalities[0]].shape[0]
+        scores = {}
+
+        for m in modalities:
+            # Leave-one-out shared feature
+            others = [n for n in modalities if n != m]
+            z_minus_m = F.normalize(
+                sum(z_c_dict[n] for n in others), dim=1
+            )  # (B, D)
+
+            # Pairwise cosine similarity (B, B); already L2-normed
+            sim_matrix = z_minus_m @ z_minus_m.t()
+            sim_matrix.fill_diagonal_(-float('inf'))  # mask self
+
+            k_actual = min(K, B - 1)
+            if k_actual <= 0:
+                scores[m] = torch.zeros(B, device=z_c_dict[m].device)
+                continue
+
+            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
+
+            z_s_m = z_s_dict[m]                    # (B, D)
+            z_s_neighbors = z_s_m[topk_idx]         # (B, K, D)
+
+            cos_neighbors = F.cosine_similarity(
+                z_s_m.unsqueeze(1),
+                z_s_neighbors.detach(),  # stop-gradient on neighbors
+                dim=2,
+            )  # (B, K)
+            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
+
+        return scores
+
+    def _compute_reliability(self, u_consensus, u_cycle_c, u_neighbor, u_cycle_s):
+        """
+        Aggregate per-modality uncertainties into reliability scores.
+
+        u_m^c = 0.5 * (u_con + u_cy_c)
+        u_m^s = 0.5 * (u_nei + u_cy_s)
+        r_m^c = clamp(exp(-u_m^c / tau_c), r_min, 1)
+        r_m^s = clamp(exp(-u_m^s / tau_s), r_min, 1)
+
+        All returned with stop-gradient.
+
+        Returns:
+            r_shared:   dict m → (B,)
+            r_specific: dict m → (B,)
+        """
+        r_shared, r_specific = {}, {}
+        for m in u_consensus:
+            # u_c = 0.5 * (u_consensus[m] + u_cycle_c[m])
+            # u_s = 0.5 * (u_neighbor[m] + u_cycle_s[m])
+            u_c = u_consensus[m]
+            u_s = u_neighbor[m]
+            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=self.r_min, max=1.0)
+            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=self.r_min, max=1.0)
+            r_shared[m] = r_c.detach()      # stop-gradient
+            r_specific[m] = r_s.detach()     # stop-gradient
+        return r_shared, r_specific
+
+    def _reliability_weighted_shared_fusion(self, c_att_dict, r_shared):
+        """
+        Uncertainty-aware shared fusion (closed-form weighted average).
+
+        Formula:
+            h̄^c = Σ_m [ r_m^c / (Σ_n r_n^c) * h_m^{c,att} ]
+
+        For backbone compatibility the output is a concat of per-modality
+        reliability-scaled features: each modality is multiplied by its
+        normalized weight w_m = r_m^c / Σ_n r_n^c, then concatenated to
+        keep the (B, 3*D) shape expected by the downstream projection layer.
+
+        Args:
+            c_att_dict: dict m → (B, D) — self-attention shared output
+            r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
+        Returns:
+            c_fusion: (B, 3*D) — reliability-scaled concat
+        """
+        modalities = list(c_att_dict.keys())
+
+        # Normalized reliability weights w_m = r_m / Σ_n r_n
+        r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
+        r_sum = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)         # (B, 1)
+        w = r_stack / r_sum                                               # (B, |M|)
+        # w is already detached because r_shared is stop-gradient
+
+        reweighted = []
+        for i, m in enumerate(modalities):
+            wi = w[:, i].unsqueeze(1)            # (B, 1)
+            reweighted.append(wi * c_att_dict[m])  # (B, D)
+
+        return torch.cat(reweighted, dim=1)  # (B, 3*D)
+
+    def _calibrate_cross_attention(self, h_m, h_cross, r_specific, m_query, m_kv):
+        """
+        Reliability-aware complementary exchange for specific representations.
+
+        Closed-form solution of:
+            tilde_h_{m←n} = argmin_x [ r_m ||x - h_m||^2 + r_n ||x - b_{m←n}||^2 ]
+
+        which gives:
+            tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
+
+        A reliable sender (high r_n) exerts stronger influence; a reliable
+        receiver (high r_m) is less affected by potentially noisy messages.
+
+        Args:
+            h_m:         (T, B, D) — receiver's own specific representation
+            h_cross:     (T, B, D) — cross-attention message b_{m←n}
+            r_specific:  dict m → (B,) — specific reliability (stop-grad)
+            m_query:     str — receiver modality key (m)
+            m_kv:        str — sender modality key (n)
+        Returns:
+            h_calibrated: (T, B, D)
+        """
+        r_m = r_specific[m_query].unsqueeze(0).unsqueeze(2)  # (1, B, 1)
+        r_n = r_specific[m_kv].unsqueeze(0).unsqueeze(2)     # (1, B, 1)
+        denom = (r_m + r_n).clamp(min=1e-8)
+        return (r_m * h_m + r_n * h_cross) / denom
+
     def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
             text = self.text_model(text)
@@ -179,6 +371,34 @@ class DP(nn.Module):
         s_v_r = self.encoder_s_v(recon_v)
         s_a_r = self.encoder_s_a(recon_a)
 
+        # ==============================================================
+        # Online Uncertainty Computation
+        # ==============================================================
+        # Pool + normalize shared and specific features (Conv1d format: B,D,T)
+        z_c = {
+            'l': self._pool_norm(c_l),  # (B, D)
+            'v': self._pool_norm(c_v),
+            'a': self._pool_norm(c_a),
+        }
+        z_s = {
+            'l': self._pool_norm(s_l),  # (B, D)
+            'v': self._pool_norm(s_v),
+            'a': self._pool_norm(s_a),
+        }
+
+        # Shared consensus uncertainty: u_m^c = 1 - (1/(|M|-1)) Σ_{n≠m} cos(z_m^c, z_n^c)
+        u_consensus = self._shared_consensus(z_c)
+        # Specific neighbor uncertainty: u_m^s via leave-one-out KNN on shared space
+        u_neighbor  = self._neighbor_uncertainty(z_c, z_s, self.K_neighbors)
+
+        # Reliability scores (all stop-gradient): r = clamp(exp(-u/tau), r_min, 1)
+        r_shared, r_specific = self._compute_reliability(
+            u_consensus, None, u_neighbor, None
+        )
+
+        # ==============================================================
+        # Permute to (T, B, D) for transformer layers
+        # ==============================================================
         s_l = s_l.permute(2, 0, 1) # (T, B, D)
         s_v = s_v.permute(2, 0, 1)
         s_a = s_a.permute(2, 0, 1)
@@ -208,6 +428,9 @@ class DP(nn.Module):
         hs_proj_a_low += hs_a_low
         logits_a_low = self.out_layer_a_low(hs_proj_a_low)
 
+        # ==============================================================
+        # Uncertainty-aware Shared Fusion
+        # ==============================================================
         # self-attention for shared feature
         c_l_att = self.self_attentions_c_l(c_l)
         if type(c_l_att) == tuple:
@@ -224,7 +447,10 @@ class DP(nn.Module):
             c_a_att = c_a_att[0]
         c_a_att = c_a_att[-1]
 
-        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1) # B, 3 * d_l
+        # Reliability-weighted fusion (replaces plain torch.cat)
+        c_att_dict = {'l': c_l_att, 'v': c_v_att, 'a': c_a_att}
+        c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
+        # c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -232,10 +458,16 @@ class DP(nn.Module):
         c_proj += c_fusion
         logits_c = self.out_layer_c(c_proj)
 
-        # cross-modal attention between specific
+        # ==============================================================
+        # Reliability-Aware Specific Cross-attention
+        # tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
+        # where b_{m←n} = CrossAttn(h_m^s, h_n^s)
+        # ==============================================================
         # (V,A) --> L
-        h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # Dimension (L, N, d_l)
-        h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # Dimension (L, N, d_l)
+        b_l_from_a = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
+        b_l_from_v = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
+        h_l_with_as = self._calibrate_cross_attention(s_l, b_l_from_a, r_specific, 'l', 'a')
+        h_l_with_vs = self._calibrate_cross_attention(s_l, b_l_from_v, r_specific, 'l', 'v')
         h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
         h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
@@ -243,8 +475,10 @@ class DP(nn.Module):
         last_h_l = last_hs = h_ls[-1]  # Take the last output for prediction
 
         # (L,V) --> A
-        h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)
-        h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)
+        b_a_from_l = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
+        b_a_from_v = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
+        h_a_with_ls = self._calibrate_cross_attention(s_a, b_a_from_l, r_specific, 'a', 'l')
+        h_a_with_vs = self._calibrate_cross_attention(s_a, b_a_from_v, r_specific, 'a', 'v')
         h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
@@ -252,8 +486,10 @@ class DP(nn.Module):
         last_h_a = last_hs = h_as[-1]
 
         # (L,A) --> V
-        h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)
-        h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)
+        b_v_from_l = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
+        b_v_from_a = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
+        h_v_with_ls = self._calibrate_cross_attention(s_v, b_v_from_l, r_specific, 'v', 'l')
+        h_v_with_as = self._calibrate_cross_attention(s_v, b_v_from_a, r_specific, 'v', 'a')
         h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
@@ -300,6 +536,15 @@ class DP(nn.Module):
         h_c_v = F.normalize(utt_shared_v, dim=1, p=2)  # (B, D)
         h_c_a = F.normalize(utt_shared_a, dim=1, p=2)  # (B, D)
 
+        # ==============================================================
+        # Reconstruction reliability weights (for training loop)
+        # w_m^i = sg(r_m^{c,i} × r_m^{s,i}) — suppresses recon under uncertainty
+        # L_m = Σ_i w_m^i ℓ_m^i / Σ_i w_m^i
+        # ==============================================================
+        recon_weights = {
+            m: (r_shared[m] * r_specific[m]).detach()  # (B,) — already stop-grad
+            for m in ['l', 'v', 'a']
+        }
 
         res = {
             'logits_l_homo': logits_l_low,
@@ -339,6 +584,10 @@ class DP(nn.Module):
             'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
             'h_c_v': h_c_v,
             'h_c_a': h_c_a,
+            # --- Uncertainty outputs ---
+            'r_shared': r_shared,       # dict m → (B,) shared reliability
+            'r_specific': r_specific,   # dict m → (B,) specific reliability
+            'recon_weights': recon_weights,  # dict m → (B,) reconstruction suppression weights
         }
         return res
 
