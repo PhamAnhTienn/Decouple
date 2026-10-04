@@ -5,6 +5,79 @@ from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
 
+class FSR(nn.Module):
+    """
+    Fine-grained Sentiment Refinement module (Section 3.4).
+    
+    Extracts fine-grained emotional cues from visual- and audio-specific
+    features and uses text-guided cross-attention to supplement textual semantics.
+    """
+
+    def __init__(self, d_model, num_heads, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1):
+        super(FSR, self).__init__()
+        # Feature refinement layers for P_V and P_A
+        self.refine_v = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+        self.refine_a = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Text-guided cross-attention: P_L as query, [P'_V; P'_A] as key/value
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            batch_first=False,
+        )
+        self.layer_norm1 = nn.LayerNorm(d_model)
+        self.layer_norm2 = nn.LayerNorm(d_model)
+
+        # FFN after cross-attention
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(relu_dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(res_dropout),
+        )
+
+    def forward(self, p_l, p_v, p_a):
+        """
+        Args:
+            p_l: (T_l, B, d) language specific features
+            p_v: (T_v, B, d) visual specific features
+            p_a: (T_a, B, d) audio specific features
+        Returns:
+            p_l_prime: (T_l, B, d) enhanced language features
+            p_v_prime: (T_v, B, d) refined visual features
+            p_a_prime: (T_a, B, d) refined audio features
+        """
+        # Refine visual and audio specific features
+        p_v_prime = p_v + self.refine_v(p_v)  # (T_v, B, d)
+        p_a_prime = p_a + self.refine_a(p_a)  # (T_a, B, d)
+
+        # Concatenate refined V and A as key/value for cross-attention
+        kv = torch.cat([p_v_prime, p_a_prime], dim=0)  # (T_v + T_a, B, d)
+
+        # Text-guided cross-attention: P_L queries [P'_V; P'_A]
+        residual = p_l
+        p_l_norm = self.layer_norm1(p_l)
+        attn_out, _ = self.cross_attn(query=p_l_norm, key=kv, value=kv)
+        p_l_enhanced = residual + attn_out  # (T_l, B, d)
+
+        # FFN
+        residual = p_l_enhanced
+        p_l_enhanced = self.layer_norm2(p_l_enhanced)
+        p_l_prime = residual + self.ffn(p_l_enhanced)  # (T_l, B, d)
+
+        return p_l_prime, p_v_prime, p_a_prime
+
+
 class DP(nn.Module):
     def __init__(self, args):
         super(DP, self).__init__()
@@ -44,6 +117,10 @@ class DP(nn.Module):
         self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
+        # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
+        # self.tau = getattr(args, 'tau', 0.5)
+        # self.omega_min = getattr(args, 'omega_min', 0.1)
+
         combined_dim_low = self.d_a
         combined_dim_high = 2 * self.d_a
         combined_dim = 2 * (self.d_l + self.d_a + self.d_v) + self.d_l * 3
@@ -62,10 +139,42 @@ class DP(nn.Module):
         # 2.2 Modality-invariant encoder
         self.encoder_c = nn.Conv1d(self.d_l, self.d_l, kernel_size=1, padding=0, bias=False)
 
-        # 3. Decoder for reconstruct three modalities
+        # 3. Decoder for reconstruct three modalities (OLD — kept for reference)
         self.decoder_l = nn.Conv1d(self.d_l * 2, self.d_l, kernel_size=1, padding=0, bias=False)
         self.decoder_v = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
         self.decoder_a = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
+
+        # =====================================================================
+        # 3b. Cross-Reconstruction Module (CRM) (Section 3.3)
+        #     6 cross-reconstruction decoders D_{nm}
+        #     3 fusion layers F_m
+        # =====================================================================
+        # Decoders: D_{nm} reconstructs target m from shared H_n ⊕ specific P_m
+        # For target L: D_VL (from V's shared), D_AL (from A's shared)
+        self.decoder_vl = nn.Conv1d(self.d_l * 2, self.d_l, kernel_size=1, padding=0, bias=False)
+        self.decoder_al = nn.Conv1d(self.d_l * 2, self.d_l, kernel_size=1, padding=0, bias=False)
+        # For target V: D_LV (from L's shared), D_AV (from A's shared)
+        self.decoder_lv = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
+        self.decoder_av = nn.Conv1d(self.d_v * 2, self.d_v, kernel_size=1, padding=0, bias=False)
+        # For target A: D_LA (from L's shared), D_VA (from V's shared)
+        self.decoder_la = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
+        self.decoder_va = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
+
+        # Fusion layers F_m to combine two cross-reconstructed features per target
+        self.fusion_l = nn.Linear(self.d_l * 2, self.d_l)
+        self.fusion_v = nn.Linear(self.d_v * 2, self.d_v)
+        self.fusion_a = nn.Linear(self.d_a * 2, self.d_a)
+
+        # =====================================================================
+        # 3c. Fine-grained Sentiment Refinement (FSR) (Section 3.4)
+        # =====================================================================
+        self.fsr = FSR(
+            d_model=self.d_l,
+            num_heads=self.num_heads,
+            attn_dropout=self.attn_dropout,
+            relu_dropout=self.relu_dropout,
+            res_dropout=self.res_dropout,
+        )
 
         # init prototype
         self.nmb_prototypes = args.nmb_prototypes
@@ -90,6 +199,15 @@ class DP(nn.Module):
         self.trans_l_mem = self.get_network(self_type='l_mem', layers=3)
         self.trans_a_mem = self.get_network(self_type='a_mem', layers=3)
         self.trans_v_mem = self.get_network(self_type='v_mem', layers=3)
+
+        # Self-attention transformer for shared features H̃ (CRM shared branch)
+        self.trans_shared = self.get_network(self_type='shared', layers=3)
+
+        # Shared branch prediction head (for TH̃)
+        shared_dim = self.d_l * 3  # concat of H̃_L, H̃_V, H̃_A last tokens
+        self.proj1_shared = nn.Linear(shared_dim, shared_dim)
+        self.proj2_shared = nn.Linear(shared_dim, shared_dim)
+        self.out_layer_shared = nn.Linear(shared_dim, output_dim)
 
         # 4. fc layers for homogeneous graph distillation
         self.proj1_l_low = nn.Linear(combined_dim_low * (self.len_l - args.conv1d_kernel_size_l + 1), combined_dim_low)
@@ -137,6 +255,8 @@ class DP(nn.Module):
             embed_dim, attn_dropout = 2 * self.d_a, self.attn_dropout
         elif self_type == 'v_mem':
             embed_dim, attn_dropout = 2 * self.d_v, self.attn_dropout
+        elif self_type == 'shared':
+            embed_dim, attn_dropout = self.d_l * 3, self.attn_dropout
         else:
             raise ValueError("Unknown network type")
 
@@ -334,6 +454,47 @@ class DP(nn.Module):
         denom = (r_m + r_n).clamp(min=1e-8)
         return (r_m * h_m + r_n * h_cross) / denom
 
+    def compute_conflict_weights(self, h_l, h_v, h_a):
+        """
+        Conflict-Aware Weighting (CAW) strategy (Section 3.2).
+        
+        Computes per-sample conflict scores from shared features and maps
+        them to cross-reconstruction weights via exponential decay.
+        
+        Args:
+            h_l: (B, d) global shared feature for language (temporal-pooled)
+            h_v: (B, d) global shared feature for visual
+            h_a: (B, d) global shared feature for audio
+        Returns:
+            w_l, w_v, w_a: (B,) per-sample weights for each modality
+        """
+        # Normalize for cosine similarity
+        h_l_norm = F.normalize(h_l, dim=-1)
+        h_v_norm = F.normalize(h_v, dim=-1)
+        h_a_norm = F.normalize(h_a, dim=-1)
+
+        # Pairwise cosine similarities
+        s_lv = (h_l_norm * h_v_norm).sum(dim=-1)  # (B,)
+        s_la = (h_l_norm * h_a_norm).sum(dim=-1)
+        s_va = (h_v_norm * h_a_norm).sum(dim=-1)
+
+        # Conflict scores: d_{m,n} = 1 - s_{m,n}
+        d_lv = 1.0 - s_lv
+        d_la = 1.0 - s_la
+        d_va = 1.0 - s_va
+
+        # Overall conflict score per modality: C_m = mean of d_{m,n} for n != m
+        c_l = (d_lv + d_la) / 2.0  # (B,)
+        c_v = (d_lv + d_va) / 2.0
+        c_a = (d_la + d_va) / 2.0
+
+        # Exponential decay: ω̂_m = exp(-C_m / τ), ω_m = max(ω̂_m, ω_min)
+        w_l = torch.exp(-c_l / self.tau).clamp(min=self.omega_min)
+        w_v = torch.exp(-c_v / self.tau).clamp(min=self.omega_min)
+        w_a = torch.exp(-c_a / self.tau).clamp(min=self.omega_min)
+
+        return w_l, w_v, w_a
+
     def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
             text = self.text_model(text)
@@ -363,13 +524,59 @@ class DP(nn.Module):
         c_a = self.encoder_c(proj_x_a)
         c_list = [c_l, c_v, c_a]
 
-        recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
-        recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
-        recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
+        # --- OLD reconstruction (commented out, replaced by CRM) ---
+        # recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
+        # recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
+        # recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
+        #
+        # s_l_r = self.encoder_s_l(recon_l)
+        # s_v_r = self.encoder_s_v(recon_v)
+        # s_a_r = self.encoder_s_a(recon_a)
 
-        s_l_r = self.encoder_s_l(recon_l)
-        s_v_r = self.encoder_s_v(recon_v)
-        s_a_r = self.encoder_s_a(recon_a)
+        # ==============================================================
+        # Cross-Reconstruction Module (CRM) (Section 3.3)
+        #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
+        #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
+        # ==============================================================
+        # For target L: use shared from V and A + specific from L
+        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        x_tilde_l = self.fusion_l(
+            torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
+        ).permute(0, 2, 1)  # (B, d, T)
+
+        # For target V: use shared from L and A + specific from V
+        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v.expand_as(c_l)], dim=1))  # (B, d, T_l)
+        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        x_tilde_v = self.fusion_v(
+            torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
+        ).permute(0, 2, 1)  # (B, d, T)
+
+        # For target A: use shared from L and V + specific from A
+        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a.expand_as(c_l)], dim=1))  # (B, d, T_l)
+        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        x_tilde_a = self.fusion_a(
+            torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
+        ).permute(0, 2, 1)  # (B, d, T)
+
+        # Re-disentangle reconstructed features (Eq. 9):
+        #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
+        h_tilde_l = self.encoder_c(x_tilde_l)     # (B, d, T)
+        h_tilde_v = self.encoder_c(x_tilde_v)
+        h_tilde_a = self.encoder_c(x_tilde_a)
+
+        p_tilde_l = self.encoder_s_l(x_tilde_l)   # (B, d, T)
+        p_tilde_v = self.encoder_s_v(x_tilde_v)
+        p_tilde_a = self.encoder_s_a(x_tilde_a)
+
+        # ==============================================================
+        # Conflict-Aware Weighting (CAW) (Section 3.2) — commented out,
+        # already covered by existing uncertainty (u_shared)
+        # ==============================================================
+        # c_l_global = c_l.mean(dim=2)  # (B, d)
+        # c_v_global = c_v.mean(dim=2)
+        # c_a_global = c_a.mean(dim=2)
+        # w_l, w_v, w_a = self.compute_conflict_weights(c_l_global, c_v_global, c_a_global)
 
         # ==============================================================
         # Online Uncertainty Computation
@@ -395,6 +602,18 @@ class DP(nn.Module):
         r_shared, r_specific = self._compute_reliability(
             u_consensus, None, u_neighbor, None
         )
+
+        # ==============================================================
+        # Fine-grained Sentiment Refinement (FSR) (Section 3.4)
+        #   Using original P_m (specific) features
+        #   — commented out for now, testing CRM first
+        # ==============================================================
+        # # Convert specific features to (T, B, D) for FSR
+        # s_l_seq = s_l.permute(2, 0, 1)  # (T, B, D)
+        # s_v_seq = s_v.permute(2, 0, 1)
+        # s_a_seq = s_a.permute(2, 0, 1)
+        # s_l_prime, s_v_prime, s_a_prime = self.fsr(s_l_seq, s_v_seq, s_a_seq)
+        # # s_l_prime: (T, B, d), s_v_prime: (T, B, d), s_a_prime: (T, B, d)
 
         # ==============================================================
         # Permute to (T, B, D) for transformer layers
@@ -449,8 +668,8 @@ class DP(nn.Module):
 
         # Reliability-weighted fusion (replaces plain torch.cat)
         c_att_dict = {'l': c_l_att, 'v': c_v_att, 'a': c_a_att}
-        c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
-        # c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
+        # c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
+        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -464,10 +683,10 @@ class DP(nn.Module):
         # where b_{m←n} = CrossAttn(h_m^s, h_n^s)
         # ==============================================================
         # (V,A) --> L
-        b_l_from_a = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
-        b_l_from_v = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
-        h_l_with_as = self._calibrate_cross_attention(s_l, b_l_from_a, r_specific, 'l', 'a')
-        h_l_with_vs = self._calibrate_cross_attention(s_l, b_l_from_v, r_specific, 'l', 'v')
+        h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
+        h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
+        # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
+        # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
         h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
         h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
@@ -475,10 +694,10 @@ class DP(nn.Module):
         last_h_l = last_hs = h_ls[-1]  # Take the last output for prediction
 
         # (L,V) --> A
-        b_a_from_l = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
-        b_a_from_v = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
-        h_a_with_ls = self._calibrate_cross_attention(s_a, b_a_from_l, r_specific, 'a', 'l')
-        h_a_with_vs = self._calibrate_cross_attention(s_a, b_a_from_v, r_specific, 'a', 'v')
+        h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
+        h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
+        # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
+        # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
         h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
@@ -486,10 +705,10 @@ class DP(nn.Module):
         last_h_a = last_hs = h_as[-1]
 
         # (L,A) --> V
-        b_v_from_l = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
-        b_v_from_a = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
-        h_v_with_ls = self._calibrate_cross_attention(s_v, b_v_from_l, r_specific, 'v', 'l')
-        h_v_with_as = self._calibrate_cross_attention(s_v, b_v_from_a, r_specific, 'v', 'a')
+        h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
+        h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
+        # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
+        # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
         h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
@@ -511,6 +730,24 @@ class DP(nn.Module):
                       training=self.training))
         hs_proj_a_high += last_h_a
         logits_a_high = self.out_layer_a_high(hs_proj_a_high)
+
+        # ==============================================================
+        # Shared branch: self-attention on H̃ (re-disentangled shared features)
+        #   — commented out for now, testing CRM first
+        # ==============================================================
+        # h_tilde_l_seq = h_tilde_l.permute(2, 0, 1)  # (T, B, d)
+        # h_tilde_v_seq = h_tilde_v.permute(2, 0, 1)
+        # h_tilde_a_seq = h_tilde_a.permute(2, 0, 1)
+        # h_tilde_concat = torch.cat([h_tilde_l_seq, h_tilde_v_seq, h_tilde_a_seq], dim=2)
+        # t_h_tilde = self.trans_shared(h_tilde_concat)
+        # if type(t_h_tilde) == tuple:
+        #     t_h_tilde = t_h_tilde[0]
+        # t_h_tilde_last = t_h_tilde[-1]  # (B, 3d)
+        # hs_shared = self.proj2_shared(
+        #     F.dropout(F.relu(self.proj1_shared(t_h_tilde_last), inplace=True),
+        #               p=self.output_dropout, training=self.training))
+        # hs_shared += t_h_tilde_last
+        # logits_shared = self.out_layer_shared(hs_shared)
 
         last_h_l = torch.sigmoid(self.weight_l(last_h_l))
         last_h_v = torch.sigmoid(self.weight_v(last_h_v))
@@ -562,12 +799,23 @@ class DP(nn.Module):
             'c_l': c_l,
             'c_v': c_v, # T, B, D
             'c_a': c_a,
-            's_l_r': s_l_r,
-            's_v_r': s_v_r,
-            's_a_r': s_a_r,
-            'recon_l': recon_l,
-            'recon_v': recon_v,
-            'recon_a': recon_a,
+            # --- OLD reconstruction outputs (commented out, replaced by CRM) ---
+            # 's_l_r': s_l_r,
+            # 's_v_r': s_v_r,
+            # 's_a_r': s_a_r,
+            # 'recon_l': recon_l,
+            # 'recon_v': recon_v,
+            # 'recon_a': recon_a,
+            # --- CRM cross-reconstruction outputs ---
+            'x_tilde_l': x_tilde_l,  # (B, d, T) cross-reconstructed features
+            'x_tilde_v': x_tilde_v,
+            'x_tilde_a': x_tilde_a,
+            'h_tilde_l': h_tilde_l,  # (B, d, T) re-disentangled shared
+            'h_tilde_v': h_tilde_v,
+            'h_tilde_a': h_tilde_a,
+            'p_tilde_l': p_tilde_l,  # (B, d, T) re-disentangled specific (replaces s_l_r)
+            'p_tilde_v': p_tilde_v,
+            'p_tilde_a': p_tilde_a,
             'logits_l_hetero': logits_l_high,
             'logits_v_hetero': logits_v_high,
             'logits_a_hetero': logits_a_high,
@@ -580,6 +828,7 @@ class DP(nn.Module):
             'c_fusion': c_fusion,          # gated, (B, 3*d)
             'last_hs_proj': last_hs_proj,  # (B, combined_dim) — pre-classifier repr    
             'logits_c': logits_c,
+            # 'logits_shared': logits_shared, # shared branch prediction from CRM — commented out
             'output_logit': output,
             'h_c_l': h_c_l,         # (B, D) per-modality shared embeddings (L2-normed)
             'h_c_v': h_c_v,
