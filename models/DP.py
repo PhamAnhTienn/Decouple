@@ -123,7 +123,10 @@ class DP(nn.Module):
 
         combined_dim_low = self.d_a
         combined_dim_high = 2 * self.d_a
-        combined_dim = 2 * (self.d_l + self.d_a + self.d_v) + self.d_l * 3
+        # --- OLD: shared concat (3*D) ---
+        # combined_dim = 2 * (self.d_l + self.d_a + self.d_v) + self.d_l * 3
+        # --- NEW: shared consensus sum (D) ---
+        combined_dim = 2 * (self.d_l + self.d_a + self.d_v) + self.d_l
         output_dim = 1
 
         # 1. Temporal convolutional layers for initial feature
@@ -185,9 +188,14 @@ class DP(nn.Module):
         self.self_attentions_c_v = self.get_network(self_type='v')
         self.self_attentions_c_a = self.get_network(self_type='a')
 
-        self.proj1_c = nn.Linear(self.d_l * 3, self.d_l * 3)
-        self.proj2_c = nn.Linear(self.d_l * 3, self.d_l * 3)
-        self.out_layer_c = nn.Linear(self.d_l * 3, output_dim)
+        # --- OLD: shared concat projection (3*D) ---
+        # self.proj1_c = nn.Linear(self.d_l * 3, self.d_l * 3)
+        # self.proj2_c = nn.Linear(self.d_l * 3, self.d_l * 3)
+        # self.out_layer_c = nn.Linear(self.d_l * 3, output_dim)
+        # --- NEW: shared consensus sum projection (D) ---
+        self.proj1_c = nn.Linear(self.d_l, self.d_l)
+        self.proj2_c = nn.Linear(self.d_l, self.d_l)
+        self.out_layer_c = nn.Linear(self.d_l, output_dim)
 
         # 4.2 Crossmodal Attentions
         self.trans_l_with_a = self.get_network(self_type='la')
@@ -236,7 +244,10 @@ class DP(nn.Module):
         self.weight_l = nn.Linear(2 * self.d_l, 2 * self.d_l)
         self.weight_v = nn.Linear(2 * self.d_v, 2 * self.d_v)
         self.weight_a = nn.Linear(2 * self.d_a, 2 * self.d_a)
-        self.weight_c = nn.Linear(3 * self.d_l, 3 * self.d_l)
+        # --- OLD: shared concat weight (3*D) ---
+        # self.weight_c = nn.Linear(3 * self.d_l, 3 * self.d_l)
+        # --- NEW: shared consensus sum weight (D) ---
+        self.weight_c = nn.Linear(self.d_l, self.d_l)
         # final project
         self.proj1 = nn.Linear(combined_dim, combined_dim)
         self.proj2 = nn.Linear(combined_dim, combined_dim)
@@ -394,65 +405,205 @@ class DP(nn.Module):
             r_specific[m] = r_s.detach()     # stop-gradient
         return r_shared, r_specific
 
-    def _reliability_weighted_shared_fusion(self, c_att_dict, r_shared):
+    # def _reliability_weighted_shared_fusion(self, c_att_dict, r_shared):
+    #     """
+    #     Uncertainty-aware shared fusion (closed-form weighted average).
+    #
+    #     Formula:
+    #         h̄^c = Σ_m [ r_m^c / (Σ_n r_n^c) * h_m^{c,att} ]
+    #
+    #     For backbone compatibility the output is a concat of per-modality
+    #     reliability-scaled features: each modality is multiplied by its
+    #     normalized weight w_m = r_m^c / Σ_n r_n^c, then concatenated to
+    #     keep the (B, 3*D) shape expected by the downstream projection layer.
+    #
+    #     Args:
+    #         c_att_dict: dict m → (B, D) — self-attention shared output
+    #         r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
+    #     Returns:
+    #         c_fusion: (B, 3*D) — reliability-scaled concat
+    #     """
+    #     modalities = list(c_att_dict.keys())
+    #
+    #     # Normalized reliability weights w_m = r_m / Σ_n r_n
+    #     r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
+    #     r_sum = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)         # (B, 1)
+    #     w = r_stack / r_sum                                               # (B, |M|)
+    #     # w is already detached because r_shared is stop-gradient
+    #
+    #     reweighted = []
+    #     for i, m in enumerate(modalities):
+    #         wi = w[:, i].unsqueeze(1)            # (B, 1)
+    #         reweighted.append(wi * c_att_dict[m])  # (B, D)
+    #
+    #     return torch.cat(reweighted, dim=1)  # (B, 3*D)
+
+    # def _calibrate_cross_attention(self, h_m, h_cross, r_specific, m_query, m_kv):
+    #     """
+    #     Reliability-aware complementary exchange for specific representations.
+    #
+    #     Closed-form solution of:
+    #         tilde_h_{m←n} = argmin_x [ r_m ||x - h_m||^2 + r_n ||x - b_{m←n}||^2 ]
+    #
+    #     which gives:
+    #         tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
+    #
+    #     A reliable sender (high r_n) exerts stronger influence; a reliable
+    #     receiver (high r_m) is less affected by potentially noisy messages.
+    #
+    #     Args:
+    #         h_m:         (T, B, D) — receiver's own specific representation
+    #         h_cross:     (T, B, D) — cross-attention message b_{m←n}
+    #         r_specific:  dict m → (B,) — specific reliability (stop-grad)
+    #         m_query:     str — receiver modality key (m)
+    #         m_kv:        str — sender modality key (n)
+    #     Returns:
+    #         h_calibrated: (T, B, D)
+    #     """
+    #     r_m = r_specific[m_query].unsqueeze(0).unsqueeze(2)  # (1, B, 1)
+    #     r_n = r_specific[m_kv].unsqueeze(0).unsqueeze(2)     # (1, B, 1)
+    #     denom = (r_m + r_n).clamp(min=1e-8)
+    #     return (r_m * h_m + r_n * h_cross) / denom
+
+    # ==================================================================
+    # Reliability-Aware Information Flow (Section 3.X)
+    # ==================================================================
+
+    def _reliability_gated_consensus(self, c_att_dict, r_shared):
         """
-        Uncertainty-aware shared fusion (closed-form weighted average).
+        Reliability-gated consensus for shared representations.
 
-        Formula:
-            h̄^c = Σ_m [ r_m^c / (Σ_n r_n^c) * h_m^{c,att} ]
+        Joint reliability gate:
+            γ^{c,i} = 1 - Π_{m ∈ M} (1 - r_m^{c,i})
 
-        For backbone compatibility the output is a concat of per-modality
-        reliability-scaled features: each modality is multiplied by its
-        normalized weight w_m = r_m^c / Σ_n r_n^c, then concatenated to
-        keep the (B, 3*D) shape expected by the downstream projection layer.
+        Consensus representation (closed-form):
+            h̄^{c,i} = γ^{c,i} * Σ_m [ r_m^{c,i} / Σ_n r_n^{c,i} ] * h_m^{c,i}
+
+        When all modalities have low reliability, γ suppresses the overall
+        shared message instead of allowing normalization to restore magnitude.
+
+        For backbone compatibility the output keeps (B, 3*D) shape: each
+        modality slot receives γ * w_m * h_m^c so that the downstream
+        projection layer remains compatible.
 
         Args:
             c_att_dict: dict m → (B, D) — self-attention shared output
             r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
         Returns:
-            c_fusion: (B, 3*D) — reliability-scaled concat
+            c_fusion: (B, 3*D) — reliability-gated concat
         """
         modalities = list(c_att_dict.keys())
+        M = len(modalities)  # number of modalities (3)
 
-        # Normalized reliability weights w_m = r_m / Σ_n r_n
+        # Joint reliability gate: γ^c = 1 - Π_m (1 - r_m^c)
+        gamma_c = torch.ones_like(r_shared[modalities[0]])  # (B,)
+        for m in modalities:
+            gamma_c = gamma_c * (1.0 - r_shared[m])         # accumulate product
+        gamma_c = 1.0 - gamma_c                             # (B,)
+
+        # Total shared reliability: R^c = Σ_m r_m^c
         r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
-        r_sum = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)         # (B, 1)
-        w = r_stack / r_sum                                               # (B, |M|)
-        # w is already detached because r_shared is stop-gradient
+        R_c = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)           # (B, 1)
 
+        gamma_c_expand = gamma_c.unsqueeze(1)  # (B, 1)
+
+        # ĥ_m = M * γ^c * (r_m^c / R^c) * h_m^{c,att}
+        # When r_l=r_v=r_a=1: γ=1, M*(1/3)=1 → recovers original concat
         reweighted = []
         for i, m in enumerate(modalities):
-            wi = w[:, i].unsqueeze(1)            # (B, 1)
-            reweighted.append(wi * c_att_dict[m])  # (B, D)
+            r_m = r_stack[:, i].unsqueeze(1)                  # (B, 1)
+            scale = M * gamma_c_expand * r_m / R_c            # (B, 1)
+            reweighted.append(scale * c_att_dict[m])          # (B, D)
 
         return torch.cat(reweighted, dim=1)  # (B, 3*D)
 
-    def _calibrate_cross_attention(self, h_m, h_cross, r_specific, m_query, m_kv):
+    def _reliability_gated_consensus_sum(self, c_att_dict, r_shared):
         """
-        Reliability-aware complementary exchange for specific representations.
+        Reliability-gated consensus for shared representations (SUM version).
 
         Closed-form solution of:
-            tilde_h_{m←n} = argmin_x [ r_m ||x - h_m||^2 + r_n ||x - b_{m←n}||^2 ]
-
+            h̄^{c,i} = argmin_z [ γ^{c,i} Σ_m w_m ||z - h_m||^2 + (1-γ^{c,i}) ||z||^2 ]
         which gives:
-            tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
+            h̄^{c,i} = γ^{c,i} Σ_m (r_m^{c,i} / R^{c,i}) h_m^{c,i}
 
-        A reliable sender (high r_n) exerts stronger influence; a reliable
-        receiver (high r_m) is less affected by potentially noisy messages.
+        where:
+            γ^{c,i} = 1 - Π_m (1 - r_m^{c,i})      (joint reliability gate)
+            R^{c,i} = Σ_m r_m^{c,i}                   (total shared reliability)
+
+        Output is a single (B, D) vector (weighted average, NOT concat).
+
+        Args:
+            c_att_dict: dict m → (B, D) — self-attention shared output
+            r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
+        Returns:
+            c_fusion: (B, D) — reliability-gated consensus representation
+        """
+        modalities = list(c_att_dict.keys())
+
+        # Joint reliability gate: γ^c = 1 - Π_m (1 - r_m^c)
+        gamma_c = torch.ones_like(r_shared[modalities[0]])  # (B,)
+        for m in modalities:
+            gamma_c = gamma_c * (1.0 - r_shared[m])         # accumulate product
+        gamma_c = 1.0 - gamma_c                             # (B,)
+
+        # Total shared reliability: R^c = Σ_m r_m^c
+        r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
+        R_c = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)           # (B, 1)
+
+        gamma_c_expand = gamma_c.unsqueeze(1)  # (B, 1)
+
+        # h̄ = γ^c * Σ_m (r_m / R^c) * h_m
+        h_bar = torch.zeros_like(c_att_dict[modalities[0]])  # (B, D)
+        for i, m in enumerate(modalities):
+            r_m = r_stack[:, i].unsqueeze(1)           # (B, 1)
+            w_m = r_m / R_c                             # (B, 1)
+            h_bar = h_bar + w_m * c_att_dict[m]         # (B, D)
+
+        h_bar = gamma_c_expand * h_bar                  # (B, D)
+
+        return h_bar  # (B, D)
+
+    def _reliability_gated_complementary_exchange(self, h_m, b_cross, r_specific, m_recv, m_send):
+        """
+        Reliability-gated complementary exchange for specific representations.
+
+        Pairwise joint reliability gate:
+            γ_{m,n}^{s,i} = 1 - (1 - r_m^{s,i})(1 - r_n^{s,i})
+
+        Mixing coefficient:
+            β_{m←n}^i = γ_{m,n}^{s,i} * r_n^{s,i} / (r_m^{s,i} + r_n^{s,i})
+
+        Update rule:
+            h̃_{m←n}^{s,i} = h_m^{s,i} + β_{m←n}^i * (b_{m←n}^i - h_m^{s,i})
+
+        A reliable sender exerts stronger influence on the receiver, whereas a
+        reliable receiver is less affected by potentially unreliable incoming
+        information. When both are unreliable, γ suppresses the update.
 
         Args:
             h_m:         (T, B, D) — receiver's own specific representation
-            h_cross:     (T, B, D) — cross-attention message b_{m←n}
+            b_cross:     (T, B, D) — cross-attention message b_{m←n}
             r_specific:  dict m → (B,) — specific reliability (stop-grad)
-            m_query:     str — receiver modality key (m)
-            m_kv:        str — sender modality key (n)
+            m_recv:      str — receiver modality key (m)
+            m_send:      str — sender modality key (n)
         Returns:
-            h_calibrated: (T, B, D)
+            h_updated:   (T, B, D)
         """
-        r_m = r_specific[m_query].unsqueeze(0).unsqueeze(2)  # (1, B, 1)
-        r_n = r_specific[m_kv].unsqueeze(0).unsqueeze(2)     # (1, B, 1)
+        r_m = r_specific[m_recv]  # (B,)
+        r_n = r_specific[m_send]  # (B,)
+
+        # γ_{m,n} = 1 - (1 - r_m)(1 - r_n)
+        gamma_mn = 1.0 - (1.0 - r_m) * (1.0 - r_n)          # (B,)
+
+        # β_{m←n} = γ_{m,n} * r_n / (r_m + r_n)
         denom = (r_m + r_n).clamp(min=1e-8)
-        return (r_m * h_m + r_n * h_cross) / denom
+        beta = gamma_mn * r_n / denom                         # (B,)
+
+        # Reshape for broadcasting: (1, B, 1)
+        beta = beta.unsqueeze(0).unsqueeze(2)
+
+        # h̃ = h_m + β * (b_{m←n} - h_m)
+        return h_m + beta * (b_cross - h_m)
 
     def compute_conflict_weights(self, h_l, h_v, h_a):
         """
@@ -524,11 +675,11 @@ class DP(nn.Module):
         c_a = self.encoder_c(proj_x_a)
         c_list = [c_l, c_v, c_a]
 
-        # --- OLD reconstruction (commented out, replaced by CRM) ---
+        # # --- OLD reconstruction (commented out, replaced by CRM) ---
         # recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
         # recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
         # recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
-        #
+        
         # s_l_r = self.encoder_s_l(recon_l)
         # s_v_r = self.encoder_s_v(recon_v)
         # s_a_r = self.encoder_s_a(recon_a)
@@ -648,7 +799,9 @@ class DP(nn.Module):
         logits_a_low = self.out_layer_a_low(hs_proj_a_low)
 
         # ==============================================================
-        # Uncertainty-aware Shared Fusion
+        # Reliability-Gated Consensus (Shared Fusion)
+        # γ^{c,i} = 1 - Π_m (1 - r_m^{c,i})
+        # h̄^{c,i} = γ^{c,i} Σ_m w_m h_m^{c,i}
         # ==============================================================
         # self-attention for shared feature
         c_l_att = self.self_attentions_c_l(c_l)
@@ -666,10 +819,15 @@ class DP(nn.Module):
             c_a_att = c_a_att[0]
         c_a_att = c_a_att[-1]
 
-        # Reliability-weighted fusion (replaces plain torch.cat)
         c_att_dict = {'l': c_l_att, 'v': c_v_att, 'a': c_a_att}
+        # --- OLD: plain concat (no reliability gating) ---
+        # c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)  # (B, 3*D)
+        # --- OLD: simple reliability-weighted fusion ---
         # c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
-        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
+        # --- OLD: reliability-gated consensus (concat version, scale per slot) ---
+        # c_fusion = self._reliability_gated_consensus(c_att_dict, r_shared)  # (B, 3*D)
+        # --- NEW: reliability-gated consensus (sum version, single vector) ---
+        c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -678,15 +836,20 @@ class DP(nn.Module):
         logits_c = self.out_layer_c(c_proj)
 
         # ==============================================================
-        # Reliability-Aware Specific Cross-attention
-        # tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
-        # where b_{m←n} = CrossAttn(h_m^s, h_n^s)
+        # Reliability-Gated Complementary Exchange (Specific Cross-attention)
+        # γ_{m,n}^s = 1 - (1 - r_m^s)(1 - r_n^s)
+        # β_{m←n} = γ_{m,n}^s * r_n^s / (r_m^s + r_n^s)
+        # h̃_{m←n} = h_m + β * (b_{m←n} - h_m)
         # ==============================================================
         # (V,A) --> L
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
+        # # --- OLD: simple weighted average calibration ---
         # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
         # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
+        # # --- NEW: reliability-gated complementary exchange ---
+        h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
+        h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
         h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
         h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
@@ -696,8 +859,12 @@ class DP(nn.Module):
         # (L,V) --> A
         h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
         h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
+        # # --- OLD: simple weighted average calibration ---
         # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
         # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
+        # # --- NEW: reliability-gated complementary exchange ---
+        h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
+        h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
         h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
@@ -707,8 +874,12 @@ class DP(nn.Module):
         # (L,A) --> V
         h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
         h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
+        # # --- OLD: simple weighted average calibration ---
         # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
         # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
+        # --- NEW: reliability-gated complementary exchange ---
+        h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
+        h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
         h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
@@ -799,7 +970,7 @@ class DP(nn.Module):
             'c_l': c_l,
             'c_v': c_v, # T, B, D
             'c_a': c_a,
-            # --- OLD reconstruction outputs (commented out, replaced by CRM) ---
+            # # --- OLD reconstruction outputs (commented out, replaced by CRM) ---
             # 's_l_r': s_l_r,
             # 's_v_r': s_v_r,
             # 's_a_r': s_a_r,

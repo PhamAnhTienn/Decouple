@@ -183,7 +183,7 @@ class DP():
                     loss_recon_a = self.MSE(output['x_tilde_a'], output['origin_a'])
                     loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
-                    # cycle consistency loss (OLD — commented out, replaced by L_p)
+                    # # cycle consistency loss (OLD — commented out, replaced by L_p)
                     # loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0).detach(), output['s_l_r'])
                     # loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0).detach(), output['s_v_r'])
                     # loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0).detach(), output['s_a_r'])
@@ -225,6 +225,11 @@ class DP():
                     combined_loss = loss_task + \
                                         (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
                                         + loss_cluster * LAMBDA_CLUSTER
+                    
+                    # combined_loss = loss_task + \
+                    #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
+                    #                     + loss_cluster * LAMBDA_CLUSTER
+                    
                     combined_loss.backward()
 
                     # Freeze prototypes during warmup iterations
