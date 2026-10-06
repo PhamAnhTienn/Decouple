@@ -15,7 +15,6 @@ logger = logging.getLogger('DecAlign')
 LAMBDA_RECON_GROUP = 0.1
 LAMBDA_ORT_INNER   = 0.1
 LAMBDA_CLUSTER     = 0.1
-LAMBDA_PUSH        = 0.1
 LAMBDA_PRESERVE    = 0.1   # weight for specific preservation loss L_p
 
 
@@ -55,7 +54,6 @@ class DP():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.weighted_MSE = WeightedMSE()
 
     def _weighted_recon_loss(self, x_tilde, x_orig, w):
         """
@@ -159,12 +157,6 @@ class DP():
                     loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
 
                     # reconstruction loss (OLD uncertainty-reweighted — commented out)
-                    # w_m^i = r_m^{c,i} * r_m^{s,i} — suppresses recon under uncertainty
-                    # L_m = Σ_i w_m^i ℓ_m^i / Σ_i w_m^i,  L_recon = Σ_m L_m
-                    # recon_w = output['recon_weights']  # dict m → (B,)
-                    # loss_recon_l = self.weighted_MSE(output['recon_l'], output['origin_l'], recon_w['l'])
-                    # loss_recon_v = self.weighted_MSE(output['recon_v'], output['origin_v'], recon_w['v'])
-                    # loss_recon_a = self.weighted_MSE(output['recon_a'], output['origin_a'], recon_w['a'])
                     # loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
                     # loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
                     # loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
@@ -173,11 +165,11 @@ class DP():
                     # --- L_recon: cross-reconstruction loss (using CRM x_tilde features) ---
                     # # CAW-weighted version (commented out, CAW disabled):
                     # loss_recon_l = self._weighted_recon_loss(
-                    #     output['x_tilde_l'], output['origin_l'], output['w_l'])
+                    #     output['x_tilde_l'], output['origin_l'], recon_w['l'])
                     # loss_recon_v = self._weighted_recon_loss(
-                    #     output['x_tilde_v'], output['origin_v'], output['w_v'])
+                    #     output['x_tilde_v'], output['origin_v'], recon_w['v'])
                     # loss_recon_a = self._weighted_recon_loss(
-                    #     output['x_tilde_a'], output['origin_a'], output['w_a'])
+                    #     output['x_tilde_a'], output['origin_a'], recon_w['a'])
                     loss_recon_l = self.MSE(output['x_tilde_l'], output['origin_l'])
                     loss_recon_v = self.MSE(output['x_tilde_v'], output['origin_v'])
                     loss_recon_a = self.MSE(output['x_tilde_a'], output['origin_a'])
@@ -218,9 +210,6 @@ class DP():
                     loss_cluster = model.compute_cpa_loss(
                         output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
                     )
-
-                    # # prototype separation loss
-                    # loss_push = model.compute_push_loss(margin=2.0)
 
                     combined_loss = loss_task + \
                                         (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \

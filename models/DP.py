@@ -1084,25 +1084,25 @@ class DP(nn.Module):
         loss_cpa /= 6.0  # average over 6 cross-modal pairs
         return loss_cpa
 
-    def compute_push_loss(self, margin=2.0):
-        """
-        Compute L_push: margin-based prototype separation loss.
-        L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
-        """
-        C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-        K = C.shape[0]
+    # def compute_push_loss(self, margin=2.0):
+    #     """
+    #     Compute L_push: margin-based prototype separation loss.
+    #     L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+    #     Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
+    #     """
+    #     C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
+    #     K = C.shape[0]
 
-        # Pairwise squared L2 distances
-        # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-        # Since C is L2-normalized: ||c_i||^2 = 1
-        dots = C @ C.t()  # (K, K)
-        sq_dists = 2.0 - 2.0 * dots  # (K, K)
+    #     # Pairwise squared L2 distances
+    #     # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
+    #     # Since C is L2-normalized: ||c_i||^2 = 1
+    #     dots = C @ C.t()  # (K, K)
+    #     sq_dists = 2.0 - 2.0 * dots  # (K, K)
 
-        # Mask out diagonal
-        mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-        sq_dists_off = sq_dists[mask]  # K*(K-1)
+    #     # Mask out diagonal
+    #     mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
+    #     sq_dists_off = sq_dists[mask]  # K*(K-1)
 
-        # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-        loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-        return loss_push
+    #     # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
+    #     loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
+    #     return loss_push
