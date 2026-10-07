@@ -1,5 +1,5 @@
 #!/bin/bash
-for seed in 1111 1112 1113 1114 1115; do
+for seed in 1119; do
     python main-dmd.py \
         --data_missing \
         --config_file "/home/tien/NCKH/DecAlign/config/dmd_mosi_config.json" \
