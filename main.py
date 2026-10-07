@@ -153,14 +153,14 @@ def DMD_run(
     if csv_file.is_file():
         df = pd.read_csv(csv_file)
     else:
-        columns=["Model","Missing Rate"]
+        columns=["Model", "Missing Rate", "Seeds"]
         for c in criterions:
             columns.append(f"{c} Mean")
             columns.append(f"{c} Std")
             
         df = pd.DataFrame(columns=columns)
         
-    expected_columns = ["Model", "Missing Rate"]
+    expected_columns = ["Model", "Missing Rate", "Seeds"]
 
     for c in criterions:
         expected_columns.extend([
@@ -174,7 +174,8 @@ def DMD_run(
             
     res = {
         "Model": model_name,
-        "Missing Rate": args.missing_rate_eval_test
+        "Missing Rate": args.missing_rate_eval_test,
+        "Seeds": str(seeds)
     }
     
     for c in criterions:
