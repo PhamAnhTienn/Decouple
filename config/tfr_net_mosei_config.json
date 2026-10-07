@@ -9,7 +9,7 @@
   "fusionModule": "c_gate",
   "recloss_type": "combine",
   "without_generator": false,
-  "early_stop": 6,
+  "early_stop": 3,
   "use_bert": true,
   "use_bert_finetune": true,
   "use_finetune": true,
