@@ -90,17 +90,25 @@ def DMD_run(
     if config_file != "":
         config_file = Path(config_file)
     else:  # use default config file
-        if dataset_name == "mosi":
+        candidate_config = Path(__file__).parent / "config" / f"{model_name}_{dataset_name}_config.json"
+        if candidate_config.is_file():
+            config_file = candidate_config
+        elif dataset_name == "mosi":
             config_name = "dp_mosi_config.json"
+            config_file = Path(__file__).parent / "config" / config_name
         elif dataset_name == "mosei":
             config_name = "dec_mosei_config.json"
+            config_file = Path(__file__).parent / "config" / config_name
         elif dataset_name == "iemocap":
             config_name = "iemocap_decalign_config.json"
+            config_file = Path(__file__).parent / "config" / config_name
         elif dataset_name == "sims":
             config_name = "dec_sims_config.json"
+            config_file = Path(__file__).parent / "config" / config_name
         else:
             config_name = "dec_config.json"
-        config_file = Path(__file__).parent / "config" / config_name
+            config_file = Path(__file__).parent / "config" / config_name
+
     if not config_file.is_file():
         raise ValueError(f"Config file {str(config_file)} not found.")
 

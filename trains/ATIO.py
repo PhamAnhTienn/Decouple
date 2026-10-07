@@ -6,6 +6,7 @@ from .DAR import DAR
 from .DP import DP
 from .TFR_NET import TFR_NET
 from .MULT import MULT as MULTTrainer
+from .LMF import LMF as LMFTrainer
 
 __all__ = ["ATIO"]
 
@@ -22,6 +23,7 @@ class ATIO():
             'mult': MULTTrainer,
             'tfr_net': TFR_NET,
             'tfrnet': TFR_NET,
+            'lmf': LMFTrainer,
         }
 
     def getTrain(self, args):
@@ -29,3 +31,4 @@ class ATIO():
         if model_name not in self.TRAIN_MAP:
             raise ValueError(f"Unsupported model name: {args.model_name}")
         return self.TRAIN_MAP[model_name](args)
+

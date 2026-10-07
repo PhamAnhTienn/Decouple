@@ -11,6 +11,7 @@ param(
     [string]$DataDir = "./data",
     [string]$ConfigFile = "",
     [int]$BatchSize = 0,
+    [switch]$NoResume,
     [switch]$DryRun
 )
 
@@ -55,7 +56,7 @@ foreach ($seed in $Seeds) {
 
         Write-Host "`n>>> [$CurrentRun/$TotalRuns] Seed: $seed | Missing Rate: $RateStr" -ForegroundColor Yellow
 
-        if (Test-Path $CkptPath) {
+        if (-not $NoResume -and (Test-Path $CkptPath)) {
             Write-Host "[Skip] Checkpoint exists: $CkptPath" -ForegroundColor Green
             continue
         }
