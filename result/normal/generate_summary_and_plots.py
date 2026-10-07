@@ -14,7 +14,7 @@ metrics = ['Acc_2', 'F1_score', 'MAE', 'Corr', 'Acc_7', 'Loss']
 # 2. Aggregation Logic
 # ---------------------------------------------------------------------------
 # Models in logical order (Proposed method DecAlign first, then baselines)
-desired_model_order = ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar']
+desired_model_order = ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']
 # Ensure all models present in df are included
 all_models = [m for m in desired_model_order if m in df['Model'].unique()]
 for m in df['Model'].unique():
@@ -84,89 +84,94 @@ plt.rcParams['ytick.major.width'] = 1.0
 # - DMD: Bluish Green (#009E73) - Matches green in reference image
 # - MISA: Reddish Purple / Orchid (#CC79A7)
 # - DAR: Amber / Gold (#E69F00)
+# Color palette — all use circle marker 'o'
 style_map = {
-    'decalign': {'label': 'DecAlign', 'color': '#0072B2', 'marker': 'o', 'zorder': 10},
-    'lnln':     {'label': 'LNLN',     'color': '#D55E00', 'marker': '^', 'zorder': 9},
-    'tfr-net':  {'label': 'TFR-Net',  'color': '#4D4D4D', 'marker': 'D', 'zorder': 8},
-    'dmd':      {'label': 'DMD',      'color': '#009E73', 'marker': 's', 'zorder': 7},
-    'misa':     {'label': 'MISA',     'color': '#CC79A7', 'marker': 'v', 'zorder': 6},
-    'dar':      {'label': 'DAR',      'color': '#E69F00', 'marker': 'p', 'zorder': 5},
+    'decalign': {'label': 'DecAlign', 'color': '#0072B2', 'zorder': 10},
+    'lnln':     {'label': 'LNLN',     'color': '#D55E00', 'zorder': 9},
+    'tfr-net':  {'label': 'TFR-Net',  'color': '#4D4D4D', 'zorder': 8},
+    'dmd':      {'label': 'DMD',      'color': '#009E73', 'zorder': 7},
+    'misa':     {'label': 'MISA',     'color': '#CC79A7', 'zorder': 6},
+    'dar':      {'label': 'DAR',      'color': '#E69F00', 'zorder': 5},
+    'dp':       {'label': 'DP',       'color': '#56B4E9', 'zorder': 4},
 }
 
-def create_plot(use_distinct_markers=True, filename_suffix=''):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.6), dpi=300)
+def create_plot():
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), dpi=300)
 
     for m in all_models:
         sub = res_df[res_df['Model'] == m].sort_values('Missing Rate')
         style = style_map[m]
-        marker_shape = style['marker'] if use_distinct_markers else 'o'
-        
+
         # Subplot 1: F1 Score
         ax1.plot(
             sub['Missing Rate'], sub['F1_score Mean'],
             label=style['label'],
             color=style['color'],
-            marker=marker_shape,
+            marker='o',
             linestyle='-',
-            linewidth=2.2,
-            markersize=6.8,
+            linewidth=2.5,
+            markersize=8,
             markeredgecolor=style['color'],
-            markeredgewidth=1.0,
+            markeredgewidth=1.2,
             zorder=style['zorder']
         )
-        
-        # Subplot 2: MAE (standard sentiment scale 0-2, divided by 100)
+
+        # Subplot 2: MAE (divided by 100 to get standard scale)
         ax2.plot(
             sub['Missing Rate'], sub['MAE Mean'] / 100.0,
             label=style['label'],
             color=style['color'],
-            marker=marker_shape,
+            marker='o',
             linestyle='-',
-            linewidth=2.2,
-            markersize=6.8,
+            linewidth=2.5,
+            markersize=8,
             markeredgecolor=style['color'],
-            markeredgewidth=1.0,
+            markeredgewidth=1.2,
             zorder=style['zorder']
         )
 
-    # Format Subplot 1 (a) - F1 Score
-    ax1.set_xlabel('Missing Rate', fontsize=13, labelpad=6)
-    ax1.set_ylabel('F1 Score', fontsize=13, labelpad=6)
-    ax1.set_xlim(-0.03, 0.93)
+    # --- Subplot 1 (a) — F1 Score ---
+    ax1.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
+    ax1.set_ylabel('F1', fontsize=14, labelpad=8, fontweight='bold')
+    ax1.set_xlim(-0.03, 0.95)
     ax1.set_ylim(32, 88)
     ax1.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
     ax1.set_yticks([40, 50, 60, 70, 80])
-    ax1.tick_params(labelsize=11.5)
-    ax1.grid(True, linestyle='--', color='#DCDCDC', alpha=0.9, linewidth=0.8)
-    ax1.set_axisbelow(True)
-    ax1.legend(loc='lower left', frameon=True, fontsize=9.2, framealpha=0.93, edgecolor='#CCCCCC', borderpad=0.35, labelspacing=0.25)
-    ax1.text(0.5, -0.25, '(a)', transform=ax1.transAxes, ha='center', va='top', fontsize=14)
+    ax1.tick_params(labelsize=12)
+    ax1.grid(False)
+    ax1.legend(
+        loc='upper right', frameon=True, fontsize=9.5,
+        framealpha=0.95, edgecolor='#CCCCCC',
+        borderpad=0.5, labelspacing=0.35, handlelength=1.8
+    )
+    ax1.text(0.5, -0.22, '(a)', transform=ax1.transAxes, ha='center', va='top', fontsize=14, fontweight='bold')
 
-    # Format Subplot 2 (b) - MAE
-    ax2.set_xlabel('Missing Rate', fontsize=13, labelpad=6)
-    ax2.set_ylabel('MAE', fontsize=13, labelpad=6)
-    ax2.set_xlim(-0.03, 0.93)
+    # --- Subplot 2 (b) — MAE ---
+    ax2.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
+    ax2.set_ylabel('MAE', fontsize=14, labelpad=8, fontweight='bold')
+    ax2.set_xlim(-0.03, 0.95)
     ax2.set_ylim(0.70, 1.55)
     ax2.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
     ax2.set_yticks([0.8, 1.0, 1.2, 1.4])
-    ax2.tick_params(labelsize=11.5)
-    ax2.grid(True, linestyle='--', color='#DCDCDC', alpha=0.9, linewidth=0.8)
-    ax2.set_axisbelow(True)
-    ax2.legend(loc='upper left', frameon=True, fontsize=9.2, framealpha=0.93, edgecolor='#CCCCCC', borderpad=0.35, labelspacing=0.25)
-    ax2.text(0.5, -0.25, '(b)', transform=ax2.transAxes, ha='center', va='top', fontsize=14)
+    ax2.tick_params(labelsize=12)
+    ax2.grid(False)
+    ax2.legend(
+        loc='upper left', frameon=True, fontsize=9.5,
+        framealpha=0.95, edgecolor='#CCCCCC',
+        borderpad=0.5, labelspacing=0.35, handlelength=1.8
+    )
+    ax2.text(0.5, -0.22, '(b)', transform=ax2.transAxes, ha='center', va='top', fontsize=14, fontweight='bold')
 
-    plt.tight_layout()
-    fig.subplots_adjust(bottom=0.20)
+    plt.tight_layout(w_pad=3.0)
+    fig.subplots_adjust(bottom=0.18)
 
-    png_path = f'result/normal/missing_rate_performance{filename_suffix}.png'
-    pdf_path = f'result/normal/missing_rate_performance{filename_suffix}.pdf'
+    png_path = 'result/normal/missing_rate_performance.png'
+    pdf_path = 'result/normal/missing_rate_performance.pdf'
     plt.savefig(png_path, dpi=300, bbox_inches='tight')
     plt.savefig(pdf_path, bbox_inches='tight')
     plt.close()
     print(f'Saved: {png_path} and {pdf_path}')
 
-# Generate both versions:
-# 1. Primary: Distinct markers (Redundant coding: Best for colorblind + B&W print)
-create_plot(use_distinct_markers=True, filename_suffix='')
-# 2. Circular markers: Matches user image 100%
-create_plot(use_distinct_markers=False, filename_suffix='_circle')
+create_plot()
+
+# python result/normal/generate_summary_and_plots.py
