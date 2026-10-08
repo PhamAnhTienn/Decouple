@@ -1,0 +1,48 @@
+{
+    "model_name": "dp",
+    "need_data_aligned": false,
+    "need_feature_standardized": true,
+    "feature_standardize_modalities": [
+        "audio",
+        "vision"
+    ],
+    "feature_clip_percentiles": [
+        0.1,
+        99.9
+    ],
+    "need_model_aligned": false,
+    "use_finetune": true,
+    "use_bert": true,
+    "early_stop": 7,
+    "update_epochs": 10,
+    "attn_mask": true,
+    "attn_dropout_a": 0.2,
+    "attn_dropout_v": 0.0,
+    "relu_dropout": 0.0,
+    "embed_dropout": 0.2,
+    "res_dropout": 0.0,
+    "dst_feature_dim_nheads": [
+        50,
+        10
+    ],
+    "nmb_prototypes": 5,
+    "freeze_prototypes_niters": 10000,
+    "batch_size": 16,
+    "learning_rate": 0.00005,
+    "nlevels": 4,
+    "conv1d_kernel_size_l": 5,
+    "conv1d_kernel_size_a": 5,
+    "conv1d_kernel_size_v": 5,
+    "text_dropout": 0.5,
+    "attn_dropout": 0.3,
+    "output_dropout": 0.5,
+    "grad_clip": 0.6,
+    "patience": 5,
+    "weight_decay": 0.005,
+    "is_distill": true,
+    "transformers": "bert",
+    "pretrained": "bert-base-chinese",
+    "KeyEval": "F1_score",
+    "selection_metric": "F1_score",
+    "scheduler_metric": "F1_score"
+}

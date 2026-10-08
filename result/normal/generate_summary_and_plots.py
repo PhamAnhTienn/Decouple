@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 input_path = 'result/normal/report.csv'
 df = pd.read_csv(input_path)
-df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
+df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net', 'dp': 'sarm'})
 
 metrics = ['Acc_2', 'F1_score', 'MAE', 'Corr', 'Acc_7', 'Loss']
 
@@ -15,7 +15,7 @@ metrics = ['Acc_2', 'F1_score', 'MAE', 'Corr', 'Acc_7', 'Loss']
 # 2. Aggregation Logic
 # ---------------------------------------------------------------------------
 # Models in logical order (Proposed method DecAlign first, then baselines)
-desired_model_order = ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']
+desired_model_order = ['sarm', 'decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar']
 # Ensure all models present in df are included
 all_models = [m for m in desired_model_order if m in df['Model'].unique()]
 for m in df['Model'].unique():
@@ -79,29 +79,27 @@ plt.rcParams['xtick.major.width'] = 1.0
 plt.rcParams['ytick.major.width'] = 1.0
 
 # ---------------------------------------------------------------------------
-# Color Palette: Full Okabe-Ito (Color Universal Design)
-# 7 maximally distinct hues — safe for all types of color-blindness.
-# Ordered by perceptual salience (high → low) so the proposed method
-# stands out clearly against baselines.
+# Color Palette: Tableau 10
+# SARM uses the first Tableau blue; baselines use the remaining hues.
 #
-#  Index │ Model     │ Hex       │ Character
-#  ──────┼───────────┼───────────┼──────────────────────────────────────
-#    1   │ DecAlign  │ #0072B2   │ Strong blue  — highest salience (proposed)
-#    2   │ LNLN      │ #D55E00   │ Vermilion    — warm, clearly distinct from blue
-#    3   │ DMD       │ #009E73   │ Bluish-green — cool, far from red & blue in hue
-#    4   │ DAR       │ #E69F00   │ Amber/gold   — warm-yellow, distinct from all above
-#    5   │ MISA      │ #CC79A7   │ Rose-purple  — unique pink hue
-#    6   │ TFR-Net   │ #56B4E9   │ Sky-blue     — lighter, separated from dark blue
-#    7   │ DP        │ #F0E442   │ Yellow       — brightest, stands out on white bg
+#  Index │ Model     │ Hex       │ Hue
+#  ──────┼───────────┼───────────┼────────────────
+#    1   │ SARM      │ #4E79A7   │ Steel-blue
+#    2   │ DecAlign  │ #F28E2B   │ Orange
+#    3   │ DMD       │ #59A14F   │ Green
+#    4   │ LNLN      │ #E15759   │ Red
+#    5   │ DAR       │ #B07AA1   │ Purple
+#    6   │ MISA      │ #76B7B2   │ Teal
+#    7   │ TFR-Net   │ #EDC948   │ Yellow
 # ---------------------------------------------------------------------------
 style_map = {
-    'decalign': {'label': 'DecAlign', 'color': '#0072B2', 'zorder': 10},
-    'lnln':     {'label': 'LNLN',     'color': '#D55E00', 'zorder': 9},
-    'dmd':      {'label': 'DMD',      'color': '#009E73', 'zorder': 8},
-    'dar':      {'label': 'DAR',      'color': '#E69F00', 'zorder': 7},
-    'misa':     {'label': 'MISA',     'color': '#CC79A7', 'zorder': 6},
-    'tfr-net':  {'label': 'TFR-Net',  'color': '#56B4E9', 'zorder': 5},
-    'dp':       {'label': 'DP',       'color': '#9467BD', 'zorder': 4},
+    'sarm':     {'label': 'SARM',     'color': '#4E79A7', 'zorder': 11},
+    'decalign': {'label': 'DecAlign', 'color': '#F28E2B', 'zorder': 10},
+    'dmd':      {'label': 'DMD',      'color': '#59A14F', 'zorder': 8},
+    'lnln':     {'label': 'LNLN',     'color': '#E15759', 'zorder': 9},
+    'dar':      {'label': 'DAR',      'color': '#B07AA1', 'zorder': 7},
+    'misa':     {'label': 'MISA',     'color': '#76B7B2', 'zorder': 6},
+    'tfr-net':  {'label': 'TFR-Net',  'color': '#EDC948', 'zorder': 5},
 }
 style_map['tfr_net'] = style_map['tfr-net']
 
