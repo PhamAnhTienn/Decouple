@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 input_path = 'result/normal/report.csv'
 df = pd.read_csv(input_path)
+df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
 
 metrics = ['Acc_2', 'F1_score', 'MAE', 'Corr', 'Acc_7', 'Loss']
 
@@ -77,23 +78,32 @@ plt.rcParams['ytick.major.size'] = 4.5
 plt.rcParams['xtick.major.width'] = 1.0
 plt.rcParams['ytick.major.width'] = 1.0
 
-# Colorblind-safe palette (Okabe-Ito / Color Universal Design + matching user reference)
-# - DecAlign: Deep Blue (#0072B2) - High salience
-# - LNLN: Vermilion Red (#D55E00) - Matches red in reference image, colorblind-safe
-# - TFR-Net: Charcoal Grey (#4D4D4D) - Matches dark grey in reference image
-# - DMD: Bluish Green (#009E73) - Matches green in reference image
-# - MISA: Reddish Purple / Orchid (#CC79A7)
-# - DAR: Amber / Gold (#E69F00)
-# Color palette — all use circle marker 'o'
+# ---------------------------------------------------------------------------
+# Color Palette: Full Okabe-Ito (Color Universal Design)
+# 7 maximally distinct hues — safe for all types of color-blindness.
+# Ordered by perceptual salience (high → low) so the proposed method
+# stands out clearly against baselines.
+#
+#  Index │ Model     │ Hex       │ Character
+#  ──────┼───────────┼───────────┼──────────────────────────────────────
+#    1   │ DecAlign  │ #0072B2   │ Strong blue  — highest salience (proposed)
+#    2   │ LNLN      │ #D55E00   │ Vermilion    — warm, clearly distinct from blue
+#    3   │ DMD       │ #009E73   │ Bluish-green — cool, far from red & blue in hue
+#    4   │ DAR       │ #E69F00   │ Amber/gold   — warm-yellow, distinct from all above
+#    5   │ MISA      │ #CC79A7   │ Rose-purple  — unique pink hue
+#    6   │ TFR-Net   │ #56B4E9   │ Sky-blue     — lighter, separated from dark blue
+#    7   │ DP        │ #F0E442   │ Yellow       — brightest, stands out on white bg
+# ---------------------------------------------------------------------------
 style_map = {
     'decalign': {'label': 'DecAlign', 'color': '#0072B2', 'zorder': 10},
     'lnln':     {'label': 'LNLN',     'color': '#D55E00', 'zorder': 9},
-    'tfr-net':  {'label': 'TFR-Net',  'color': '#4D4D4D', 'zorder': 8},
-    'dmd':      {'label': 'DMD',      'color': '#009E73', 'zorder': 7},
+    'dmd':      {'label': 'DMD',      'color': '#009E73', 'zorder': 8},
+    'dar':      {'label': 'DAR',      'color': '#E69F00', 'zorder': 7},
     'misa':     {'label': 'MISA',     'color': '#CC79A7', 'zorder': 6},
-    'dar':      {'label': 'DAR',      'color': '#E69F00', 'zorder': 5},
-    'dp':       {'label': 'DP',       'color': '#56B4E9', 'zorder': 4},
+    'tfr-net':  {'label': 'TFR-Net',  'color': '#56B4E9', 'zorder': 5},
+    'dp':       {'label': 'DP',       'color': '#9467BD', 'zorder': 4},
 }
+style_map['tfr_net'] = style_map['tfr-net']
 
 def create_plot():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), dpi=300)
@@ -133,7 +143,7 @@ def create_plot():
     # --- Subplot 1 (a) — F1 Score ---
     ax1.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
     ax1.set_ylabel('F1', fontsize=14, labelpad=8, fontweight='bold')
-    ax1.set_xlim(-0.03, 0.95)
+    ax1.set_xlim(-0.05, 1.02)
     ax1.set_ylim(32, 88)
     ax1.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
     ax1.set_yticks([40, 50, 60, 70, 80])
@@ -149,7 +159,7 @@ def create_plot():
     # --- Subplot 2 (b) — MAE ---
     ax2.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
     ax2.set_ylabel('MAE', fontsize=14, labelpad=8, fontweight='bold')
-    ax2.set_xlim(-0.03, 0.95)
+    ax2.set_xlim(-0.05, 1.02)
     ax2.set_ylim(0.70, 1.55)
     ax2.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
     ax2.set_yticks([0.8, 1.0, 1.2, 1.4])

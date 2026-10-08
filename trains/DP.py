@@ -110,6 +110,10 @@ class DP():
 
         # Number of initial iterations to freeze prototype weights
         freeze_prototypes_niters = getattr(self.args, 'freeze_prototypes_niters', -1)
+        # How often to rebuild the train-set KNN bank (in epochs).
+        # bank_update_freq=1 → every epoch (most accurate but expensive)
+        # bank_update_freq=N → every N epochs (cheaper, slightly stale)
+        bank_update_freq = getattr(self.args, 'bank_update_freq', 1)
         global_iter = 0
 
         while True:
@@ -250,6 +254,20 @@ class DP():
                     f">> total_loss: {round(train_loss, 4)} "
                     f"{dict_to_str(train_results)}"
                 )
+
+                # --- Update train-set memory bank for KNN neighbor uncertainty ---
+                # This rebuilds z_c / z_s for the full training set (eval mode, no_grad)
+                # so that both train and test samples use the same neighbor pool.
+                # Controlled by bank_update_freq: update every N epochs to save compute.
+                if epochs % bank_update_freq == 0:
+                    logger.info(f">> Epoch {epochs}: rebuilding train-set KNN bank (freq={bank_update_freq})...")
+                    model.update_train_bank(
+                        model_forward_fn=model,
+                        train_dataloader=dataloader['train'],
+                        device=self.args.device,
+                    )
+                    logger.info(f">> Train bank updated: {model._train_bank_z_c['l'].shape[0]} samples.")
+
                 # validation
                 val_results = self.do_test(model, dataloader['valid'], mode="VAL")
                 cur_valid = val_results[self.args.KeyEval]

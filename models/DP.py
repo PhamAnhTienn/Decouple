@@ -117,6 +117,12 @@ class DP(nn.Module):
         self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
+        # Train-set memory bank for KNN neighbor uncertainty
+        # Populated by update_train_bank() after each epoch; None until first update.
+        # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
+        self._train_bank_z_c: dict = {}   # shared representations of full train set
+        self._train_bank_z_s: dict = {}   # specific representations of full train set
+
         # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
         # self.tau = getattr(args, 'tau', 0.5)
         # self.omega_min = getattr(args, 'omega_min', 0.1)
@@ -332,6 +338,7 @@ class DP(nn.Module):
     def _neighbor_uncertainty(self, z_c_dict, z_s_dict, K):
         """
         In-batch neighbor uncertainty for specific representations.
+        Used as fallback when train bank is not yet populated.
 
         z_{-m}^c = Norm(Σ_{n≠m} z_n^c)
         N_K^m(i) = TopK_{j≠i}[cos(z_{-m}^{c,i}, z_{-m}^{c,j})]
@@ -377,6 +384,126 @@ class DP(nn.Module):
             scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
 
         return scores
+
+    def _neighbor_uncertainty_bank(self, z_c_dict, z_s_dict, K):
+        """
+        Train-set KNN neighbor uncertainty for specific representations.
+
+        Uses the full-train memory bank (_train_bank_z_c / _train_bank_z_s)
+        to find K nearest neighbors for every query sample (train or test).
+        This avoids the in-batch bias and makes uncertainty comparable across
+        train/test splits.
+
+        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)  — query leave-one-out shared feature
+        N_K^m(i) = TopK_j [cos(z_{-m}^{c,i}, bank_z_{-m}^{c,j})]   (no self-mask needed)
+        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(bank_z_m^{s,j}))
+
+        Args:
+            z_c_dict: dict m → (B, D) — query shared pooled repr (normed)
+            z_s_dict: dict m → (B, D) — query specific pooled repr (normed)
+            K: number of neighbors
+        Returns:
+            dict m → (B,) neighbor uncertainty
+        """
+        modalities = list(z_c_dict.keys())
+        device = z_c_dict[modalities[0]].device
+        scores = {}
+
+        for m in modalities:
+            others = [n for n in modalities if n != m]
+
+            # --- Query: leave-one-out shared feature (B, D) ---
+            z_minus_m_query = F.normalize(
+                sum(z_c_dict[n] for n in others), dim=1
+            )  # (B, D)
+
+            # --- Bank: leave-one-out shared feature (N, D) ---
+            bank_z_minus_m = F.normalize(
+                sum(self._train_bank_z_c[n].to(device) for n in others), dim=1
+            )  # (N, D)
+
+            # Cosine similarity between query and bank: (B, N)
+            sim_matrix = z_minus_m_query @ bank_z_minus_m.t()
+
+            N_bank = bank_z_minus_m.shape[0]
+            k_actual = min(K, N_bank)
+            if k_actual <= 0:
+                scores[m] = torch.zeros(
+                    z_c_dict[m].shape[0], device=device
+                )
+                continue
+
+            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
+
+            # Specific features from bank: (N, D)
+            bank_z_s_m = self._train_bank_z_s[m].to(device)  # (N, D)
+            z_s_neighbors = bank_z_s_m[topk_idx]              # (B, K, D)
+
+            z_s_m = z_s_dict[m]  # (B, D)
+            cos_neighbors = F.cosine_similarity(
+                z_s_m.unsqueeze(1),
+                z_s_neighbors.detach(),  # stop-gradient on bank
+                dim=2,
+            )  # (B, K)
+            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
+
+        return scores
+
+    @torch.no_grad()
+    def update_train_bank(self, model_forward_fn, train_dataloader, device):
+        """
+        Rebuild the full-train memory bank by passing the entire training set
+        through the encoder in eval mode (no gradients).
+
+        Should be called once after each training epoch (before validation).
+
+        Args:
+            model_forward_fn: callable that accepts (text_m, audio_m, vision_m,
+                              text, audio, vision) and returns the model output dict.
+                              Typically just `model` itself.
+            train_dataloader: DataLoader for the training split.
+            device: torch device.
+        """
+        self.eval()
+        bank_z_c = {'l': [], 'v': [], 'a': []}
+        bank_z_s = {'l': [], 'v': [], 'a': []}
+
+        for batch_data in train_dataloader:
+            text    = batch_data['text'].to(device)
+            text_m  = batch_data['text_m'].to(device)
+            audio   = batch_data['audio'].to(device)
+            audio_m = batch_data['audio_m'].to(device)
+            vision  = batch_data['vision'].to(device)
+            vision_m = batch_data['vision_m'].to(device)
+
+            output = model_forward_fn(text_m, audio_m, vision_m, text, audio, vision)
+
+            # c_l, c_v, c_a are (T, B, D) in output (after permute in forward)
+            c_l = output['c_l']  # (T, B, D)
+            c_v = output['c_v']
+            c_a = output['c_a']
+            s_l = output['s_l']  # (T, B, D)
+            s_v = output['s_v']
+            s_a = output['s_a']
+
+            # Pool over time dim and L2-normalize  → (B, D)
+            # c_* are already (T, B, D), mean over dim=0 gives (B, D)
+            for m, feat_c, feat_s in [
+                ('l', c_l, s_l),
+                ('v', c_v, s_v),
+                ('a', c_a, s_a),
+            ]:
+                z_c_m = F.normalize(feat_c.mean(dim=0), dim=1)  # (B, D)
+                z_s_m = F.normalize(feat_s.mean(dim=0), dim=1)  # (B, D)
+                bank_z_c[m].append(z_c_m.cpu())
+                bank_z_s[m].append(z_s_m.cpu())
+
+        # Concatenate all batches → (N_train, D) on CPU
+        for m in ['l', 'v', 'a']:
+            self._train_bank_z_c[m] = torch.cat(bank_z_c[m], dim=0)
+            self._train_bank_z_s[m] = torch.cat(bank_z_s[m], dim=0)
+
+        self.train()
 
     def _compute_reliability(self, u_consensus, u_cycle_c, u_neighbor, u_cycle_s):
         """
@@ -746,8 +873,12 @@ class DP(nn.Module):
 
         # Shared consensus uncertainty: u_m^c = 1 - (1/(|M|-1)) Σ_{n≠m} cos(z_m^c, z_n^c)
         u_consensus = self._shared_consensus(z_c)
-        # Specific neighbor uncertainty: u_m^s via leave-one-out KNN on shared space
-        u_neighbor  = self._neighbor_uncertainty(z_c, z_s, self.K_neighbors)
+        # Specific neighbor uncertainty: u_m^s via leave-one-out KNN
+        # Use train-set memory bank if populated, otherwise fall back to in-batch KNN
+        if self._train_bank_z_c and all(m in self._train_bank_z_c for m in ['l', 'v', 'a']):
+            u_neighbor = self._neighbor_uncertainty_bank(z_c, z_s, self.K_neighbors)
+        else:
+            u_neighbor = self._neighbor_uncertainty(z_c, z_s, self.K_neighbors)
 
         # Reliability scores (all stop-gradient): r = clamp(exp(-u/tau), r_min, 1)
         r_shared, r_specific = self._compute_reliability(
