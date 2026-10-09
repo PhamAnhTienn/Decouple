@@ -1,0 +1,427 @@
+\subsection{Subspace-Specific Reliability Estimation}
+\label{sec:reliability}
+ 
+SARM does not assign a single reliability value to an entire modality.
+Instead, it estimates separate reliability signals for its shared and
+modality-specific representations.
+The distinction lies in the evidence used to support each subspace.
+ 
+ 
+\paragraph{Shared-space structuring.}
+Shared reliability is assessed from cross-modal corroboration.
+For this comparison to be meaningful, shared representations from
+different modalities should follow a compatible coarse semantic
+organization.
+We therefore use cross-modal prototype alignment (CPA) as an auxiliary
+structuring objective.
+ 
+Let
+$C=[c_1,\ldots,c_{K_p}]^\top\in\mathbb{R}^{K_p\times d}$
+denote $K_p$ normalized prototypes shared across modalities, and let
+%
+\begin{equation}
+    Z^{c,m}
+    =
+    [z_{m,1}^{c},\ldots,z_{m,B}^{c}]^\top,
+    \qquad
+    A^m=Z^{c,m}C^\top
+    \label{eq:prototype_similarity}
+\end{equation}
+%
+denote the shared representations and their prototype affinities for a
+mini-batch of $B$ samples.
+ 
+Following balanced prototype assignment
+\citep{caron2020unsupervised,kim2023swamp}, we obtain:
+%
+\begin{equation}
+    Q^{m,*}
+    =
+    \arg\max_{Q\in\mathcal{Q}}
+    \left[
+        \operatorname{Tr}(Q^\top A^m)
+        +
+        \epsilon H(Q)
+    \right],
+    \label{eq:prototype_assignment}
+\end{equation}
+%
+where
+$H(Q)=-\sum_{i,k}Q_{ik}\log Q_{ik}$ and
+$\mathcal{Q}$ imposes balanced sample--prototype marginals,
+$Q\mathbf{1}_{K_p}=\mathbf{1}_B$ and
+$Q^\top\mathbf{1}_B=\frac{B}{K_p}\mathbf{1}_{K_p}$.
+The assignment is solved using Sinkhorn--Knopp normalization
+\citep{cuturi2013sinkhorn}.
+ 
+Prototype prediction for modality $m$ is defined as:
+%
+\begin{equation}
+    p_{ik}^{m}
+    =
+    \operatorname{softmax}_{k}
+    \left(
+        \frac{(z_{m,i}^{c})^\top c_k}{\tau_p}
+    \right),
+    \label{eq:prototype_prediction}
+\end{equation}
+%
+and assignments from one modality supervise prototype predictions in
+another.
+The resulting alignment objective is:
+%
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{\mathrm{CPA}}
+    =
+    -\frac{1}{M(M-1)B}
+    \sum_{m\in\mathcal{M}}
+    \sum_{\substack{n\in\mathcal{M}\\n\neq m}}
+    \sum_{i=1}^{B}
+    \sum_{k=1}^{K_p}
+    \operatorname{sg}
+    \left(
+        Q_{ik}^{m,*}
+    \right)
+    \log p_{ik}^{n}.
+\end{aligned}
+\label{eq:cpa}
+\end{equation}
+ 
+This objective provides a coarse common organization for shared
+representations without requiring pointwise alignment.
+The resulting shared space is then used for sample-level reliability
+estimation.
+ 
+ 
+\paragraph{Shared reliability.}
+Since the shared subspace is intended to capture common information,
+its reliability can be assessed through within-sample cross-modal
+corroboration:
+%
+\begin{equation}
+\begin{aligned}
+    u_{m,i}^{c}
+    =
+    1
+    -
+    \frac{1}{M-1}
+    \sum_{\substack{
+        n\in\mathcal{M}\\
+        n\neq m
+    }}
+    \cos
+    \left(
+        z_{m,i}^{c},
+        z_{n,i}^{c}
+    \right).
+\end{aligned}
+\label{eq:shared_uncertainty}
+\end{equation}
+%
+A larger $u_{m,i}^{c}$ indicates weaker support from the corresponding
+shared evidence in the other modalities.
+ 
+ 
+\paragraph{Complement-conditioned specific reliability.}
+The same criterion is unsuitable for modality-specific
+representations, since cross-modal differences may encode useful
+complementary information rather than unreliability.
+We therefore assess specific reliability from same-modality local
+support under a comparable complementary shared context.
+For modality $m$, the complementary shared context is:
+%
+\begin{equation}
+\begin{aligned}
+    \widetilde{z}_{m,i}^{c}
+    =
+    \operatorname{Norm}
+    \left(
+        \sum_{\substack{
+            n\in\mathcal{M}\\
+            n\neq m
+        }}
+        z_{n,i}^{c}
+    \right).
+\end{aligned}
+\label{eq:complementary_context}
+\end{equation}
+ 
+This estimator follows a conditional locality assumption:
+samples with similar complementary shared semantics are expected to
+exhibit locally coherent patterns within the same modality-specific
+subspace.
+Importantly, this does not require specific representations from
+different modalities to be aligned.
+ 
+Let $\mathcal{I}_{\mathrm{tr}}$ denote the training index set.
+For each modality, we define a reference memory:
+%
+\begin{equation}
+    \mathcal{B}^{m}
+    =
+    \left\{
+        \left(
+            \widetilde{z}_{m,j}^{c},
+            z_{m,j}^{s},
+            j
+        \right)
+        :
+        j\in\mathcal{I}_{\mathrm{tr}}
+    \right\}.
+    \label{eq:reference_memory}
+\end{equation}
+ 
+The $K_n$ most comparable references are selected according to their
+complementary shared contexts:
+%
+\begin{equation}
+\begin{aligned}
+    \mathcal{N}_{K_n}^{m}(i)
+    =
+    \operatorname{TopK}_{
+        j\in\mathcal{I}_{\mathrm{tr}}\setminus\{i\}
+    }
+    \cos
+    \left(
+        \widetilde{z}_{m,i}^{c},
+        \widetilde{z}_{m,j}^{c}
+    \right).
+\end{aligned}
+\label{eq:semantic_neighbors}
+\end{equation}
+ 
+Specific uncertainty is then evaluated from the corresponding
+same-modality representations:
+%
+\begin{equation}
+\begin{aligned}
+    u_{m,i}^{s}
+    =
+    1
+    -
+    \frac{1}{K_n}
+    \sum_{j\in\mathcal{N}_{K_n}^{m}(i)}
+    \cos
+    \left(
+        z_{m,i}^{s},
+        z_{m,j}^{s}
+    \right).
+\end{aligned}
+\label{eq:specific_uncertainty}
+\end{equation}
+%
+Thus, $u_{m,i}^{s}$ measures the lack of local support rather than
+cross-modal disagreement.
+The retrieved representations serve only as references for reliability
+estimation and are not injected into the current representation.
+ 
+ 
+\paragraph{Uncertainty-to-reliability mapping.}
+The two uncertainty measures are converted into reliability signals
+using the same monotonic mapping:
+%
+\begin{equation}
+\begin{aligned}
+    r_{m,i}^{c}
+    &=
+    \operatorname{sg}
+    \left[
+        \max
+        \left\{
+            r_{\min},
+            e^{-u_{m,i}^{c}/\tau}
+        \right\}
+    \right],\\
+    r_{m,i}^{s}
+    &=
+    \operatorname{sg}
+    \left[
+        \max
+        \left\{
+            r_{\min},
+            e^{-u_{m,i}^{s}/\tau}
+        \right\}
+    \right].
+\end{aligned}
+\label{eq:reliability_mapping}
+\end{equation}
+%
+Here, $\tau>0$ controls the decay rate and
+$0<r_{\min}<1$ prevents complete suppression.
+The resulting reliability scores are detached from gradient
+propagation and serve as control signals for multimodal interaction.
+ 
+ 
+\subsection{Role-Matched Reliability-Guided Interaction}
+\label{sec:interaction}
+ 
+Reliability is useful only if it regulates information flow in a manner
+consistent with the role of the corresponding representation.
+SARM therefore uses different interaction mechanisms for shared and
+modality-specific information:
+shared representations form a reliability-weighted consensus, whereas
+specific representations exchange complementary information
+directionally.
+ 
+Relative reliability determines which representations should
+contribute more strongly.
+However, normalized weights alone cannot suppress an interaction when
+all participating representations are weak.
+For a set of reliability scores $\mathcal{S}$, we therefore define the
+joint gate:
+%
+\begin{equation}
+    \gamma_{\mathcal{S}}
+    =
+    1-
+    \prod_{j\in\mathcal{S}}
+    (1-r_j).
+    \label{eq:joint_gate}
+\end{equation}
+%
+Relative reliability controls the contribution of individual
+representations, while the joint gate controls the overall interaction
+strength.
+ 
+ 
+\paragraph{Shared consensus.}
+For the shared subspace, the joint gate and normalized reliability
+weights are:
+%
+\begin{equation}
+\begin{aligned}
+    \gamma_i^{c}
+    &=
+    1-
+    \prod_{m\in\mathcal{M}}
+    (1-r_{m,i}^{c}),\\
+    w_{m,i}^{c}
+    &=
+    \frac{
+        r_{m,i}^{c}
+    }{
+        \sum_{n\in\mathcal{M}}
+        r_{n,i}^{c}
+    }.
+\end{aligned}
+\label{eq:shared_weights}
+\end{equation}
+ 
+The shared consensus is then:
+%
+\begin{equation}
+    \overline{S}_i
+    =
+    \gamma_i^{c}
+    \sum_{m\in\mathcal{M}}
+    w_{m,i}^{c}S_{m,i}.
+    \label{eq:shared_consensus}
+\end{equation}
+%
+Representations with stronger shared support contribute more to the
+consensus, while the joint gate reduces its strength when the available
+shared evidence is collectively weak.
+ 
+ 
+\paragraph{Specific sender--receiver exchange.}
+Modality-specific representations remain separate and exchange
+complementary information directionally.
+For receiver modality $m$ and sender modality $n$, we obtain:
+%
+\begin{equation}
+    B_{m\leftarrow n,i}
+    =
+    \operatorname{CrossAttn}
+    \left(
+        P_{m,i},
+        P_{n,i}
+    \right),
+    \label{eq:specific_message}
+\end{equation}
+%
+where the receiver provides the query and the sender provides the key
+and value.
+ 
+Their joint gate and sender influence are:
+%
+\begin{equation}
+\begin{aligned}
+    \gamma_{m,n,i}^{s}
+    &=
+    1-
+    (1-r_{m,i}^{s})
+    (1-r_{n,i}^{s}),\\
+    \beta_{m\leftarrow n,i}
+    &=
+    \gamma_{m,n,i}^{s}
+    \frac{
+        r_{n,i}^{s}
+    }{
+        r_{m,i}^{s}+r_{n,i}^{s}
+    }.
+\end{aligned}
+\label{eq:specific_weights}
+\end{equation}
+ 
+The receiver is updated toward the sender-conditioned representation:
+%
+\begin{equation}
+\begin{aligned}
+    \widetilde{P}_{m\leftarrow n,i}
+    =
+    P_{m,i}
+    +
+    \beta_{m\leftarrow n,i}
+    \left(
+        B_{m\leftarrow n,i}
+        -
+        P_{m,i}
+    \right).
+\end{aligned}
+\label{eq:specific_update}
+\end{equation}
+%
+The relative reliability term increases the influence of a
+better-supported sender, while the joint gate suppresses the exchange
+when both representations are weak.
+ 
+For multiple senders, the resulting representations are combined as:
+%
+\begin{equation}
+    \widetilde{P}_{m,i}
+    =
+    \mathcal{A}_m
+    \left(
+        \left\{
+            \widetilde{P}_{m\leftarrow n,i}
+        \right\}_{n\neq m}
+    \right),
+    \label{eq:specific_aggregation}
+\end{equation}
+%
+where $\mathcal{A}_m$ denotes the specific-feature aggregation
+operator.
+ 
+ 
+\subsection{Training Objective}
+\label{sec:objective}
+ 
+The reliability-regulated shared and modality-specific representations
+are passed to the downstream sentiment predictor.
+Let $\mathcal{L}_{\mathrm{base}}$ denote the task and
+representation-learning objectives of the shared--specific backbone.
+The overall objective is:
+%
+\begin{equation}
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{base}}
+    +
+    \lambda_{\mathrm{CPA}}
+    \mathcal{L}_{\mathrm{CPA}},
+    \label{eq:overall_objective}
+\end{equation}
+%
+where $\lambda_{\mathrm{CPA}}\geq0$ controls the auxiliary
+shared-space structuring objective

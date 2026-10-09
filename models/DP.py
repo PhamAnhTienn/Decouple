@@ -119,9 +119,10 @@ class DP(nn.Module):
 
         # Train-set memory bank for KNN neighbor uncertainty
         # Populated by update_train_bank() after each epoch; None until first update.
-        # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
+        # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on GPU (cached)
         self._train_bank_z_c: dict = {}   # shared representations of full train set
         self._train_bank_z_s: dict = {}   # specific representations of full train set
+        self._train_bank_z_minus: dict = {}  # pre-computed leave-one-out shared (Strategy 3)
 
         # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
         # self.tau = getattr(args, 'tau', 0.5)
@@ -394,9 +395,9 @@ class DP(nn.Module):
         This avoids the in-batch bias and makes uncertainty comparable across
         train/test splits.
 
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)  — query leave-one-out shared feature
-        N_K^m(i) = TopK_j [cos(z_{-m}^{c,i}, bank_z_{-m}^{c,j})]   (no self-mask needed)
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(bank_z_m^{s,j}))
+        Optimized: uses pre-computed leave-one-out bank features
+        (_train_bank_z_minus) and GPU-cached bank tensors to avoid
+        redundant computation and CPU→GPU transfers.
 
         Args:
             z_c_dict: dict m → (B, D) — query shared pooled repr (normed)
@@ -417,10 +418,9 @@ class DP(nn.Module):
                 sum(z_c_dict[n] for n in others), dim=1
             )  # (B, D)
 
-            # --- Bank: leave-one-out shared feature (N, D) ---
-            bank_z_minus_m = F.normalize(
-                sum(self._train_bank_z_c[n].to(device) for n in others), dim=1
-            )  # (N, D)
+            # --- Bank: pre-computed leave-one-out shared feature (N, D) ---
+            # Already on GPU and L2-normalized (Strategy 2+3)
+            bank_z_minus_m = self._train_bank_z_minus[m]  # (N, D)
 
             # Cosine similarity between query and bank: (B, N)
             sim_matrix = z_minus_m_query @ bank_z_minus_m.t()
@@ -435,9 +435,8 @@ class DP(nn.Module):
 
             _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
 
-            # Specific features from bank: (N, D)
-            bank_z_s_m = self._train_bank_z_s[m].to(device)  # (N, D)
-            z_s_neighbors = bank_z_s_m[topk_idx]              # (B, K, D)
+            # Specific features from bank (already on GPU)
+            z_s_neighbors = self._train_bank_z_s[m][topk_idx]  # (B, K, D)
 
             z_s_m = z_s_dict[m]  # (B, D)
             cos_neighbors = F.cosine_similarity(
@@ -450,17 +449,19 @@ class DP(nn.Module):
         return scores
 
     @torch.no_grad()
-    def update_train_bank(self, model_forward_fn, train_dataloader, device):
+    def update_train_bank(self, train_dataloader, device):
         """
-        Rebuild the full-train memory bank by passing the entire training set
-        through the encoder in eval mode (no gradients).
+        Rebuild the full-train memory bank using only projection + encoder
+        layers (lightweight — skips CRM, cross-attention, transformers).
+
+        Optimizations applied:
+          - Strategy 1: Only runs proj + encoder_c + encoder_s_* (skip downstream)
+          - Strategy 2: Bank tensors cached on GPU (no CPU→GPU transfer per batch)
+          - Strategy 3: Pre-computes leave-one-out z_minus for each modality
 
         Should be called once after each training epoch (before validation).
 
         Args:
-            model_forward_fn: callable that accepts (text_m, audio_m, vision_m,
-                              text, audio, vision) and returns the model output dict.
-                              Typically just `model` itself.
             train_dataloader: DataLoader for the training split.
             device: torch device.
         """
@@ -469,39 +470,54 @@ class DP(nn.Module):
         bank_z_s = {'l': [], 'v': [], 'a': []}
 
         for batch_data in train_dataloader:
-            text    = batch_data['text'].to(device)
+            # Only need the missing-modality inputs (main encoder input)
             text_m  = batch_data['text_m'].to(device)
-            audio   = batch_data['audio'].to(device)
             audio_m = batch_data['audio_m'].to(device)
-            vision  = batch_data['vision'].to(device)
             vision_m = batch_data['vision_m'].to(device)
 
-            output = model_forward_fn(text_m, audio_m, vision_m, text, audio, vision)
+            # --- Strategy 1: lightweight forward (proj + encoder only) ---
+            if self.use_bert:
+                text_m = self.text_model(text_m)
+            x_l = F.dropout(text_m.transpose(1, 2), p=self.text_dropout, training=False)
+            x_a = audio_m.transpose(1, 2)
+            x_v = vision_m.transpose(1, 2)
 
-            # c_l, c_v, c_a are (T, B, D) in output (after permute in forward)
-            c_l = output['c_l']  # (T, B, D)
-            c_v = output['c_v']
-            c_a = output['c_a']
-            s_l = output['s_l']  # (T, B, D)
-            s_v = output['s_v']
-            s_a = output['s_a']
+            proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
+            proj_x_a = x_a if self.orig_d_a == self.d_a else self.proj_a(x_a)
+            proj_x_v = x_v if self.orig_d_v == self.d_v else self.proj_v(x_v)
 
-            # Pool over time dim and L2-normalize  → (B, D)
-            # c_* are already (T, B, D), mean over dim=0 gives (B, D)
+            # Shared encoder (Conv1d) → (B, D, T)
+            c_l = self.encoder_c(proj_x_l)
+            c_v = self.encoder_c(proj_x_v)
+            c_a = self.encoder_c(proj_x_a)
+
+            # Specific encoders (Conv1d) → (B, D, T)
+            s_l = self.encoder_s_l(proj_x_l)
+            s_v = self.encoder_s_v(proj_x_v)
+            s_a = self.encoder_s_a(proj_x_a)
+
+            # Pool over time dim + L2-normalize → (B, D)
             for m, feat_c, feat_s in [
                 ('l', c_l, s_l),
                 ('v', c_v, s_v),
                 ('a', c_a, s_a),
             ]:
-                z_c_m = F.normalize(feat_c.mean(dim=0), dim=1)  # (B, D)
-                z_s_m = F.normalize(feat_s.mean(dim=0), dim=1)  # (B, D)
-                bank_z_c[m].append(z_c_m.cpu())
-                bank_z_s[m].append(z_s_m.cpu())
+                z_c_m = F.normalize(feat_c.mean(dim=2), dim=1)  # (B, D)
+                z_s_m = F.normalize(feat_s.mean(dim=2), dim=1)  # (B, D)
+                bank_z_c[m].append(z_c_m)
+                bank_z_s[m].append(z_s_m)
 
-        # Concatenate all batches → (N_train, D) on CPU
+        # --- Strategy 2: concatenate and keep on GPU ---
         for m in ['l', 'v', 'a']:
-            self._train_bank_z_c[m] = torch.cat(bank_z_c[m], dim=0)
-            self._train_bank_z_s[m] = torch.cat(bank_z_s[m], dim=0)
+            self._train_bank_z_c[m] = torch.cat(bank_z_c[m], dim=0)  # (N, D) on GPU
+            self._train_bank_z_s[m] = torch.cat(bank_z_s[m], dim=0)  # (N, D) on GPU
+
+        # --- Strategy 3: pre-compute leave-one-out shared features ---
+        for m in ['l', 'v', 'a']:
+            others = [n for n in ['l', 'v', 'a'] if n != m]
+            self._train_bank_z_minus[m] = F.normalize(
+                sum(self._train_bank_z_c[n] for n in others), dim=1
+            )  # (N, D) on GPU
 
         self.train()
 

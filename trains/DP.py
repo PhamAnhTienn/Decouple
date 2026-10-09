@@ -262,7 +262,6 @@ class DP():
                 if epochs % bank_update_freq == 0:
                     logger.info(f">> Epoch {epochs}: rebuilding train-set KNN bank (freq={bank_update_freq})...")
                     model.update_train_bank(
-                        model_forward_fn=model,
                         train_dataloader=dataloader['train'],
                         device=self.args.device,
                     )
