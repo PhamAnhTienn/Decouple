@@ -55,6 +55,12 @@ class DP():
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
 
+        # ---- Ablation flags (default False = full model) ----
+        self.ablate_ort = getattr(args, 'ablate_ort', False)
+        self.ablate_cpa = getattr(args, 'ablate_cpa', False)
+        self.ablate_shared_cal = getattr(args, 'ablate_shared_calibration', False)
+        self.ablate_specific_cal = getattr(args, 'ablate_specific_calibration', False)
+
     def _weighted_recon_loss(self, x_tilde, x_orig, w):
         """
         Weighted cross-reconstruction loss (Eq. 8).
@@ -215,9 +221,13 @@ class DP():
                         output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
                     )
 
+                    # ---- Ablation: zero out disabled loss terms ----
+                    ort_weight = 0.0 if self.ablate_ort else LAMBDA_ORT_INNER
+                    cpa_weight = 0.0 if self.ablate_cpa else LAMBDA_CLUSTER
+
                     combined_loss = loss_task + \
-                                        (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
+                                        (loss_p + loss_recon + loss_ort * ort_weight) * LAMBDA_RECON_GROUP \
+                                        + loss_cluster * cpa_weight
                     
                     # combined_loss = loss_task + \
                     #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \

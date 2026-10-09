@@ -117,6 +117,10 @@ class DP(nn.Module):
         self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
+        # ---- Ablation flags ----
+        self.ablate_shared_cal = getattr(args, 'ablate_shared_calibration', False)
+        self.ablate_specific_cal = getattr(args, 'ablate_specific_calibration', False)
+
         # Train-set memory bank for KNN neighbor uncertainty
         # Populated by update_train_bank() after each epoch; None until first update.
         # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
@@ -958,7 +962,11 @@ class DP(nn.Module):
         # --- OLD: reliability-gated consensus (concat version, scale per slot) ---
         # c_fusion = self._reliability_gated_consensus(c_att_dict, r_shared)  # (B, 3*D)
         # --- NEW: reliability-gated consensus (sum version, single vector) ---
-        c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
+        if self.ablate_shared_cal:
+            # Ablation: equal-weight mean (no reliability gating)
+            c_fusion = (c_att_dict['l'] + c_att_dict['v'] + c_att_dict['a']) / 3.0  # (B, D)
+        else:
+            c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -975,12 +983,13 @@ class DP(nn.Module):
         # (V,A) --> L
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
-        # # --- OLD: simple weighted average calibration ---
-        # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
-        # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
-        # # --- NEW: reliability-gated complementary exchange ---
-        h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
-        h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
+        if not self.ablate_specific_cal:
+            # # --- OLD: simple weighted average calibration ---
+            # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
+            # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
+            # # --- NEW: reliability-gated complementary exchange ---
+            h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
+            h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
         h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
         h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
@@ -990,12 +999,13 @@ class DP(nn.Module):
         # (L,V) --> A
         h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
         h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
-        # # --- OLD: simple weighted average calibration ---
-        # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
-        # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
-        # # --- NEW: reliability-gated complementary exchange ---
-        h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
-        h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
+        if not self.ablate_specific_cal:
+            # # --- OLD: simple weighted average calibration ---
+            # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
+            # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
+            # # --- NEW: reliability-gated complementary exchange ---
+            h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
+            h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
         h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
@@ -1005,12 +1015,13 @@ class DP(nn.Module):
         # (L,A) --> V
         h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
         h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
-        # # --- OLD: simple weighted average calibration ---
-        # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
-        # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
-        # --- NEW: reliability-gated complementary exchange ---
-        h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
-        h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
+        if not self.ablate_specific_cal:
+            # # --- OLD: simple weighted average calibration ---
+            # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
+            # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
+            # --- NEW: reliability-gated complementary exchange ---
+            h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
+            h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
         h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
