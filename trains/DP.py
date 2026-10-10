@@ -215,9 +215,11 @@ class DP():
                         output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
                     )
 
+                    # λ_CPA: configurable via args.lambda_cpa (default: LAMBDA_CLUSTER=0.1)
+                    lambda_cpa = getattr(self.args, 'lambda_cpa', LAMBDA_CLUSTER)
                     combined_loss = loss_task + \
                                         (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
+                                        + loss_cluster * lambda_cpa
                     
                     # combined_loss = loss_task + \
                     #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \

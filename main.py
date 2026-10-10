@@ -194,7 +194,8 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
     dataloader = MMDataLoader(args, num_workers)
     # Build selected model variant.
     model = build_model(args)
-    model = model.cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     
     logger.info(f'The model has {count_parameters(model)} trainable parameters')
 
