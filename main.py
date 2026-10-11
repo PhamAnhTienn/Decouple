@@ -130,7 +130,10 @@ def DMD_run(
             setattr(args, key, value)
             
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
-    args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
+    ablation_suffix = ""
+    if hasattr(args, 'interaction_ablation') and args.interaction_ablation and args.interaction_ablation != 'full_sarm':
+        ablation_suffix = f"-{args.interaction_ablation}"
+    args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}{ablation_suffix}-missing{args.missing_rate_eval_test:.1f}.pth")
     args.res_save_dir = str(res_save_dir)
 
     # Running results
@@ -172,8 +175,11 @@ def DMD_run(
         if column not in df.columns:
             df[column] = np.nan
             
+    model_label = model_name
+    if hasattr(args, 'interaction_ablation') and args.interaction_ablation:
+        model_label = f"{model_name}_{args.interaction_ablation}"
     res = {
-        "Model": model_name,
+        "Model": model_label,
         "Missing Rate": args.missing_rate_eval_test,
         "Seeds": str(seeds)
     }
@@ -245,6 +251,13 @@ def parse_args():
     parser.add_argument('--missing_rate_eval_test', type=float, default=0.0, help='Missing rate for evaluation and testing')
     parser.add_argument('--data_missing', action='store_true', help='Enable missing modality simulation')
     parser.add_argument(
+        '--interaction_ablation',
+        type=str,
+        default='full_sarm',
+        choices=['full_sarm', 'generic', 'consensus_all', 'consensus', 'directional_all', 'directional', 'role_swapped'],
+        help='Role-matched interaction ablation variant (Ablation 9)'
+    )
+    parser.add_argument(
         '--config_override',
         action='append',
         default=[],
@@ -265,6 +278,7 @@ def main():
             'missing_rate_eval_test': args.missing_rate_eval_test,
             'data_missing': args.data_missing,
             'K_neighbors': args.K_neighbors,
+            'interaction_ablation': args.interaction_ablation,
         }.items()
         if value is not None
     })

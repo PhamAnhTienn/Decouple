@@ -117,6 +117,25 @@ class DP(nn.Module):
         self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
+        # Role-matched interaction ablation (Ablation 9)
+        self.interaction_ablation = getattr(args, 'interaction_ablation', 'full_sarm')
+        if not self.interaction_ablation:
+            self.interaction_ablation = 'full_sarm'
+        self.interaction_ablation = str(self.interaction_ablation).lower()
+        INTERACTION_ABLATION_MAP = {
+            'full_sarm':        ('consensus',   'directional'),
+            'generic':          ('generic',     'generic'),
+            'consensus_all':    ('consensus',   'consensus'),
+            'consensus':        ('consensus',   'consensus'),
+            'directional_all':  ('directional', 'directional'),
+            'directional':      ('directional', 'directional'),
+            'role_swapped':     ('directional', 'consensus'),
+        }
+        if self.interaction_ablation not in INTERACTION_ABLATION_MAP:
+            raise ValueError(f"Unknown interaction_ablation: {self.interaction_ablation}. "
+                             f"Supported: {list(INTERACTION_ABLATION_MAP.keys())}")
+        self.shared_interaction_mode, self.specific_interaction_mode = INTERACTION_ABLATION_MAP[self.interaction_ablation]
+
         # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
         # self.tau = getattr(args, 'tau', 0.5)
         # self.omega_min = getattr(args, 'omega_min', 0.1)
@@ -605,6 +624,70 @@ class DP(nn.Module):
         # h̃ = h_m + β * (b_{m←n} - h_m)
         return h_m + beta * (b_cross - h_m)
 
+    def _generic_weighted_shared_fusion(self, c_att_dict, r_shared):
+        """
+        Generic reliability-weighted shared fusion (no joint consensus gate γ^c).
+        h̄ = Σ_m (r_m / R^c) * h_m
+        """
+        modalities = list(c_att_dict.keys())
+        r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
+        R_c = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)           # (B, 1)
+
+        h_bar = torch.zeros_like(c_att_dict[modalities[0]])  # (B, D)
+        for i, m in enumerate(modalities):
+            r_m = r_stack[:, i].unsqueeze(1)           # (B, 1)
+            w_m = r_m / R_c                             # (B, 1)
+            h_bar = h_bar + w_m * c_att_dict[m]         # (B, D)
+
+        return h_bar  # (B, D)
+
+    def _directional_shared_interaction(self, c_att_dict, r_shared):
+        """
+        Directional sender-receiver interaction for shared representations.
+        Forces shared features to interact via pairwise sender-receiver updates instead of consensus:
+            γ_{m,n}^{c} = 1 - (1 - r_m^c)(1 - r_n^c)
+            β_{m←n}^c = γ_{m,n}^c * r_n^c / (r_m^c + r_n^c)
+            c̃_{m←n} = c_m + β_{m←n}^c * (c_n - c_m)
+        """
+        modalities = list(c_att_dict.keys())
+        updated_c = {}
+        for m in modalities:
+            other_modalities = [n for n in modalities if n != m]
+            updates = []
+            r_m = r_shared[m]  # (B,)
+            c_m = c_att_dict[m]  # (B, D)
+            for n in other_modalities:
+                r_n = r_shared[n]  # (B,)
+                c_n = c_att_dict[n]  # (B, D)
+                gamma_mn = 1.0 - (1.0 - r_m) * (1.0 - r_n)
+                denom = (r_m + r_n).clamp(min=1e-8)
+                beta = (gamma_mn * r_n / denom).unsqueeze(1)  # (B, 1)
+                c_mn = c_m + beta * (c_n - c_m)
+                updates.append(c_mn)
+            updated_c[m] = torch.stack(updates, dim=0).mean(dim=0)  # (B, D)
+
+        c_fusion = torch.stack([updated_c[m] for m in modalities], dim=0).mean(dim=0)  # (B, D)
+        return c_fusion
+
+    def _fuse_shared(self, c_att_dict, r_shared):
+        if self.shared_interaction_mode == 'consensus':
+            return self._reliability_gated_consensus_sum(c_att_dict, r_shared)
+        elif self.shared_interaction_mode == 'generic':
+            return self._generic_weighted_shared_fusion(c_att_dict, r_shared)
+        elif self.shared_interaction_mode == 'directional':
+            return self._directional_shared_interaction(c_att_dict, r_shared)
+        else:
+            raise ValueError(f"Unknown shared_interaction_mode: {self.shared_interaction_mode}")
+
+    def _calibrate_cross_attention_generic(self, h_m, h_cross, r_specific, m_query, m_kv):
+        """
+        Generic reliability-weighted cross-attention (no pairwise joint gate γ_{m,n}^s).
+        """
+        r_m = r_specific[m_query].unsqueeze(0).unsqueeze(2)  # (1, B, 1)
+        r_n = r_specific[m_kv].unsqueeze(0).unsqueeze(2)     # (1, B, 1)
+        denom = (r_m + r_n).clamp(min=1e-8)
+        return (r_m * h_m + r_n * h_cross) / denom
+
     def compute_conflict_weights(self, h_l, h_v, h_a):
         """
         Conflict-Aware Weighting (CAW) strategy (Section 3.2).
@@ -820,14 +903,11 @@ class DP(nn.Module):
         c_a_att = c_a_att[-1]
 
         c_att_dict = {'l': c_l_att, 'v': c_v_att, 'a': c_a_att}
-        # --- OLD: plain concat (no reliability gating) ---
-        # c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)  # (B, 3*D)
-        # --- OLD: simple reliability-weighted fusion ---
-        # c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
-        # --- OLD: reliability-gated consensus (concat version, scale per slot) ---
-        # c_fusion = self._reliability_gated_consensus(c_att_dict, r_shared)  # (B, 3*D)
-        # --- NEW: reliability-gated consensus (sum version, single vector) ---
-        c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
+        # Shared fusion governed by interaction ablation mode:
+        # - 'consensus':   _reliability_gated_consensus_sum (γ^c * Σ w_m h_m)
+        # - 'generic':     _generic_weighted_shared_fusion (Σ w_m h_m without γ^c)
+        # - 'directional': _directional_shared_interaction (pairwise sender-receiver)
+        c_fusion = self._fuse_shared(c_att_dict, r_shared)  # (B, D)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -836,51 +916,85 @@ class DP(nn.Module):
         logits_c = self.out_layer_c(c_proj)
 
         # ==============================================================
-        # Reliability-Gated Complementary Exchange (Specific Cross-attention)
-        # γ_{m,n}^s = 1 - (1 - r_m^s)(1 - r_n^s)
-        # β_{m←n} = γ_{m,n}^s * r_n^s / (r_m^s + r_n^s)
-        # h̃_{m←n} = h_m + β * (b_{m←n} - h_m)
+        # Specific Interaction (Ablation 9: Role-Matched Information Flow)
+        # - 'directional': pairwise cross-attention with sender-receiver reliability exchange (Full SARM)
+        # - 'generic':     pairwise cross-attention with naive weighted average (no joint gate γ_{mn}^s)
+        # - 'consensus':   consensus pooling and broadcast to all specific branches
         # ==============================================================
-        # (V,A) --> L
-        h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
-        h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
-        # # --- OLD: simple weighted average calibration ---
-        # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
-        # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
-        # # --- NEW: reliability-gated complementary exchange ---
-        h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
-        h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
-        h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
+        if self.specific_interaction_mode == 'directional':
+            # (V,A) --> L
+            h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
+            h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
+            h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
+            h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
+            h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
+
+            # (L,V) --> A
+            h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
+            h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
+            h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
+            h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
+            h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
+
+            # (L,A) --> V
+            h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
+            h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
+            h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
+            h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
+            h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
+
+        elif self.specific_interaction_mode == 'generic':
+            # Generic weighted cross-attention (no joint reliability gate γ_{mn}^s)
+            h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)
+            h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)
+            h_l_with_as = self._calibrate_cross_attention_generic(s_l, h_l_with_as, r_specific, 'l', 'a')
+            h_l_with_vs = self._calibrate_cross_attention_generic(s_l, h_l_with_vs, r_specific, 'l', 'v')
+            h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
+
+            h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)
+            h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)
+            h_a_with_ls = self._calibrate_cross_attention_generic(s_a, h_a_with_ls, r_specific, 'a', 'l')
+            h_a_with_vs = self._calibrate_cross_attention_generic(s_a, h_a_with_vs, r_specific, 'a', 'v')
+            h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
+
+            h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)
+            h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)
+            h_v_with_ls = self._calibrate_cross_attention_generic(s_v, h_v_with_ls, r_specific, 'v', 'l')
+            h_v_with_as = self._calibrate_cross_attention_generic(s_v, h_v_with_as, r_specific, 'v', 'a')
+            h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
+
+        elif self.specific_interaction_mode == 'consensus':
+            # Specific consensus fusion: forces private features to be aggregated into a single consensus pool
+            gamma_s = 1.0 - (1.0 - r_specific['l']) * (1.0 - r_specific['v']) * (1.0 - r_specific['a'])
+            r_stack_s = torch.stack([r_specific['l'], r_specific['v'], r_specific['a']], dim=1)  # (B, 3)
+            R_s = r_stack_s.sum(dim=1, keepdim=True).clamp(min=1e-8)  # (B, 1)
+            gamma_s_expand = gamma_s.unsqueeze(0).unsqueeze(2)  # (1, B, 1)
+
+            w_l_s = (r_specific['l'] / R_s[:, 0]).unsqueeze(0).unsqueeze(2)  # (1, B, 1)
+            w_v_s = (r_specific['v'] / R_s[:, 0]).unsqueeze(0).unsqueeze(2)
+            w_a_s = (r_specific['a'] / R_s[:, 0]).unsqueeze(0).unsqueeze(2)
+            s_consensus = gamma_s_expand * (w_l_s * s_l + w_v_s * s_v + w_a_s * s_a)  # (T, B, D)
+
+            h_l_updated = s_l + gamma_s_expand * (s_consensus - s_l)
+            h_a_updated = s_a + gamma_s_expand * (s_consensus - s_a)
+            h_v_updated = s_v + gamma_s_expand * (s_consensus - s_v)
+
+            h_ls = torch.cat([h_l_updated, s_consensus], dim=2)  # (T, B, 2*D)
+            h_as = torch.cat([h_a_updated, s_consensus], dim=2)  # (T, B, 2*D)
+            h_vs = torch.cat([h_v_updated, s_consensus], dim=2)  # (T, B, 2*D)
+        else:
+            raise ValueError(f"Unknown specific_interaction_mode: {self.specific_interaction_mode}")
+
         h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
             h_ls = h_ls[0]
         last_h_l = last_hs = h_ls[-1]  # Take the last output for prediction
 
-        # (L,V) --> A
-        h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
-        h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
-        # # --- OLD: simple weighted average calibration ---
-        # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
-        # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
-        # # --- NEW: reliability-gated complementary exchange ---
-        h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
-        h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
-        h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
             h_as = h_as[0]
         last_h_a = last_hs = h_as[-1]
 
-        # (L,A) --> V
-        h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
-        h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
-        # # --- OLD: simple weighted average calibration ---
-        # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
-        # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
-        # --- NEW: reliability-gated complementary exchange ---
-        h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
-        h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
-        h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
             h_vs = h_vs[0]
