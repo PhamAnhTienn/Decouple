@@ -33,6 +33,20 @@ VARIANT_DESCRIPTIONS = {
 }
 
 
+def df_to_markdown(df):
+    """Formats DataFrame as markdown table without requiring tabulate package."""
+    try:
+        return df.to_markdown(index=False)
+    except Exception:
+        headers = [str(c) for c in df.columns]
+        lines = []
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for _, row in df.iterrows():
+            lines.append("| " + " | ".join(str(row[c]) for c in df.columns) + " |")
+        return "\n".join(lines)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Role-matched Interaction Ablation")
     parser.add_argument('--dataset', type=str, default='mosi', choices=['mosi', 'mosei', 'sims'], help='Dataset name')
@@ -125,7 +139,7 @@ def generate_summary(csv_file, output_dir, dataset_name, variants, missing_rates
         display_df = summary_df
 
     # Print to console as Markdown
-    print(display_df.to_markdown(index=False))
+    print(df_to_markdown(display_df))
 
     # Save to CSV and Markdown
     out_csv = Path(output_dir) / f"ablation_9_{dataset_name}_summary.csv"
@@ -133,7 +147,7 @@ def generate_summary(csv_file, output_dir, dataset_name, variants, missing_rates
     summary_df.to_csv(out_csv, index=False)
     with open(out_md, 'w', encoding='utf-8') as f:
         f.write(f"# Ablation 9: Role-matched Interaction Ablation ({dataset_name.upper()})\n\n")
-        f.write(display_df.to_markdown(index=False))
+        f.write(df_to_markdown(display_df))
         f.write("\n\n*Numbers in parentheses indicate performance gap (delta) relative to Full SARM.*\n")
 
     print("\n" + "=" * 90)

@@ -210,13 +210,17 @@ class DP():
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
                     # CPA loss (Cross-modal Prototype Alignment)
-                    loss_cluster = model.compute_cpa_loss(
-                        output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
-                    )
+                    lambda_cpa = getattr(self.args, 'lambda_cpa', LAMBDA_CLUSTER)
+                    if lambda_cpa > 0.0:
+                        loss_cluster = model.compute_cpa_loss(
+                            output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                        )
+                    else:
+                        loss_cluster = 0.0
 
                     combined_loss = loss_task + \
                                         (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
+                                        + loss_cluster * lambda_cpa
                     
                     # combined_loss = loss_task + \
                     #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
