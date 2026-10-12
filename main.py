@@ -132,9 +132,7 @@ def DMD_run(
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
     ablation_suffix = ""
     if hasattr(args, 'interaction_ablation') and args.interaction_ablation and args.interaction_ablation != 'full_sarm':
-        ablation_suffix += f"-{args.interaction_ablation}"
-    if hasattr(args, 'lambda_cpa') and args.lambda_cpa == 0.0:
-        ablation_suffix += "-no_cpa"
+        ablation_suffix = f"-{args.interaction_ablation}"
     args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}{ablation_suffix}-missing{args.missing_rate_eval_test:.1f}.pth")
     args.res_save_dir = str(res_save_dir)
 
@@ -180,8 +178,6 @@ def DMD_run(
     model_label = model_name
     if hasattr(args, 'interaction_ablation') and args.interaction_ablation:
         model_label = f"{model_name}_{args.interaction_ablation}"
-    if hasattr(args, 'lambda_cpa') and args.lambda_cpa == 0.0:
-        model_label += "_no_cpa"
     res = {
         "Model": model_label,
         "Missing Rate": args.missing_rate_eval_test,
@@ -261,7 +257,6 @@ def parse_args():
         choices=['full_sarm', 'generic', 'consensus_all', 'consensus', 'directional_all', 'directional', 'role_swapped'],
         help='Role-matched interaction ablation variant (Ablation 9)'
     )
-    parser.add_argument('--lambda_cpa', type=float, default=0.1, help='Weight for CPA loss (0.0 means w/o CPA)')
     parser.add_argument(
         '--config_override',
         action='append',
@@ -284,7 +279,6 @@ def main():
             'data_missing': args.data_missing,
             'K_neighbors': args.K_neighbors,
             'interaction_ablation': args.interaction_ablation,
-            'lambda_cpa': args.lambda_cpa,
         }.items()
         if value is not None
     })

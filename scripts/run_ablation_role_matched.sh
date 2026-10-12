@@ -14,7 +14,8 @@ CONFIG_FILE=${2:-"config/dp_mosi_config.json"}
 DATA_DIR=${3:-""}
 GPU_ID=${4:-0}
 
-VARIANTS=("full_sarm" "generic" "consensus_all" "directional_all" "role_swapped")
+# Note: full_sarm (Full model baseline) is NOT re-trained; its existing baseline results are preserved in CSV.
+VARIANTS=("generic" "consensus_all" "directional_all" "role_swapped")
 MISSING_RATES=(0.5 0.8)
 SEEDS=(1111)
 

@@ -22,14 +22,14 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-VARIANTS = ['full_sarm', 'generic', 'consensus_all', 'directional_all', 'role_swapped']
+VARIANTS = ['generic', 'consensus_all', 'directional_all', 'role_swapped']
 
 VARIANT_DESCRIPTIONS = {
-    'full_sarm':        ('Consensus', 'Directional', 'Proposed Full SARM (Role-matched)'),
     'generic':          ('Weighted',  'Weighted',    'Generic Weighted Fusion'),
     'consensus_all':    ('Consensus', 'Consensus',   'Consensus for All'),
     'directional_all':  ('Directional','Directional', 'Directional for All'),
     'role_swapped':     ('Directional','Consensus',   'Role-swapped (Counterfactual)'),
+    'full_sarm':        ('Consensus', 'Directional', 'Proposed Full SARM (Role-matched)'),
 }
 
 
@@ -47,6 +47,22 @@ def df_to_markdown(df):
         return "\n".join(lines)
 
 
+def is_already_completed(csv_file, model_name, mr, seed):
+    """Checks whether a specific run is already recorded in the results CSV."""
+    if not csv_file.is_file():
+        return False
+    try:
+        df = pd.read_csv(csv_file)
+        if 'Model' not in df.columns or 'Missing Rate' not in df.columns:
+            return False
+        sub = df[(df['Model'] == model_name) & (np.isclose(df['Missing Rate'], mr, atol=1e-4))]
+        if 'Seeds' in df.columns and seed is not None:
+            sub = sub[sub['Seeds'].astype(str).str.contains(str(seed))]
+        return not sub.empty
+    except Exception:
+        return False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Role-matched Interaction Ablation")
     parser.add_argument('--dataset', type=str, default='mosi', choices=['mosi', 'mosei', 'sims'], help='Dataset name')
@@ -59,6 +75,9 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers')
     parser.add_argument('--base_save_dir', type=str, default='./ablation_role_matched', help='Base directory for logs and models')
     parser.add_argument('--skip_train', action='store_true', help='Skip training and only generate summary from existing results')
+    parser.add_argument('--skip_full_model', action='store_true', default=True, help='Skip retraining full_sarm and reuse existing baseline results from CSV')
+    parser.add_argument('--run_full_model', action='store_true', default=False, help='Explicitly force training full_sarm')
+    parser.add_argument('--skip_completed', action='store_true', default=True, help='Skip training combinations that already exist in results CSV')
     return parser.parse_args()
 
 
@@ -86,8 +105,13 @@ def generate_summary(csv_file, output_dir, dataset_name, variants, missing_rates
         # Fallback to any Mean column
         target_metrics = [c for c in df.columns if c.endswith('Mean')]
 
+    # Exclude full_sarm from summary table as requested
+    display_variants = [v for v in variants if v != 'full_sarm']
+    if not display_variants:
+        display_variants = list(VARIANTS)
+
     rows = []
-    for var in variants:
+    for var in display_variants:
         model_name = f"dp_{var}"
         shared_role, spec_role, desc = VARIANT_DESCRIPTIONS.get(var, ('-', '-', var))
         
@@ -116,30 +140,8 @@ def generate_summary(csv_file, output_dir, dataset_name, variants, missing_rates
 
     summary_df = pd.DataFrame(rows)
 
-    # Calculate Deltas relative to full_sarm
-    if 'full_sarm' in summary_df['Variant'].values:
-        baseline_idx = summary_df[summary_df['Variant'] == 'full_sarm'].index[0]
-        baseline = summary_df.loc[baseline_idx]
-        delta_rows = []
-        for idx, row in summary_df.iterrows():
-            d_dict = {'Variant': row['Variant'], 'Shared (H)': row['Shared (H)'], 'Specific (P)': row['Specific (P)']}
-            for col in summary_df.columns:
-                if col not in ['Variant', 'Shared (H)', 'Specific (P)']:
-                    val = row[col]
-                    b_val = baseline[col]
-                    if pd.notna(val) and pd.notna(b_val):
-                        diff = val - b_val
-                        sign = "+" if diff > 0 else ""
-                        d_dict[col] = f"{val:.2f} ({sign}{diff:.2f})"
-                    else:
-                        d_dict[col] = "-"
-            delta_rows.append(d_dict)
-        display_df = pd.DataFrame(delta_rows)
-    else:
-        display_df = summary_df
-
     # Print to console as Markdown
-    print(df_to_markdown(display_df))
+    print(df_to_markdown(summary_df))
 
     # Save to CSV and Markdown
     out_csv = Path(output_dir) / f"ablation_9_{dataset_name}_summary.csv"
@@ -147,8 +149,8 @@ def generate_summary(csv_file, output_dir, dataset_name, variants, missing_rates
     summary_df.to_csv(out_csv, index=False)
     with open(out_md, 'w', encoding='utf-8') as f:
         f.write(f"# Ablation 9: Role-matched Interaction Ablation ({dataset_name.upper()})\n\n")
-        f.write(df_to_markdown(display_df))
-        f.write("\n\n*Numbers in parentheses indicate performance gap (delta) relative to Full SARM.*\n")
+        f.write(df_to_markdown(summary_df))
+        f.write("\n")
 
     print("\n" + "=" * 90)
     print(f"Summary table saved to:")
@@ -170,21 +172,28 @@ def main():
 
     csv_file = res_save_dir / "normal" / f"{args.dataset}.csv"
 
+    should_skip_full = args.skip_full_model and not args.run_full_model
+    train_variants = [v for v in args.variants if not (should_skip_full and v == 'full_sarm')]
+
     print("=" * 75)
     print("ROLE-MATCHED INTERACTION ABLATION EXPERIMENT RUNNER (ABLATION 9)")
     print(f"Dataset:       {args.dataset.upper()}")
     print(f"Config:        {args.config_file}")
-    print(f"Variants:      {args.variants}")
+    print(f"Variants:      {train_variants} (Skip full model: {should_skip_full})")
     print(f"Missing Rates: {args.missing_rates} (Moderate p=0.5, Severe p=0.8)")
     print(f"Seeds:         {args.seeds}")
     print(f"Result Dir:    {res_save_dir}")
     print("=" * 75)
 
     if not args.skip_train:
-        for variant in args.variants:
+        for variant in train_variants:
             print(f"\n>>>>>>> RUNNING VARIANT: [{variant.upper()}] <<<<<<<")
             for mr in args.missing_rates:
                 for seed in args.seeds:
+                    if args.skip_completed and is_already_completed(csv_file, f"dp_{variant}", mr, seed):
+                        print(f"\n[Variant: {variant} | Missing Rate: {mr} | Seed: {seed}] -> Already completed in {csv_file}, skipping training.")
+                        continue
+
                     print(f"\n[Variant: {variant} | Missing Rate: {mr} | Seed: {seed}]")
                     
                     cmd = [

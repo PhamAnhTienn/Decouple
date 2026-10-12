@@ -1198,47 +1198,6 @@ class DP(nn.Module):
         loss_cpa /= 6.0  # average over 6 cross-modal pairs
         return loss_cpa
 
-    @torch.no_grad()
-    def evaluate_prototype_metrics(self, output, epsilon=0.05, sinkhorn_iterations=3):
-        """
-        Computes quantitative prototype metrics for Appendix:
-        1. Prototype agreement: fraction of samples where argmax(q_l) == argmax(q_v) == argmax(q_a)
-        2. Pairwise prototype agreement: (L, V), (L, A), (V, A)
-        3. Cluster utilization entropy: H = - sum_k p_k log(p_k + 1e-8) normalized by log(K)
-        """
-        h_c_l = output['h_c_l']  # (B, D)
-        h_c_v = output['h_c_v']
-        h_c_a = output['h_c_a']
-        C = self.prototypes.weight  # (K, D)
-        K = C.shape[0]
-
-        q_l = self.sinkhorn_knopp(h_c_l @ C.t(), epsilon=epsilon, sinkhorn_iterations=sinkhorn_iterations)  # (B, K)
-        q_v = self.sinkhorn_knopp(h_c_v @ C.t(), epsilon=epsilon, sinkhorn_iterations=sinkhorn_iterations)
-        q_a = self.sinkhorn_knopp(h_c_a @ C.t(), epsilon=epsilon, sinkhorn_iterations=sinkhorn_iterations)
-
-        pred_l = q_l.argmax(dim=1)  # (B,)
-        pred_v = q_v.argmax(dim=1)
-        pred_a = q_a.argmax(dim=1)
-
-        agree_lv = (pred_l == pred_v).float().mean().item()
-        agree_la = (pred_l == pred_a).float().mean().item()
-        agree_va = (pred_v == pred_a).float().mean().item()
-        agree_all = ((pred_l == pred_v) & (pred_v == pred_a)).float().mean().item()
-
-        # Cluster entropy / utilization
-        q_mean = (q_l + q_v + q_a).mean(dim=0) / 3.0  # (K,)
-        entropy = -torch.sum(q_mean * torch.log(q_mean.clamp(min=1e-8))).item()
-        norm_entropy = entropy / np.log(K)
-
-        return {
-            'proto_agree_all': agree_all,
-            'proto_agree_lv': agree_lv,
-            'proto_agree_la': agree_la,
-            'proto_agree_va': agree_va,
-            'cluster_entropy': entropy,
-            'cluster_entropy_norm': norm_entropy,
-        }
-
     # def compute_push_loss(self, margin=2.0):
     #     """
     #     Compute L_push: margin-based prototype separation loss.
