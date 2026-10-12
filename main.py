@@ -130,7 +130,9 @@ def DMD_run(
             setattr(args, key, value)
             
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
-    args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
+    reliability_mode = getattr(args, 'reliability_mode', 'full')
+    reliability_tag = f"-rel_{reliability_mode}" if reliability_mode != 'full' else ""
+    args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}{reliability_tag}.pth")
     args.res_save_dir = str(res_save_dir)
 
     # Running results
@@ -173,7 +175,7 @@ def DMD_run(
             df[column] = np.nan
             
     res = {
-        "Model": model_name,
+        "Model": f"{model_name}-rel_{reliability_mode}" if reliability_mode != 'full' else model_name,
         "Missing Rate": args.missing_rate_eval_test,
         "Seeds": str(seeds)
     }

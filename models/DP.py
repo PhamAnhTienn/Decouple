@@ -117,6 +117,18 @@ class DP(nn.Module):
         self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
+        # ── Role-conditioned reliability ablation ──
+        # Controls how r_shared / r_specific scores are routed to the
+        # shared-consensus and specific-exchange modules.
+        # Modes:
+        #   'full'          – default: shared→r^c, specific→r^s  (Full SARM)
+        #   'uniform'       – r^c = r^s = 1 for both modules
+        #   'shared_only'   – both modules use r^c
+        #   'specific_only' – both modules use r^s
+        #   'averaged'      – both modules use (r^c + r^s) / 2
+        #   'swapped'       – shared→r^s, specific→r^c  (role-swapped)
+        self.reliability_mode = getattr(args, 'reliability_mode', 'full')
+
         # Train-set memory bank for KNN neighbor uncertainty
         # Populated by update_train_bank() after each epoch; None until first update.
         # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
@@ -884,6 +896,33 @@ class DP(nn.Module):
         r_shared, r_specific = self._compute_reliability(
             u_consensus, None, u_neighbor, None
         )
+
+        # ── Role-conditioned reliability routing ──
+        # Re-assign r_shared / r_specific based on ablation mode.
+        # After this block, r_shared is fed to shared-consensus,
+        # r_specific is fed to specific-exchange.
+        if self.reliability_mode == 'uniform':
+            # r^c = r^s = 1 → no reliability gating at all
+            ones = {m: torch.ones_like(r_shared[m]) for m in r_shared}
+            r_shared, r_specific = ones, {m: v.clone() for m, v in ones.items()}
+        elif self.reliability_mode == 'shared_only':
+            # Both modules use r^c
+            r_specific = {m: r_shared[m].clone() for m in r_shared}
+        elif self.reliability_mode == 'specific_only':
+            # Both modules use r^s
+            r_shared = {m: r_specific[m].clone() for m in r_specific}
+        elif self.reliability_mode == 'averaged':
+            # Both modules use (r^c + r^s) / 2
+            avg = {m: ((r_shared[m] + r_specific[m]) / 2.0).detach() for m in r_shared}
+            r_shared = avg
+            r_specific = {m: v.clone() for m, v in avg.items()}
+        elif self.reliability_mode == 'swapped':
+            # Role-swapped: shared module gets r^s, specific module gets r^c
+            r_shared, r_specific = (
+                {m: r_specific[m].clone() for m in r_specific},
+                {m: r_shared[m].clone() for m in r_shared},
+            )
+        # elif self.reliability_mode == 'full':  → default, no change needed
 
         # ==============================================================
         # Fine-grained Sentiment Refinement (FSR) (Section 3.4)
