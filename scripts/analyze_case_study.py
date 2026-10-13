@@ -31,6 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import MultipleLocator
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -70,6 +71,8 @@ ACC7_VALUES = {
     0.5: {"sarm": 33.67, "decalign": 27.0,  "dmd": 30.67},
 }
 
+ACL_COL_W = 3.03  # in, \columnwidth
+SHOW_VALUES = False  # số trên thanh ở 5 pt rất nhỏ; bật nếu thật cần
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -409,198 +412,130 @@ def write_summary(results: dict, sample_indices: dict, output_path: Path) -> Non
         writer.writerows(rows)
 
 
-def plot_motivation_figure(results: dict, sample_indices: dict, output_dir: Path) -> None:
-    """2×3 grid — rows = MR conditions, columns = models.
-
-    Each model column uses its own best-case sample.  Row labels
-    (MR = 0.0 / 0.5) appear once on the left.  No suptitle.
-    Bars are grouped by modality (T, V, A) with u_con and u_specific
-    side-by-side within each group.  A soft highlight rectangle marks the
-    Text group when text u_specific spikes at MR=0.5.  Acc-7 is shown as
-    a compact corner label (bold black for SARM, gold for others).
-    """
-    from matplotlib.patches import FancyBboxPatch
+def plot_motivation_figure_1col(results: dict, sample_indices: dict, output_dir: Path,
+                                fig_w: float = ACL_COL_W, fig_h: float = 4.3) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({
         "font.family": "serif",
-        "font.serif": ["Liberation Serif", "DejaVu Serif", "Times New Roman"],
+        "font.serif": ["Times New Roman", "Nimbus Roman", "TeX Gyre Termes",
+                       "Liberation Serif", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "axes.linewidth": 1.1,
-        "xtick.direction": "in",
-        "ytick.direction": "in",
-        "xtick.major.size": 4.5,
-        "ytick.major.size": 4.5,
-        "xtick.major.width": 1.0,
-        "ytick.major.width": 1.0,
-        "font.size": 9.5,
-        "axes.labelsize": 11.0,
-        "axes.titlesize": 12.0,
-        "xtick.labelsize": 9.5,
-        "ytick.labelsize": 9.0,
-        "legend.fontsize": 11.0,
+        "axes.linewidth": 0.6,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.major.size": 2.0, "ytick.major.size": 2.0,
+        "xtick.major.width": 0.5, "ytick.major.width": 0.5,
+        "font.size": 6.5,
+        "xtick.labelsize": 6.5,
+        "ytick.labelsize": 6.5,
+        "axes.titlesize": 8,
+        "legend.fontsize": 7,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
     })
 
-    # -- Colour & hatch definitions --
-    COLOR_CON = "#F28E2B"       # orange  (u_con)
-    COLOR_SPEC = "#4E79A7"      # steel-blue  (u_specific)
-    EDGE_CON = "#D07520"
-    EDGE_SPEC = "#3A6186"
-    HIGHLIGHT_COLOR = "#FFEFD5"  # soft peach for text-spike highlight
-    HIGHLIGHT_EDGE = "#FFDAB9"
-
+    # -- Colours (unchanged) --
+    COLOR_CON, COLOR_SPEC = "#F28E2B", "#4E79A7"
+    EDGE_CON, EDGE_SPEC = "#D07520", "#3A6186"
+    HIGHLIGHT_COLOR, HIGHLIGHT_EDGE = "#FFEFD5", "#FFDAB9"
     MOD_LABELS_MAP = {"l": "T", "v": "V", "a": "A"}
-    MOD_HATCHES = {"l": "///", "v": "\\\\", "a": "xx"}
+    MRS = (0.0, 0.5)
 
-    # -- Grouped bar positions --
-    # 3 modality groups, each with 2 bars (u_con, u_specific).
-    # Within a group the two bars sit side-by-side; between groups a gap.
-    bar_w = 0.35
-    group_gap = 0.45  # extra space between modality groups
-    group_centres = []  # centre x of each modality group
-    bar_positions = []  # (x_con, x_spec) per modality
-    x_cursor = 0.0
-    for _i, _m in enumerate(MODALITIES):
-        x_con = x_cursor
-        x_spec = x_cursor + bar_w
-        bar_positions.append((x_con, x_spec))
-        group_centres.append((x_con + x_spec) / 2)
-        x_cursor = x_spec + bar_w + group_gap
+    # -- x layout: 2 MR blocks, each with 3 modality groups of 2 bars --
+    bar_w, group_gap, block_gap = 0.38, 0.30, 0.90
+    pos = {}            # (mr, modality) -> (x_con, x_spec)
+    group_centre = {}   # (mr, modality) -> x
+    block_centre = {}   # mr -> x
+    block_edges = {}    # mr -> (left, right)
+    x = 0.0
+    for mr in MRS:
+        left = x - bar_w / 2
+        for m in MODALITIES:
+            pos[(mr, m)] = (x, x + bar_w)
+            group_centre[(mr, m)] = x + bar_w / 2
+            x += 2 * bar_w + group_gap
+        right = x - group_gap - bar_w / 2
+        block_edges[mr] = (left, right)
+        block_centre[mr] = (left + right) / 2
+        x += block_gap - group_gap
+    x_lo, x_hi = block_edges[0.0][0] - 0.15, block_edges[0.5][1] + 0.15
+    divider_x = (block_edges[0.0][1] + block_edges[0.5][0]) / 2
 
-    fig, axes_grid = plt.subplots(
-        2, len(MODEL_ORDER), figsize=(12.0, 5.8), sharey=True,
-    )
+    fig, axes = plt.subplots(len(MODEL_ORDER), 1, figsize=(fig_w, fig_h),
+                             sharey=True, layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.03, h_pad=0.03, hspace=0.06)
 
-    # Collect global y-max for consistent scale (first pass)
     global_ymax = 0.0
-
-    MR_LABELS = {0.0: "MR = 0.0", 0.5: "MR = 0.5"}
-
-    # Pre-compute text u_spec at MR=0.0 for highlight detection
-    text_spec_mr0 = {}
-    for model_key in MODEL_ORDER:
+    for ax, model_key in zip(axes, MODEL_ORDER):
         si = sample_indices[model_key]
-        text_spec_mr0[model_key] = results[0.0][model_key]["u_specific"]["l"][si].item()
+        text_spec_mr0 = results[0.0][model_key]["u_specific"]["l"][si].item()
 
-    for col, model_key in enumerate(MODEL_ORDER):
-        si = sample_indices[model_key]
-
-        for row, missing_rate in enumerate((0.0, 0.5)):
-            ax = axes_grid[row, col]
-            data = results[missing_rate][model_key]
-
-            all_vals = []
-            for mi, m in enumerate(MODALITIES):
-                tag = MOD_LABELS_MAP[m]
-                hatch = MOD_HATCHES[m]
+        for mr in MRS:
+            data = results[mr][model_key]
+            for m in MODALITIES:
                 u_con_val = data["u_con"][m][si].item()
                 u_spec_val = data["u_specific"][m][si].item()
-                x_con, x_spec = bar_positions[mi]
+                x_con, x_spec = pos[(mr, m)]
 
-                bar_con = ax.bar(x_con, u_con_val, bar_w, color=COLOR_CON,
-                                 edgecolor=EDGE_CON, linewidth=0.7, zorder=3,
-                                 hatch=hatch)
-                bar_spec = ax.bar(x_spec, u_spec_val, bar_w, color=COLOR_SPEC,
-                                  edgecolor=EDGE_SPEC, linewidth=0.7, zorder=3,
-                                  hatch=hatch)
+                if m == "l" and mr == 0.5 and u_spec_val - text_spec_mr0 > 0.05:
+                    ax.axvspan(x_con - bar_w / 2 - 0.08, x_spec + bar_w / 2 + 0.08,
+                               facecolor=HIGHLIGHT_COLOR, edgecolor=HIGHLIGHT_EDGE,
+                               linewidth=0.5, alpha=0.55, zorder=1)
 
-                # Value annotations
-                for bar_obj, val, edge_c in [(bar_con[0], u_con_val, EDGE_CON),
-                                              (bar_spec[0], u_spec_val, EDGE_SPEC)]:
-                    ax.text(bar_obj.get_x() + bar_obj.get_width() / 2,
-                            val + 0.015, f"{val:.2f}",
-                            ha="center", va="bottom", fontsize=7.5,
-                            color=edge_c, fontweight="bold")
+                for xx, val, fc, ec in ((x_con, u_con_val, COLOR_CON, EDGE_CON),
+                                        (x_spec, u_spec_val, COLOR_SPEC, EDGE_SPEC)):
+                    ax.bar(xx, val, bar_w, color=fc, edgecolor=ec, linewidth=0.5, zorder=3)
+                    if SHOW_VALUES:
+                        ax.text(xx, val + 0.015, f"{val:.2f}".lstrip("0"),
+                                ha="center", va="bottom", fontsize=5, color="#333333")
+                global_ymax = max(global_ymax, u_con_val, u_spec_val)
 
-                all_vals.extend([u_con_val, u_spec_val])
+            # block label + Acc-7 (above each block)
+            acc7 = ACC7_VALUES[mr][model_key]
+            acc_color, acc_bg = (("#000000", "#F5F5DC") if model_key == "sarm"
+                                 else ("#6B4C00", "#FFFDE7"))
+            ax.text(block_centre[mr], 0.97,
+                    rf"MR = {mr:.1f}" "\n" rf"$\star$ Acc-7 = {acc7:.1f}%",
+                    transform=ax.get_xaxis_transform(), ha="center", va="top",
+                    fontsize=6.5, fontweight="bold", color=acc_color, linespacing=1.25,
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor=acc_bg,
+                              edgecolor=acc_color, alpha=0.85, linewidth=0.5),
+                    zorder=5)
 
-                # -- Highlight rectangle for Text modality spike --
-                if m == "l" and missing_rate == 0.5:
-                    t_spec_now = u_spec_val
-                    t_spec_before = text_spec_mr0[model_key]
-                    jump = t_spec_now - t_spec_before
-                    if jump > 0.05:  # meaningful spike threshold
-                        rect_x = x_con - bar_w * 0.35
-                        rect_w = (x_spec + bar_w) - x_con + bar_w * 0.7 - bar_w
-                        rect_h = max(u_con_val, u_spec_val) + 0.08
-                        highlight = FancyBboxPatch(
-                            (rect_x, 0), rect_w, rect_h,
-                            boxstyle="round,pad=0.04",
-                            facecolor=HIGHLIGHT_COLOR, edgecolor=HIGHLIGHT_EDGE,
-                            linewidth=1.0, alpha=0.55, zorder=1,
-                        )
-                        ax.add_patch(highlight)
+        ax.axvline(divider_x, color="#BBBBBB", linewidth=0.5, linestyle=(0, (3, 2)), zorder=2)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_xticks([group_centre[(mr, m)] for mr in MRS for m in MODALITIES])
+        ax.set_xticklabels([MOD_LABELS_MAP[m] for _ in MRS for m in MODALITIES],
+                           fontweight="bold")
+        ax.tick_params(axis="x", length=0, pad=2)
+        ax.yaxis.set_major_locator(MultipleLocator(0.5))
+        ax.grid(axis="y", color="#D9D9D9", linewidth=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_title(MODEL_SPECS[model_key]["display_name"], fontweight="bold",
+                     loc="left", pad=2)
 
-            # -- Acc-7 label (compact, upper-right corner) --
-            acc7 = ACC7_VALUES[missing_rate][model_key]
-            if model_key == "sarm":
-                acc_color = "#000000"
-                acc_bg = "#F5F5DC"
-            else:
-                acc_color = "#6B4C00"
-                acc_bg = "#FFFDE7"
-            ax.text(
-                0.97, 0.95,
-                f"★ Acc7 = {acc7:.1f}%",
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=9.0, fontweight="bold", color=acc_color,
-                bbox=dict(boxstyle="round,pad=0.25", facecolor=acc_bg,
-                          edgecolor=acc_color, alpha=0.85, linewidth=0.8),
-            )
+    # headroom cho hộp MR/Acc-7 (chiếm ~35% chiều cao trục)
+    y_top = max(1.0, math.ceil(global_ymax / 0.62 * 10) / 10)
+    for ax in axes:
+        ax.set_ylim(0, y_top)
 
-            # -- X-axis --
-            ax.set_xticks(group_centres)
-            ax.set_xticklabels(
-                [MOD_LABELS_MAP[m] for m in MODALITIES], fontsize=9.5,
-                fontweight="bold",
-            )
-            ax.grid(axis="y", color="#D9D9D9", linewidth=0.45, zorder=0)
-            ax.set_axisbelow(True)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
+    fig.supylabel("Uncertainty score", fontsize=7.5)
 
-            global_ymax = max(global_ymax, max(all_vals))
-
-            # Column title: model name (only on top row)
-            if row == 0:
-                ax.set_title(
-                    MODEL_SPECS[model_key]["display_name"],
-                    fontweight="bold", fontsize=13,
-                )
-
-            # Row label on leftmost column
-            if col == 0:
-                ax.set_ylabel(
-                    f"{MR_LABELS[missing_rate]}\nUncertainty score",
-                    fontsize=11, fontweight="bold",
-                )
-
-    # -- Global y-limits --
-    y_top = max(1.0, math.ceil((global_ymax + 0.15) * 4) / 4)
-    for ax_row in axes_grid:
-        for ax in ax_row:
-            ax.set_ylim(0, y_top)
-
-    # -- Legend --
     legend_handles = [
-        Patch(facecolor=COLOR_CON, edgecolor=EDGE_CON, label=r"$u^{con}$"),
-        Patch(facecolor=COLOR_SPEC, edgecolor=EDGE_SPEC, label=r"$u^{specific}$"),
-        Patch(facecolor="#E0E0E0", edgecolor="#999999", hatch="///", label="Text (T)"),
-        Patch(facecolor="#E0E0E0", edgecolor="#999999", hatch="\\\\", label="Video (V)"),
-        Patch(facecolor="#E0E0E0", edgecolor="#999999", hatch="xx", label="Audio (A)"),
-        Patch(facecolor=HIGHLIGHT_COLOR, edgecolor=HIGHLIGHT_EDGE,
-              linewidth=1.0, alpha=0.55, label="Text spike"),
+        Patch(facecolor=COLOR_CON, edgecolor=EDGE_CON, linewidth=0.5,
+              label=r"$u^{\mathrm{con}}$"),
+        Patch(facecolor=COLOR_SPEC, edgecolor=EDGE_SPEC, linewidth=0.5,
+              label=r"$u^{\mathrm{specific}}$"),
+        Patch(facecolor=HIGHLIGHT_COLOR, edgecolor=HIGHLIGHT_EDGE, linewidth=0.5,
+              alpha=0.55, label="Text spike"),
     ]
-    fig.legend(
-        handles=legend_handles, loc="lower center", ncol=6, frameon=True,
-        bbox_to_anchor=(0.5, -0.005), handlelength=1.6, columnspacing=1.0,
-        framealpha=0.92, edgecolor="#CCCCCC", fontsize=11,
-    )
-    plt.tight_layout(rect=[0, 0.06, 1, 1.0])
+    fig.legend(handles=legend_handles, loc="outside lower center", ncol=3,
+               frameon=False, handlelength=1.3, columnspacing=1.4, handletextpad=0.5)
+
     for suffix in ("pdf", "png"):
-        fig.savefig(output_dir / f"mosi_shared_specific_case_study.{suffix}",
-                    dpi=400, facecolor="white", bbox_inches="tight", pad_inches=0.03)
+        fig.savefig(output_dir / f"mosi_shared_specific_case_study_1col.{suffix}",
+                    dpi=400, facecolor="white")  # không dùng bbox_inches="tight"
     plt.close(fig)
 
 
@@ -637,7 +572,7 @@ def main() -> None:
     results = load_or_infer_all(args, device)
     sample_indices = select_case(results)
     args.fig_dir.mkdir(parents=True, exist_ok=True)
-    plot_motivation_figure(results, sample_indices, args.fig_dir)
+    plot_motivation_figure_1col(results, sample_indices, args.fig_dir)
     summary_path = args.fig_dir / "mosi_shared_specific_case_study.csv"
     write_summary(results, sample_indices, summary_path)
     print_summary(results, sample_indices)
