@@ -13,22 +13,32 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+from matplotlib.ticker import MaxNLocator, FormatStrFormatter
 
-# =========================================================================
-# 0. Publication-quality RC params
-# =========================================================================
+ACL_COL_W = 3.03   # inch, 1 cột ACL
+
 plt.rcParams.update({
     'font.family': 'serif',
-    'font.serif': ['Liberation Serif', 'DejaVu Serif', 'Times New Roman'],
+    'font.serif': ['Times New Roman', 'Liberation Serif', 'Nimbus Roman', 'DejaVu Serif'],
     'mathtext.fontset': 'stix',
-    'axes.linewidth': 1.1,
+    'pdf.fonttype': 42,            # tránh Type 3
+    'ps.fonttype': 42,
+    'font.size': 7,
+    'axes.labelsize': 8,
+    'xtick.labelsize': 6.5,
+    'ytick.labelsize': 6.5,
+    'legend.fontsize': 7,
+    'axes.linewidth': 0.7,
     'xtick.direction': 'in',
     'ytick.direction': 'in',
-    'xtick.major.size': 4.5,
-    'ytick.major.size': 4.5,
-    'xtick.major.width': 1.0,
-    'ytick.major.width': 1.0,
+    'xtick.major.size': 2.5,
+    'ytick.major.size': 2.5,
+    'xtick.major.width': 0.6,
+    'ytick.major.width': 0.6,
+    'xtick.major.pad': 2,
+    'ytick.major.pad': 2,
+    'lines.linewidth': 1.4,
+    'lines.markersize': 4.5,
 })
 
 # =========================================================================
@@ -114,6 +124,7 @@ for sw in sweeps:
     sweep_data.append({
         'label': sw['label'],
         'values': sw['values'],
+        'default': sw['default'],      # <-- thêm dòng này
         'f1': f1_list,
         'mae': mae_list,
     })
@@ -136,67 +147,64 @@ COLOR_MAE = '#4E79A7'   # Steel-blue (SARM accent)
 # =========================================================================
 # 4. Plot
 # =========================================================================
-fig, axes = plt.subplots(2, 2, figsize=(9.0, 6.6), dpi=300)
+fig, axes = plt.subplots(2, 2, figsize=(ACL_COL_W, 2.5), layout='constrained')
+fig.get_layout_engine().set(
+    w_pad=0.01,
+    h_pad=0.01,
+    wspace=0.05,
+    hspace=0.05
+)
 axes = axes.flatten()
 
-for idx, (ax, sd) in enumerate(zip(axes, sweep_data)):
-    x_vals = sd['values']
-    x_labels = [str(v) for v in x_vals]
-    x_pos = np.arange(len(x_vals))
+# Span chung cho mọi panel -> độ dốc so sánh được giữa các panel
+F1_SPAN  = max(max(np.ptp(sd['f1']) for sd in sweep_data) * 1.8, 3.0)
+MAE_SPAN = max(max(np.ptp(sd['mae']) for sd in sweep_data) / 100.0 * 1.8, 0.03)
 
-    # ---- F1 (left y-axis) ----
-    ax.set_xlabel(sd['label'], fontsize=16, labelpad=6)
-    ln1 = ax.plot(
-        x_pos, sd['f1'],
-        color=COLOR_F1, marker='o', linewidth=2.4, markersize=8,
-        markeredgecolor='white', markeredgewidth=1.3,
-        label='F1', zorder=5,
-    )
-    ax.tick_params(axis='y', labelcolor='black', labelsize=13)
-    ax.tick_params(axis='x', labelsize=13)
+handles = None
+for ax, sd in zip(axes, sweep_data):
+    n = len(sd['values'])
+    x_pos = np.arange(n)
+    d_idx = sd['values'].index(sd['default'])
+
+    # default marker line
+    ax.axvline(d_idx, color='0.7', linestyle='--', linewidth=0.7, zorder=1)
+
+    # ---- F1 (left) ----
+    ln1 = ax.plot(x_pos, sd['f1'], color=COLOR_F1, marker='o',
+                  markeredgecolor='white', markeredgewidth=0.6,
+                  label='F1', zorder=5)
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(x_labels)
+    ax.set_xticklabels([str(v) for v in sd['values']])
+    ax.set_xlim(-0.3, n - 1 + 0.3)
+    ax.set_xlabel(sd['label'], labelpad=2)
 
-    f1_arr = np.array(sd['f1'])
-    f1_min, f1_max = f1_arr.min(), f1_arr.max()
-    pad = max((f1_max - f1_min) * 0.6, 2.5)
-    ax.set_ylim(f1_min - pad, f1_max + pad)
-
-    # ---- MAE (right y-axis, inverted so lower=better appears higher) ----
-    ax2 = ax.twinx()
-    mae_display = [m / 100.0 for m in sd['mae']]
-    ln2 = ax2.plot(
-        x_pos, mae_display,
-        color=COLOR_MAE, marker='D', linewidth=2.4, markersize=7,
-        markeredgecolor='white', markeredgewidth=1.3,
-        label='MAE', zorder=4, linestyle='-',
-    )
-    ax2.tick_params(axis='y', labelcolor='black', labelsize=13)
-
-    mae_arr = np.array(mae_display)
-    mae_min, mae_max = mae_arr.min(), mae_arr.max()
-    mae_pad = max((mae_max - mae_min) * 0.6, 0.02)
-    ax2.set_ylim(mae_min - mae_pad, mae_max + mae_pad)
-    ax2.invert_yaxis()
-
-    # ---- "F1" top-left, "MAE" top-right — above the axes frame ----
-    ax.text(0.02, 1.02, 'F1', transform=ax.transAxes,
-            ha='left', va='bottom', fontsize=15, color='black')
-    ax2.text(0.98, 1.02, 'MAE', transform=ax2.transAxes,
-             ha='right', va='bottom', fontsize=15, color='black')
-
-    # ---- Legend ----
-    lns = ln1 + ln2
-    labs = [l.get_label() for l in lns]
-    ax.legend(lns, labs, loc='upper right', frameon=True, fontsize=12,
-              framealpha=0.92, edgecolor='#CCCCCC',
-              borderpad=0.5, labelspacing=0.3, handlelength=1.6)
-
-    ax.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.4)
+    mid = (max(sd['f1']) + min(sd['f1'])) / 2
+    ax.set_ylim(mid - F1_SPAN / 2, mid + F1_SPAN / 2)
+    ax.yaxis.set_major_locator(MaxNLocator(4))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+    ax.grid(axis='y', linestyle=':', linewidth=0.4, alpha=0.5)
     ax.set_axisbelow(True)
+    ax.set_title('F1', loc='left', fontsize=7, pad=2)
 
-plt.tight_layout(w_pad=1.5, h_pad=2.0)
-fig.subplots_adjust(bottom=0.09, top=0.94)
+    # ---- MAE (right, inverted) ----
+    ax2 = ax.twinx()
+    mae = [m / 100.0 for m in sd['mae']]
+    ln2 = ax2.plot(x_pos, mae, color=COLOR_MAE, marker='D', markersize=4,
+                   markeredgecolor='white', markeredgewidth=0.6,
+                   label='MAE', zorder=4)
+    mid2 = (max(mae) + min(mae)) / 2
+    ax2.set_ylim(mid2 + MAE_SPAN / 2, mid2 - MAE_SPAN / 2)   # inverted
+    ax2.yaxis.set_major_locator(MaxNLocator(4))
+    ax2.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    ax2.set_title('MAE', loc='right', fontsize=7, pad=2)
+
+    if handles is None:
+        handles = ln1 + ln2
+
+# ---- 1 legend chung ----
+fig.legend(handles, [h.get_label() for h in handles],
+           loc='outside upper center', ncol=2, frameon=False,
+           handlelength=1.8, columnspacing=1.5)
 
 # =========================================================================
 # 5. Save
@@ -204,8 +212,6 @@ fig.subplots_adjust(bottom=0.09, top=0.94)
 out_dir = os.path.dirname(__file__)
 png_path = os.path.join(out_dir, 'hp_sensitivity_mosi.png')
 pdf_path = os.path.join(out_dir, 'hp_sensitivity_mosi.pdf')
-plt.savefig(png_path, dpi=300, bbox_inches='tight')
-plt.savefig(pdf_path, bbox_inches='tight')
-plt.close()
-print(f'\nSaved: {png_path}')
-print(f'Saved: {pdf_path}')
+fig.savefig(pdf_path)
+fig.savefig(png_path, dpi=600)
+plt.close(fig)
