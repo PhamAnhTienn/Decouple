@@ -1,6 +1,6 @@
 """
 Tính trung bình các metrics từ Missing Rate 0.0 đến 0.9 cho từng model
-trong file report_grouped.csv
+trong file mosei.csv
 """
 
 import pandas as pd
@@ -8,8 +8,8 @@ import os
 
 # Đường dẫn file
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_FILE = os.path.join(BASE_DIR, "report_grouped.csv")
-OUTPUT_FILE = os.path.join(BASE_DIR, "report_avg.csv")
+INPUT_FILE = os.path.join(BASE_DIR, "mosei.csv")
+OUTPUT_FILE = os.path.join(BASE_DIR, "report_avg_mosei.csv")
 
 # Đọc dữ liệu
 df = pd.read_csv(INPUT_FILE)
@@ -34,8 +34,21 @@ avg_df = (
 
 avg_df.insert(1, "Missing Rate", "0.0 - 0.9 (avg)")
 
-# Lưu kết quả
-avg_df.to_csv(OUTPUT_FILE, index=False)
+# Lưu kết quả: tránh trùng lặp nếu file đã tồn tại
+if os.path.exists(OUTPUT_FILE):
+    existing_df = pd.read_csv(OUTPUT_FILE)
+    existing_models = set(existing_df["Model"].tolist())
 
-print(f"Đã lưu kết quả vào: {OUTPUT_FILE}\n")
-print(avg_df.to_string(index=False))
+    new_rows = avg_df[~avg_df["Model"].isin(existing_models)]
+
+    if new_rows.empty:
+        print("Tất cả model đã tồn tại trong file output, không có gì để thêm.")
+    else:
+        combined_df = pd.concat([existing_df, new_rows], ignore_index=True)
+        combined_df.to_csv(OUTPUT_FILE, index=False)
+        print(f"Đã thêm {len(new_rows)} model mới vào: {OUTPUT_FILE}")
+        print(new_rows.to_string(index=False))
+else:
+    avg_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Đã lưu kết quả vào: {OUTPUT_FILE}\n")
+    print(avg_df.to_string(index=False))

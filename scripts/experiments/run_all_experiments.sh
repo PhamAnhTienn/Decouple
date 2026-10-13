@@ -28,7 +28,7 @@ python scripts/experiments/exp04_reliability_validity.py \
     --dataset $DATASET \
     --data_dir $DATA_DIR \
     --checkpoint_dir $CKPT_DIR \
-    --missing_rates 0.0 0.2 0.5 0.7 \
+    --missing_rates 0.0 0.3 0.5 0.7 \
     --gpu_ids $GPU \
     --num_workers $WORKERS \
     --seed $SEED
@@ -67,22 +67,22 @@ python scripts/experiments/exp12_nonredundancy.py \
     --dataset $DATASET \
     --data_dir $DATA_DIR \
     --checkpoint_dir $CKPT_DIR \
-    --missing_rates 0.0 0.2 0.5 0.7 \
+    --missing_rates 0.0 0.3 0.5 0.7 \
     --gpu_ids $GPU \
     --num_workers $WORKERS \
     --seed $SEED
 
-# ── Exp 14: Efficiency & Reproducibility ──
-echo ""
-echo ">>> Exp 14: Efficiency"
-python scripts/experiments/exp14_efficiency.py \
-    --dataset $DATASET \
-    --data_dir $DATA_DIR \
-    --checkpoint_dir $CKPT_DIR \
-    --missing_rate 0.0 \
-    --gpu_ids $GPU \
-    --num_workers $WORKERS \
-    --seed $SEED
+# # ── Exp 14: Efficiency & Reproducibility ──
+# echo ""
+# echo ">>> Exp 14: Efficiency"
+# python scripts/experiments/exp14_efficiency.py \
+#     --dataset $DATASET \
+#     --data_dir $DATA_DIR \
+#     --checkpoint_dir $CKPT_DIR \
+#     --missing_rate 0.0 \
+#     --gpu_ids $GPU \
+#     --num_workers $WORKERS \
+#     --seed $SEED
 
 echo ""
 echo "========================================"

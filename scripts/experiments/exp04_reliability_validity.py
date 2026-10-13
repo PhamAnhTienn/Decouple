@@ -73,9 +73,7 @@ def collect_paired_representations(model, dataloader, device):
         **{f"z_s_{m}_comp": [] for m in MODALITIES},
         # reliability & uncertainty (from corrupted pass)
         **{f"r_shared_{m}": [] for m in MODALITIES},
-        **{f"r_specific_{m}": [] for m in MODALITIES},
-        **{f"u_shared_{m}": [] for m in MODALITIES},
-        **{f"u_specific_{m}": [] for m in MODALITIES},
+        **{f"r_specific_{m}": [] for m in MODALITIES}
     }
     labels_list = []
 
@@ -290,7 +288,7 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoint",
                         help="Directory containing dp-{dataset}-missing{rate}.pth checkpoints")
     parser.add_argument("--missing_rates", type=float, nargs="+",
-                        default=[0.0, 0.2, 0.5, 0.7],
+                        default=[0.0, 0.3, 0.5, 0.7],
                         help="Missing rates to evaluate")
     parser.add_argument("--save_dir", type=str, default="./result/experiments/exp04")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=[0])

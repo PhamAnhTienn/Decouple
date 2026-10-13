@@ -3,185 +3,162 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
-# 1. Load data
+# 1. Load data from per-dataset CSVs
 # ---------------------------------------------------------------------------
-input_path = 'result/normal/report.csv'
-df = pd.read_csv(input_path)
-df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
+mosi_df = pd.read_csv('result/normal/mosi.csv')
+mosei_df = pd.read_csv('result/normal/mosei.csv')
 
-metrics = ['Acc_2', 'F1_score', 'MAE', 'Corr', 'Acc_7', 'Loss']
-
-# ---------------------------------------------------------------------------
-# 2. Aggregation Logic
-# ---------------------------------------------------------------------------
-# Models in logical order (Proposed method DecAlign first, then baselines)
-desired_model_order = ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']
-# Ensure all models present in df are included
-all_models = [m for m in desired_model_order if m in df['Model'].unique()]
-for m in df['Model'].unique():
-    if m not in all_models:
-        all_models.append(m)
-
-grouped_rows = []
-
-for m in all_models:
-    sub = df[df['Model'] == m]
-    mrs = sorted(sub['Missing Rate'].unique())
-    for mr in mrs:
-        group = sub[sub['Missing Rate'] == mr]
-        # Check if already has a row with std > 0 (e.g. pre-calculated baseline summary)
-        ready = group[group['Acc_2 Std'].notna() & (group['Acc_2 Std'] > 0)]
-        
-        if len(ready) > 0:
-            r = ready.iloc[0]
-            row_dict = {
-                'Model': m,
-                'Missing Rate': mr,
-                'Seed': 'reported' if pd.isna(r['Seed']) else str(r['Seed'])
-            }
-            for met in metrics:
-                row_dict[f'{met} Mean'] = round(float(r[f'{met} Mean']), 2)
-                row_dict[f'{met} Std'] = round(float(r[f'{met} Std']), 2)
-            grouped_rows.append(row_dict)
-        else:
-            seeds = group['Seed'].dropna().tolist()
-            seed_str = f'{len(group)} seeds'
-            row_dict = {
-                'Model': m,
-                'Missing Rate': mr,
-                'Seed': seed_str
-            }
-            for met in metrics:
-                vals = group[f'{met} Mean'].dropna()
-                mean_val = vals.mean()
-                std_val = vals.std(ddof=1) if len(vals) > 1 else 0.0
-                row_dict[f'{met} Mean'] = round(float(mean_val), 2)
-                row_dict[f'{met} Std'] = round(float(std_val), 2)
-            grouped_rows.append(row_dict)
-
-res_df = pd.DataFrame(grouped_rows)
-output_csv = 'result/normal/report_grouped.csv'
-res_df.to_csv(output_csv, index=False)
-print(f'Successfully saved aggregated CSV to {output_csv}')
+# Normalize model names
+for df in [mosi_df, mosei_df]:
+    df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
 
 # ---------------------------------------------------------------------------
-# 3. Publication-Quality Plotting Configuration
+# 2. Model order and color palette (unchanged from original)
 # ---------------------------------------------------------------------------
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Liberation Serif', 'DejaVu Serif', 'Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'stix'
-plt.rcParams['axes.linewidth'] = 1.1
-plt.rcParams['xtick.direction'] = 'in'
-plt.rcParams['ytick.direction'] = 'in'
-plt.rcParams['xtick.major.size'] = 4.5
-plt.rcParams['ytick.major.size'] = 4.5
-plt.rcParams['xtick.major.width'] = 1.0
-plt.rcParams['ytick.major.width'] = 1.0
+# ---------------------------------------------------------------------------
+# Model order and color palette
+# SARM uses the dark blue #4e79a7
+# ---------------------------------------------------------------------------
+desired_model_order = [
+    'decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp'
+]
 
-# ---------------------------------------------------------------------------
-# Color Palette: Full Okabe-Ito (Color Universal Design)
-# 7 maximally distinct hues — safe for all types of color-blindness.
-# Ordered by perceptual salience (high → low) so the proposed method
-# stands out clearly against baselines.
-#
-#  Index │ Model     │ Hex       │ Character
-#  ──────┼───────────┼───────────┼──────────────────────────────────────
-#    1   │ DecAlign  │ #0072B2   │ Strong blue  — highest salience (proposed)
-#    2   │ LNLN      │ #D55E00   │ Vermilion    — warm, clearly distinct from blue
-#    3   │ DMD       │ #009E73   │ Bluish-green — cool, far from red & blue in hue
-#    4   │ DAR       │ #E69F00   │ Amber/gold   — warm-yellow, distinct from all above
-#    5   │ MISA      │ #CC79A7   │ Rose-purple  — unique pink hue
-#    6   │ TFR-Net   │ #56B4E9   │ Sky-blue     — lighter, separated from dark blue
-#    7   │ DP        │ #F0E442   │ Yellow       — brightest, stands out on white bg
-# ---------------------------------------------------------------------------
 style_map = {
-    'decalign': {'label': 'DecAlign', 'color': '#0072B2', 'zorder': 10},
-    'lnln':     {'label': 'LNLN',     'color': '#D55E00', 'zorder': 9},
-    'dmd':      {'label': 'DMD',      'color': '#009E73', 'zorder': 8},
-    'dar':      {'label': 'DAR',      'color': '#E69F00', 'zorder': 7},
-    'misa':     {'label': 'MISA',     'color': '#CC79A7', 'zorder': 6},
-    'tfr-net':  {'label': 'TFR-Net',  'color': '#56B4E9', 'zorder': 5},
-    'dp':       {'label': 'DP',       'color': '#9467BD', 'zorder': 4},
+    'decalign': {'label': 'DecAlign', 'color': '#f28e2b', 'zorder': 10},
+    'dmd':      {'label': 'DMD',      'color': '#e15759', 'zorder': 8},
+    'lnln':     {'label': 'LNLN',     'color': '#59a14f', 'zorder': 9},
+    'tfr-net':  {'label': 'TFR-Net',  'color': '#76b7b2', 'zorder': 5},
+    'misa':     {'label': 'MISA',     'color': '#b07aa1', 'zorder': 6},
+    'dar':      {'label': 'DAR',      'color': '#ababab', 'zorder': 7},
+    'dp':       {'label': 'SARM',     'color': '#4e79a7', 'zorder': 11},
 }
-style_map['tfr_net'] = style_map['tfr-net']
 
-def create_plot():
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.5), dpi=300)
+# ---------------------------------------------------------------------------
+# 3. Aggregate: mean across seeds per (Model, Missing Rate)
+# ---------------------------------------------------------------------------
+def aggregate_data(df):
+    """Group by Model and Missing Rate, compute mean of '*_Mean' columns."""
+    all_models = [m for m in desired_model_order if m in df['Model'].unique()]
+    for m in df['Model'].unique():
+        if m not in all_models:
+            all_models.append(m)
 
+    rows = []
     for m in all_models:
-        sub = res_df[res_df['Model'] == m].sort_values('Missing Rate')
-        style = style_map[m]
+        sub = df[df['Model'] == m]
+        for mr in sorted(sub['Missing Rate'].unique()):
+            group = sub[sub['Missing Rate'] == mr]
+            row = {'Model': m, 'Missing Rate': mr}
+            for met in ['F1_score', 'MAE']:
+                vals = group[f'{met} Mean'].dropna()
+                row[f'{met} Mean'] = vals.mean()
+            rows.append(row)
+    return pd.DataFrame(rows), all_models
 
-        # Subplot 1: F1 Score
-        ax1.plot(
-            sub['Missing Rate'], sub['F1_score Mean'],
-            label=style['label'],
-            color=style['color'],
-            marker='o',
-            linestyle='-',
-            linewidth=2.5,
-            markersize=8,
-            markeredgecolor=style['color'],
-            markeredgewidth=1.2,
-            zorder=style['zorder']
-        )
 
-        # Subplot 2: MAE (divided by 100 to get standard scale)
-        ax2.plot(
-            sub['Missing Rate'], sub['MAE Mean'] / 100.0,
-            label=style['label'],
-            color=style['color'],
-            marker='o',
-            linestyle='-',
-            linewidth=2.5,
-            markersize=8,
-            markeredgecolor=style['color'],
-            markeredgewidth=1.2,
-            zorder=style['zorder']
-        )
+mosi_agg, mosi_models = aggregate_data(mosi_df)
+mosei_agg, mosei_models = aggregate_data(mosei_df)
 
-    # --- Subplot 1 (a) — F1 Score ---
-    ax1.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
-    ax1.set_ylabel('F1', fontsize=14, labelpad=8, fontweight='bold')
-    ax1.set_xlim(-0.05, 1.02)
-    ax1.set_ylim(32, 88)
-    ax1.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
-    ax1.set_yticks([40, 50, 60, 70, 80])
-    ax1.tick_params(labelsize=12)
-    ax1.grid(False)
-    ax1.legend(
-        loc='upper right', frameon=True, fontsize=9.5,
-        framealpha=0.95, edgecolor='#CCCCCC',
-        borderpad=0.5, labelspacing=0.35, handlelength=1.8
-    )
-    ax1.text(0.5, -0.22, '(a)', transform=ax1.transAxes, ha='center', va='top', fontsize=14, fontweight='bold')
+# ---------------------------------------------------------------------------
+# 4. ACL single-column configuration
+#    ACL \columnwidth ≈ 7.7 cm = 3.03 in  (check with \the\columnwidth)
+# ---------------------------------------------------------------------------
+COL_W, FIG_H = 3.03, 3.3
 
-    # --- Subplot 2 (b) — MAE ---
-    ax2.set_xlabel(r'Missing Rate $r$', fontsize=14, labelpad=8)
-    ax2.set_ylabel('MAE', fontsize=14, labelpad=8, fontweight='bold')
-    ax2.set_xlim(-0.05, 1.02)
-    ax2.set_ylim(0.70, 1.55)
-    ax2.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8])
-    ax2.set_yticks([0.8, 1.0, 1.2, 1.4])
-    ax2.tick_params(labelsize=12)
-    ax2.grid(False)
-    ax2.legend(
-        loc='upper left', frameon=True, fontsize=9.5,
-        framealpha=0.95, edgecolor='#CCCCCC',
-        borderpad=0.5, labelspacing=0.35, handlelength=1.8
-    )
-    ax2.text(0.5, -0.22, '(b)', transform=ax2.transAxes, ha='center', va='top', fontsize=14, fontweight='bold')
+plt.rcParams.update({
+    # --- fonts: embed TrueType (no Type 3), Times-like serif ---
+    'pdf.fonttype': 42,
+    'ps.fonttype': 42,
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'Times', 'Liberation Serif',
+                   'Nimbus Roman', 'DejaVu Serif'],
+    'mathtext.fontset': 'stix',
+    # --- sizes are FINAL sizes (no rescaling in LaTeX) ---
+    'font.size': 7.5,
+    'axes.titlesize': 7.5,
+    'axes.labelsize': 7.5,
+    'xtick.labelsize': 7,
+    'ytick.labelsize': 7,
+    'legend.fontsize': 6.5,
+    'axes.titlepad': 3,
+    'axes.labelpad': 2,
+    # --- line / tick geometry ---
+    'axes.linewidth': 0.6,
+    'xtick.direction': 'in', 'ytick.direction': 'in',
+    'xtick.major.size': 2.5, 'ytick.major.size': 2.5,
+    'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
+    'xtick.major.pad': 2, 'ytick.major.pad': 2,
+    'lines.linewidth': 1.3,
+    'lines.markersize': 3.2,
+    'lines.markeredgewidth': 0.6,
+})
 
-    plt.tight_layout(w_pad=3.0)
-    fig.subplots_adjust(bottom=0.18)
+# ---------------------------------------------------------------------------
+# 5. Figure
+# ---------------------------------------------------------------------------
+fig, axes = plt.subplots(2, 2, figsize=(COL_W, FIG_H), sharex=True)
 
-    png_path = 'result/normal/missing_rate_performance.png'
-    pdf_path = 'result/normal/missing_rate_performance.pdf'
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
-    plt.savefig(pdf_path, bbox_inches='tight')
-    plt.close()
-    print(f'Saved: {png_path} and {pdf_path}')
+mr_all = sorted(set(mosi_agg['Missing Rate']) | set(mosei_agg['Missing Rate']))
+xmin, xmax = min(mr_all), max(mr_all)
 
-create_plot()
 
-# python result/normal/generate_summary_and_plots.py
+def plot_row(ax_f1, ax_mae, agg_df, models):
+    for m in models:
+        if m not in style_map:
+            continue
+        sub = agg_df[agg_df['Model'] == m].sort_values('Missing Rate')
+        s = style_map[m]
+        kw = dict(label=s['label'], color=s['color'], marker='o',
+                  linestyle='-', markeredgecolor=s['color'], zorder=s['zorder'])
+        ax_f1.plot(sub['Missing Rate'], sub['F1_score Mean'], **kw)
+        ax_mae.plot(sub['Missing Rate'], sub['MAE Mean'] / 100.0, **kw)
+
+    for ax in (ax_f1, ax_mae):
+        ax.set_xlim(xmin - 0.04, xmax + 0.04)
+        ax.set_xticks(np.arange(0, xmax + 1e-6, 0.2))
+        ax.grid(True, linewidth=0.3, alpha=0.35)   # light grid helps at small size
+        ax.set_axisbelow(True)
+
+
+plot_row(axes[0, 0], axes[0, 1], mosi_agg, mosi_models)
+plot_row(axes[1, 0], axes[1, 1], mosei_agg, mosei_models)
+
+# --- y-limits (unchanged, fewer ticks for small panels is fine) ---
+axes[0, 0].set_ylim(32, 88);    axes[0, 0].set_yticks([40, 60, 80])
+axes[0, 1].set_ylim(0.70, 1.55); axes[0, 1].set_yticks([0.8, 1.0, 1.2, 1.4])
+axes[1, 0].set_ylim(55, 90);    axes[1, 0].set_yticks([60, 70, 80])
+axes[1, 1].set_ylim(0.50, 0.88); axes[1, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
+
+# --- panel label + dataset + metric in the title (replaces ylabel & (a)-(d) text) ---
+axes[0, 0].set_title(r'(a) MOSI: F1 $\uparrow$')
+axes[0, 1].set_title(r'(b) MOSI: MAE $\downarrow$')
+axes[1, 0].set_title(r'(c) MOSEI: F1 $\uparrow$')
+axes[1, 1].set_title(r'(d) MOSEI: MAE $\downarrow$')
+
+# --- x label only on bottom row ---
+for ax in axes[1]:
+    ax.set_xlabel(r'Missing Rate $r$')
+
+# --- shared legend ---
+handles, leg_labels = axes[0, 0].get_legend_handles_labels()
+leg = fig.legend(
+    handles, leg_labels, loc='upper center', ncol=4,
+    bbox_to_anchor=(0.5, 1.0), frameon=True, framealpha=0.95,
+    edgecolor='#CCCCCC', borderpad=0.3, labelspacing=0.25,
+    handlelength=1.5, handletextpad=0.4, columnspacing=0.8,
+)
+leg.get_frame().set_linewidth(0.5)
+
+# --- fixed layout (no bbox_inches='tight' => final size is exactly COL_W x FIG_H) ---
+fig.subplots_adjust(left=0.05, right=0.985, top=0.80, bottom=0.115,
+                    wspace=0.42, hspace=0.38)
+
+# ---------------------------------------------------------------------------
+# 6. Save
+# ---------------------------------------------------------------------------
+png_path = 'result/normal/missing_rate_performance_combined.png'
+pdf_path = 'result/normal/missing_rate_performance_combined.pdf'
+plt.savefig(pdf_path)                 # vector, for the paper
+plt.savefig(png_path, dpi=300)        # preview only
+plt.close()
+print(f'Saved: {png_path} and {pdf_path}')
