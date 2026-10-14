@@ -202,6 +202,7 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
     if args.mode == 'test':
         model.load_state_dict(torch.load(args.model_save_path))
+        model.update_train_bank(dataloader['train'], args.device)
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
         sys.stdout.flush()
         input('[Press Any Key to start another run]')
@@ -209,6 +210,7 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
         model.load_state_dict(torch.load(args.model_save_path))
         K = getattr(args, 'K_neighbors', 10)
         res_dir = getattr(args, 'res_save_dir', './result')
+        model.update_train_bank(dataloader['train'], args.device)
         trainer.do_test_uncertainty(model, dataloader['test'], save_dir=res_dir, K=K)
         # Also run standard test for reference
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
