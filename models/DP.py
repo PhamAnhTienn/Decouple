@@ -96,6 +96,13 @@ class DP(nn.Module):
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 500
+        if args.dataset_name == 'sims':
+            if args.need_data_aligned:
+                self.len_l, self.len_v, self.len_a = 39, 39, 39
+            else:
+                # SIMS unaligned: Text=39, Vision=55, Audio=400
+                self.len_l, self.len_v, self.len_a = 39, 55, 400
+
         self.orig_d_l, self.orig_d_a, self.orig_d_v = args.feature_dims
         self.d_l = self.d_a = self.d_v = dst_feature_dims
         self.num_heads = nheads
@@ -175,16 +182,16 @@ class DP(nn.Module):
         self.fusion_v = nn.Linear(self.d_v * 2, self.d_v)
         self.fusion_a = nn.Linear(self.d_a * 2, self.d_a)
 
-        # =====================================================================
-        # 3c. Fine-grained Sentiment Refinement (FSR) (Section 3.4)
-        # =====================================================================
-        self.fsr = FSR(
-            d_model=self.d_l,
-            num_heads=self.num_heads,
-            attn_dropout=self.attn_dropout,
-            relu_dropout=self.relu_dropout,
-            res_dropout=self.res_dropout,
-        )
+        # # =====================================================================
+        # # 3c. Fine-grained Sentiment Refinement (FSR) (Section 3.4)
+        # # =====================================================================
+        # self.fsr = FSR(
+        #     d_model=self.d_l,
+        #     num_heads=self.num_heads,
+        #     attn_dropout=self.attn_dropout,
+        #     relu_dropout=self.relu_dropout,
+        #     res_dropout=self.res_dropout,
+        # )
 
         # init prototype
         self.nmb_prototypes = args.nmb_prototypes
@@ -832,26 +839,34 @@ class DP(nn.Module):
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
         # ==============================================================
+        def align_time(feat, target_len):
+            if feat.shape[-1] != target_len:
+                return F.interpolate(feat, size=target_len, mode='linear', align_corners=False)
+            return feat
+
         # For target L: use shared from V and A + specific from L
-        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l.expand_as(c_v)], dim=1))  # (B, d, T_v)
-        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        t_l = s_l.shape[-1]
+        x_tilde_vl = self.decoder_vl(torch.cat([align_time(c_v, t_l), s_l], dim=1))  # (B, d, T_l)
+        x_tilde_al = self.decoder_al(torch.cat([align_time(c_a, t_l), s_l], dim=1))  # (B, d, T_l)
         x_tilde_l = self.fusion_l(
             torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_l)
 
         # For target V: use shared from L and A + specific from V
-        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        t_v = s_v.shape[-1]
+        x_tilde_lv = self.decoder_lv(torch.cat([align_time(c_l, t_v), s_v], dim=1))  # (B, d, T_v)
+        x_tilde_av = self.decoder_av(torch.cat([align_time(c_a, t_v), s_v], dim=1))  # (B, d, T_v)
         x_tilde_v = self.fusion_v(
             torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_v)
 
         # For target A: use shared from L and V + specific from A
-        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        t_a = s_a.shape[-1]
+        x_tilde_la = self.decoder_la(torch.cat([align_time(c_l, t_a), s_a], dim=1))  # (B, d, T_a)
+        x_tilde_va = self.decoder_va(torch.cat([align_time(c_v, t_a), s_a], dim=1))  # (B, d, T_a)
         x_tilde_a = self.fusion_a(
             torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_a)
 
         # Re-disentangle reconstructed features (Eq. 9):
         #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)

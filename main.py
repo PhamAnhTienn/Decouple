@@ -130,7 +130,9 @@ def DMD_run(
             setattr(args, key, value)
             
     logger = _set_logger(log_dir, model_name, dataset_name, verbose_level, missing_rate=args.missing_rate_eval_test)
-    args.model_save_path = str(Path(model_save_dir) / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
+    save_dir = Path(model_save_dir) / dataset_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    args.model_save_path = str(save_dir / f"{args.model_name}-{args.dataset_name}-missing{args.missing_rate_eval_test:.1f}.pth")
     args.res_save_dir = str(res_save_dir)
 
     # Running results

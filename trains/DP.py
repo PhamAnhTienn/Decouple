@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-import wandb
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
