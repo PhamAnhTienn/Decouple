@@ -112,9 +112,7 @@ class DP(nn.Module):
 
         # Uncertainty hyperparameters
         self.tau_c = getattr(args, 'tau_c', 1.0)    # temperature for shared reliability
-        self.tau_s = getattr(args, 'tau_s', 1.0)    # temperature for specific reliability
-        self.tau_f = getattr(args, 'tau_f', 1.0)    # temperature for shared fusion softmax
-        self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
+        self.tau_s = getattr(args, 'tau_s', 0.5)    # temperature for specific reliability
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
         # ── Role-conditioned reliability ablation ──
@@ -538,8 +536,8 @@ class DP(nn.Module):
             # u_s = 0.5 * (u_neighbor[m] + u_cycle_s[m])
             u_c = u_consensus[m]
             u_s = u_neighbor[m]
-            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=self.r_min, max=1.0)
-            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=self.r_min, max=1.0)
+            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=1e-4, max=1.0)
+            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=1e-4, max=1.0)
             r_shared[m] = r_c.detach()      # stop-gradient
             r_specific[m] = r_s.detach()     # stop-gradient
         return r_shared, r_specific

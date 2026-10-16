@@ -135,17 +135,18 @@ def compute_metrics(u_shared, u_specific):
 # Visualization
 # =====================================================================
 
+
 def plot_heatmap_and_bars(all_results, missing_rates, save_dir, dataset):
     """
-    Two-panel figure:
-      Left:  Heatmap of Spearman ρ (rows=modality, cols=missing rate)
-      Right: 100% stacked bar of 4 states
+    Save two separate figures:
+      Figure 1: Heatmap of Spearman rho
+      Figure 2: 100% stacked bar of 4 states
     """
     n_rates = len(missing_rates)
 
-    # Build matrices
+    # Build matrices (unchanged)
     rho_matrix = np.zeros((3, n_rates))
-    state_matrix = np.zeros((3, n_rates, 4))  # [mod, rate, state]
+    state_matrix = np.zeros((3, n_rates, 4))
 
     for j, mr in enumerate(missing_rates):
         if mr not in all_results:
@@ -153,14 +154,26 @@ def plot_heatmap_and_bars(all_results, missing_rates, save_dir, dataset):
         for i, m in enumerate(MODALITIES):
             r = all_results[mr][m]
             rho_matrix[i, j] = r["spearman_rho"]
-            state_matrix[i, j] = [r["frac_LL"], r["frac_LH"], r["frac_HL"], r["frac_HH"]]
+            state_matrix[i, j] = [
+                r["frac_LL"],
+                r["frac_LH"],
+                r["frac_HL"],
+                r["frac_HH"],
+            ]
 
-    fig = plt.figure(figsize=(16, 5))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1.5])
+    # ================================================================
+    # Figure 1: Spearman rho heatmap
+    # ================================================================
+    fig1, ax1 = plt.subplots(figsize=(8, 5))
 
-    # ── Left: Spearman ρ heatmap ──
-    ax1 = fig.add_subplot(gs[0])
-    im = ax1.imshow(rho_matrix, cmap="RdBu_r", aspect="auto", vmin=-1, vmax=1)
+    im = ax1.imshow(
+        rho_matrix,
+        cmap="RdBu_r",
+        aspect="auto",
+        vmin=-1,
+        vmax=1,
+    )
+
     ax1.set_yticks(range(3))
     ax1.set_yticklabels([MOD_NAMES[m] for m in MODALITIES])
     ax1.set_xticks(range(n_rates))
@@ -170,12 +183,30 @@ def plot_heatmap_and_bars(all_results, missing_rates, save_dir, dataset):
 
     for i in range(3):
         for j in range(n_rates):
-            ax1.text(j, i, f"{rho_matrix[i, j]:.2f}", ha="center", va="center",
-                     fontsize=9, color="white" if abs(rho_matrix[i, j]) > 0.5 else "black")
-    plt.colorbar(im, ax=ax1)
+            ax1.text(
+                j, i, f"{rho_matrix[i, j]:.2f}",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="white" if abs(rho_matrix[i, j]) > 0.5 else "black",
+            )
 
-    # ── Right: 100% stacked bar ──
-    ax2 = fig.add_subplot(gs[1])
+    fig1.colorbar(im, ax=ax1)
+    fig1.tight_layout()
+
+    heatmap_path = os.path.join(
+        save_dir, f"exp12_nonredundancy_heatmap_{dataset}.png"
+    )
+    fig1.savefig(heatmap_path, dpi=200, bbox_inches="tight")
+    plt.close(fig1)
+
+    print(f"Heatmap saved to {heatmap_path}")
+
+    # ================================================================
+    # Figure 2: 100% stacked bar
+    # ================================================================
+    fig2, ax2 = plt.subplots(figsize=(12, 5))
+
     x_labels = []
     ll_vals, lh_vals, hl_vals, hh_vals = [], [], [], []
 
@@ -190,12 +221,33 @@ def plot_heatmap_and_bars(all_results, missing_rates, save_dir, dataset):
     x = np.arange(len(x_labels))
     width = 0.7
 
-    ax2.bar(x, ll_vals, width, label="LL (both low)", color="#4CAF50", alpha=0.85)
-    ax2.bar(x, lh_vals, width, bottom=ll_vals, label="LH (uᶜ low, uˢ high)", color="#FF9800", alpha=0.85)
+    ax2.bar(
+        x, ll_vals, width,
+        label="LL (both low)",
+        color="#4CAF50", alpha=0.85,
+    )
+    ax2.bar(
+        x, lh_vals, width,
+        bottom=ll_vals,
+        label="LH (uᶜ low, uˢ high)",
+        color="#FF9800", alpha=0.85,
+    )
+
     bottoms_2 = [a + b for a, b in zip(ll_vals, lh_vals)]
-    ax2.bar(x, hl_vals, width, bottom=bottoms_2, label="HL (uᶜ high, uˢ low)", color="#2196F3", alpha=0.85)
+    ax2.bar(
+        x, hl_vals, width,
+        bottom=bottoms_2,
+        label="HL (uᶜ high, uˢ low)",
+        color="#2196F3", alpha=0.85,
+    )
+
     bottoms_3 = [a + b for a, b in zip(bottoms_2, hl_vals)]
-    ax2.bar(x, hh_vals, width, bottom=bottoms_3, label="HH (both high)", color="#F44336", alpha=0.85)
+    ax2.bar(
+        x, hh_vals, width,
+        bottom=bottoms_3,
+        label="HH (both high)",
+        color="#F44336", alpha=0.85,
+    )
 
     ax2.set_xticks(x)
     ax2.set_xticklabels(x_labels, fontsize=7)
@@ -204,11 +256,15 @@ def plot_heatmap_and_bars(all_results, missing_rates, save_dir, dataset):
     ax2.legend(loc="upper right", fontsize=8)
     ax2.set_ylim(0, 1.05)
 
-    plt.tight_layout()
-    path = os.path.join(save_dir, f"exp12_nonredundancy_{dataset}.png")
-    plt.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Figure saved to {path}")
+    fig2.tight_layout()
+
+    bars_path = os.path.join(
+        save_dir, f"exp12_nonredundancy_states_{dataset}.png"
+    )
+    fig2.savefig(bars_path, dpi=200, bbox_inches="tight")
+    plt.close(fig2)
+
+    print(f"Stacked bar saved to {bars_path}")
 
 
 def print_table(all_results, missing_rates):

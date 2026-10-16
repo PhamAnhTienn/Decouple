@@ -36,6 +36,8 @@ from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+import matplotlib.patheffects as pe
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config import get_config_regression
@@ -224,7 +226,7 @@ def sweep_beta(model, model_args, m_recv, m_send, rates, num_workers, third_mod_
 def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path):
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(beta_matrix, cmap="YlOrRd", aspect="auto", origin="lower",
-                   vmin=0, vmax=max(0.5, beta_matrix.max()))
+                   vmin=beta_matrix.min(), vmax=beta_matrix.max())
 
     ax.set_xticks(range(len(rates)))
     ax.set_xticklabels([f"{r:.1f}" for r in rates])
@@ -235,12 +237,40 @@ def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path):
     ax.set_ylabel(f"Receiver ({MOD_NAMES[m_recv]}) Missing Rate", fontsize=12)
     ax.set_title(f"β_{{{MOD_NAMES[m_recv]}←{MOD_NAMES[m_send]}}}", fontsize=14)
 
-    # Add text annotations
+    # Add readable annotations based on actual cell luminance
+    norm = im.norm
+    cmap = im.get_cmap()
+
     for i in range(len(rates)):
         for j in range(len(rates)):
-            ax.text(j, i, f"{beta_matrix[i, j]:.3f}", ha="center", va="center",
-                    color="white" if beta_matrix[i, j] > beta_matrix.max() * 0.6 else "black",
-                    fontsize=9)
+            value = beta_matrix[i, j]
+
+            # Actual RGBA color of this cell
+            r, g, b, _ = cmap(norm(value))
+
+            # Perceived brightness (relative luminance)
+            luminance = (
+                0.2126 * r
+                + 0.7152 * g
+                + 0.0722 * b
+            )
+
+            # Dark text on light cells, white on dark cells
+            text_color = "black" if luminance > 0.5 else "white"
+
+            ax.text(
+                j, i, f"{value:.3f}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=9,
+                fontweight="medium",
+                path_effects=[
+                    pe.withStroke(linewidth=0.4, foreground="white")
+                    if text_color == "black"
+                    else pe.withStroke(linewidth=0.4, foreground="black")
+                ],
+            )
 
     plt.colorbar(im, ax=ax, label="Mean β")
     plt.tight_layout()
@@ -353,3 +383,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python scripts/experiments/exp08.py \
+#     --dataset mosi \
+#     --all_pairs \
+#     --save_dir result/experiments/exp08 \
+#     --rates 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9
