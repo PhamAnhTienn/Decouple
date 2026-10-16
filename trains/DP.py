@@ -1,6 +1,8 @@
+import json
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,8 +96,27 @@ class DP():
         return F.mse_loss(p_tilde, p_orig.detach())
 
     def do_train(self, model, dataloader, return_epoch_results=False):
-        optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate)
+        # Differential learning rate for BERT and weight decay
+        bert_learning_rate = getattr(self.args, 'bert_learning_rate', None)
+        weight_decay = getattr(self.args, 'weight_decay', 0.0)
+        if bert_learning_rate is not None and hasattr(model, 'text_model') and getattr(self.args, 'use_bert', True):
+            bert_params = list(map(id, model.text_model.parameters()))
+            other_params = filter(lambda p: id(p) not in bert_params, model.parameters())
+            optimizer_grouped_parameters = [
+                {'params': other_params, 'weight_decay': weight_decay, 'lr': self.args.learning_rate},
+                {'params': model.text_model.parameters(), 'weight_decay': weight_decay, 'lr': bert_learning_rate},
+            ]
+            optimizer = optim.Adam(optimizer_grouped_parameters)
+        else:
+            optimizer = optim.Adam(model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay)
+
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=self.args.patience)
+
+        # Dynamic loss weights configurable via config / CLI overrides
+        lambda_recon_group = getattr(self.args, 'lambda_recon_group', LAMBDA_RECON_GROUP)
+        lambda_ort = getattr(self.args, 'lambda_ort', LAMBDA_ORT_INNER)
+        lambda_cluster = getattr(self.args, 'lambda_cluster', LAMBDA_CLUSTER)
+        lambda_preserve = getattr(self.args, 'lambda_preserve', LAMBDA_PRESERVE)
 
         epochs, best_epoch = 0, 0
         if return_epoch_results:
@@ -215,8 +236,8 @@ class DP():
                     )
 
                     combined_loss = loss_task + \
-                                        (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
+                                        (loss_p * lambda_preserve + loss_recon + loss_ort * lambda_ort) * lambda_recon_group \
+                                        + loss_cluster * lambda_cluster
                     
                     # combined_loss = loss_task + \
                     #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
@@ -277,6 +298,15 @@ class DP():
                     best_valid, best_epoch = cur_valid, epochs
                     # save model
                     torch.save(model.state_dict(), self.args.model_save_path)
+                    # save best validation metrics for tuning / evaluation
+                    if hasattr(self.args, 'res_save_dir') and self.args.res_save_dir:
+                        res_dir = Path(self.args.res_save_dir)
+                        res_dir.mkdir(parents=True, exist_ok=True)
+                        cur_seed = getattr(self.args, 'cur_seed', 1111)
+                        vf = res_dir / f"best_val_seed{cur_seed}.json"
+                        clean_res = {k: float(v) if isinstance(v, (torch.Tensor, np.floating, float, int)) else v for k, v in val_results.items()}
+                        clean_res['best_epoch'] = best_epoch
+                        vf.write_text(json.dumps(clean_res, indent=2))
 
                 if return_epoch_results:
                     train_results["Loss"] = train_loss
