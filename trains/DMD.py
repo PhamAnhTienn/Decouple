@@ -290,7 +290,7 @@ class DMD():
                 train_results["Loss"] = train_loss
                 epoch_results['train'].append(train_results)
                 epoch_results['valid'].append(val_results)
-                test_results = self.do_test(model, dataloader['test'], mode="TEST")
+                test_results = self.do_test(model[0], dataloader['test'], mode="TEST")
                 epoch_results['test'].append(test_results)
             # early stop
             if epochs - best_epoch >= self.args.early_stop:

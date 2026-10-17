@@ -17,11 +17,18 @@ class DMD(nn.Module):
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 375
-        if args.dataset_name == 'mosei':
+        elif args.dataset_name == 'mosei':
             if args.need_data_aligned:
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 500
+        elif args.dataset_name in ['sims', 'chsims', 'ch-sims', 'ch_sims']:
+            if args.need_data_aligned:
+                self.len_l, self.len_v, self.len_a = 39, 39, 39
+            else:
+                self.len_l, self.len_v, self.len_a = 39, 55, 400
+        elif hasattr(args, 'seq_lens'):
+            self.len_l, self.len_a, self.len_v = args.seq_lens
         self.orig_d_l, self.orig_d_a, self.orig_d_v = args.feature_dims
         self.d_l = self.d_a = self.d_v = dst_feature_dims
         self.num_heads = nheads
