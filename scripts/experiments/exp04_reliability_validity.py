@@ -5,9 +5,9 @@ Validate that reliability scores (rᶜ, rˢ) genuinely reflect representation
 degradation, rather than being mere geometric heuristics.
 
 For each test sample we have both its **complete** and **corrupted** (missing)
-counterpart.  We compute representation distortion:
+counterpart.  We compute representation distortion using symmetric normalized Frobenius error:
 
-    δᵠ(m,i) = 1 − cos(zᵠ(m,i; complete), zᵠ(m,i; missing)),  q ∈ {c, s}
+    δᵠ(m,i) = ||Xᵠ(m,i; comp) − Xᵠ(m,i; miss)||_F / (||Xᵠ(m,i; comp)||_F + ||Xᵠ(m,i; miss)||_F + eps),  q ∈ {c, s}
 
 Then measure Spearman ρ between:
     ρ(uᵠ, δᵠ) > 0   (uncertainty should increase with distortion)
@@ -57,18 +57,21 @@ def collect_paired_representations(model, dataloader, device):
       2. **Complete**  pass: text   / audio   / vision    (no missing)
 
     For each sample return:
-      z_c_m^{miss}, z_s_m^{miss}  — from corrupted pass
-      z_c_m^{comp}, z_s_m^{comp}  — from complete pass
+      delta_c_m,    delta_s_m     — symmetric normalized distortion: ||X_comp - X_miss||_F / (||X_comp||_F + ||X_miss||_F)
+      z_c_m^{miss}, z_s_m^{miss}  — from corrupted pass (mean pooled, normalized)
+      z_c_m^{comp}, z_s_m^{comp}  — from complete pass (mean pooled, normalized)
       r_shared_m,   r_specific_m  — reliability from corrupted pass
-      u_consensus_m, u_neighbor_m — uncertainties from corrupted pass
     """
     model.eval()
 
     acc = {
-        # corrupted
+        # Symmetric normalized distortion
+        **{f"delta_c_{m}": [] for m in MODALITIES},
+        **{f"delta_s_{m}": [] for m in MODALITIES},
+        # corrupted pooled
         **{f"z_c_{m}_miss": [] for m in MODALITIES},
         **{f"z_s_{m}_miss": [] for m in MODALITIES},
-        # complete
+        # complete pooled
         **{f"z_c_{m}_comp": [] for m in MODALITIES},
         **{f"z_s_{m}_comp": [] for m in MODALITIES},
         # reliability & uncertainty (from corrupted pass)
@@ -97,16 +100,33 @@ def collect_paired_representations(model, dataloader, device):
                 # Shared reps: c_m is (T, B, D) in output
                 c_miss = out_miss[f"c_{m}"]  # (T, B, D)
                 c_comp = out_comp[f"c_{m}"]
+                s_miss = out_miss[f"s_{m}"]
+                s_comp = out_comp[f"s_{m}"]
+
+                # Frobenius norms across (T, D) for each sample in batch
+                norm_c_comp = torch.norm(c_comp, p="fro", dim=(0, 2))  # (B,)
+                norm_c_miss = torch.norm(c_miss, p="fro", dim=(0, 2))
+                diff_c = torch.norm(c_comp - c_miss, p="fro", dim=(0, 2))
+                both_zero_c = (norm_c_comp < 1e-6) & (norm_c_miss < 1e-6)
+                delta_c = diff_c / (norm_c_comp + norm_c_miss + 1e-8)
+                delta_c[both_zero_c] = 0.0
+
+                norm_s_comp = torch.norm(s_comp, p="fro", dim=(0, 2))
+                norm_s_miss = torch.norm(s_miss, p="fro", dim=(0, 2))
+                diff_s = torch.norm(s_comp - s_miss, p="fro", dim=(0, 2))
+                both_zero_s = (norm_s_comp < 1e-6) & (norm_s_miss < 1e-6)
+                delta_s = diff_s / (norm_s_comp + norm_s_miss + 1e-8)
+                delta_s[both_zero_s] = 0.0
+
+                acc[f"delta_c_{m}"].append(delta_c.cpu())
+                acc[f"delta_s_{m}"].append(delta_s.cpu())
+
                 acc[f"z_c_{m}_miss"].append(
                     F.normalize(c_miss.mean(dim=0), dim=1).cpu()
                 )
                 acc[f"z_c_{m}_comp"].append(
                     F.normalize(c_comp.mean(dim=0), dim=1).cpu()
                 )
-
-                # Specific reps: s_m is (T, B, D) in output
-                s_miss = out_miss[f"s_{m}"]
-                s_comp = out_comp[f"s_{m}"]
                 acc[f"z_s_{m}_miss"].append(
                     F.normalize(s_miss.mean(dim=0), dim=1).cpu()
                 )
@@ -132,27 +152,22 @@ def collect_paired_representations(model, dataloader, device):
 
 def compute_distortion_correlations(data):
     """
-    δᵠ(m,i) = 1 − cos(z_comp, z_miss)
+    δᵠ(m,i) = ||X_comp - X_miss||_F / (||X_comp||_F + ||X_miss||_F + eps)
     Then Spearman ρ(rᵠ, δᵠ) and ρ(uᵠ, δᵠ).
     """
     results = {}
 
     for m in MODALITIES:
         # ── Shared distortion ──
-        delta_c = 1.0 - F.cosine_similarity(
-            data[f"z_c_{m}_comp"], data[f"z_c_{m}_miss"], dim=1
-        ).numpy()
+        delta_c = data[f"delta_c_{m}"].numpy()
 
         # ── Specific distortion ──
-        delta_s = 1.0 - F.cosine_similarity(
-            data[f"z_s_{m}_comp"], data[f"z_s_{m}_miss"], dim=1
-        ).numpy()
+        delta_s = data[f"delta_s_{m}"].numpy()
 
         r_c = data[f"r_shared_{m}"].numpy()
         r_s = data[f"r_specific_{m}"].numpy()
 
-        # Uncertainty u = -log(r) * tau  (invert the mapping)
-        # Or we can just compute 1 - r as a monotone proxy
+        # Uncertainty u = 1 - r as a monotone proxy
         u_c = 1.0 - r_c
         u_s = 1.0 - r_s
 
@@ -188,42 +203,77 @@ def compute_distortion_correlations(data):
 # Pretty-print tables
 # =====================================================================
 
-def print_main_table(all_results):
+def print_main_table(all_results, global_results=None):
     """Table 3 style: Dataset × score × Spearman ρ."""
     print("\n" + "=" * 80)
     print("TABLE 3: Reliability Validity — Spearman ρ(score, distortion)")
     print("=" * 80)
-    header = f"{'Dataset':<12} {'Score':<6} {'ρ':<10} {'p-value':<12} {'Expected':<10}"
+    header = f"{'Dataset':<22} {'Score':<6} {'ρ':<10} {'p-value':<12} {'Expected':<10}"
     print(header)
     print("-" * 80)
 
     for dataset, mr_results in all_results.items():
         for mr, mod_results in mr_results.items():
-            # Average across modalities for the main table
             rho_rc_list = [mod_results[m]["rho_rc_dc"] for m in MODALITIES]
             rho_rs_list = [mod_results[m]["rho_rs_ds"] for m in MODALITIES]
             p_rc_list = [mod_results[m]["p_rc_dc"] for m in MODALITIES]
             p_rs_list = [mod_results[m]["p_rs_ds"] for m in MODALITIES]
-
             label = f"{dataset} (mr={mr})"
+
+            if all(np.isnan(x) for x in rho_rc_list):
+                mean_rho_rc = np.nan
+                mean_p_rc = np.nan
+            else:
+                mean_rho_rc = np.nanmean(rho_rc_list)
+                mean_p_rc = np.nanmean(p_rc_list)
+
+            if all(np.isnan(x) for x in rho_rs_list):
+                mean_rho_rs = np.nan
+                mean_p_rs = np.nan
+            else:
+                mean_rho_rs = np.nanmean(rho_rs_list)
+                mean_p_rs = np.nanmean(p_rs_list)
+
+            if np.isnan(mean_rho_rc):
+                print(f"{label:<22} {'rᶜ':<6} {'N/A (clean)':<10} {'N/A':<12} {'Baseline'}")
+                print(f"{'':<22} {'rˢ':<6} {'N/A (clean)':<10} {'N/A':<12} {'Baseline'}")
+            else:
+                print(
+                    f"{label:<22} {'rᶜ':<6} {mean_rho_rc:>+.4f}    "
+                    f"{mean_p_rc:.2e}    {'ρ<0 ✓' if mean_rho_rc < 0 else 'ρ<0 ✗'}"
+                )
+                print(
+                    f"{'':<22} {'rˢ':<6} {mean_rho_rs:>+.4f}    "
+                    f"{mean_p_rs:.2e}    {'ρ<0 ✓' if mean_rho_rs < 0 else 'ρ<0 ✗'}"
+                )
+
+        if global_results and dataset in global_results:
+            print("-" * 80)
+            g = global_results[dataset]
+            g_rc = np.mean([g[m]["rho_rc_dc"] for m in MODALITIES])
+            g_rs = np.mean([g[m]["rho_rs_ds"] for m in MODALITIES])
+            g_p_rc = np.mean([g[m]["p_rc_dc"] for m in MODALITIES])
+            g_p_rs = np.mean([g[m]["p_rs_ds"] for m in MODALITIES])
+
+            g_label = f"{dataset} (Global Pooled)"
             print(
-                f"{label:<20} {'rᶜ':<6} {np.mean(rho_rc_list):>+.4f}    "
-                f"{np.mean(p_rc_list):.2e}    {'ρ<0 ✓' if np.mean(rho_rc_list) < 0 else 'ρ<0 ✗'}"
+                f"{g_label:<22} {'rᶜ':<6} {g_rc:>+.4f}    "
+                f"{g_p_rc:.2e}    {'ρ<0 ✓' if g_rc < 0 else 'ρ<0 ✗'}"
             )
             print(
-                f"{'':<20} {'rˢ':<6} {np.mean(rho_rs_list):>+.4f}    "
-                f"{np.mean(p_rs_list):.2e}    {'ρ<0 ✓' if np.mean(rho_rs_list) < 0 else 'ρ<0 ✗'}"
+                f"{'':<22} {'rˢ':<6} {g_rs:>+.4f}    "
+                f"{g_p_rs:.2e}    {'ρ<0 ✓' if g_rs < 0 else 'ρ<0 ✗'}"
             )
     print("=" * 80)
 
 
-def print_appendix_table(all_results):
+def print_appendix_table(all_results, global_results=None):
     """Appendix: per-modality breakdown."""
     print("\n" + "=" * 90)
     print("APPENDIX: Per-Modality Reliability Validity")
     print("=" * 90)
     header = (
-        f"{'Dataset':<12} {'MR':<5} {'Mod':<5} "
+        f"{'Dataset':<12} {'MR':<7} {'Mod':<10} "
         f"{'ρ(rᶜ,δᶜ)':<12} {'p':<10} "
         f"{'ρ(rˢ,δˢ)':<12} {'p':<10} "
         f"{'δᶜ mean':<10} {'δˢ mean':<10}"
@@ -235,11 +285,26 @@ def print_appendix_table(all_results):
         for mr, mod_results in mr_results.items():
             for m in MODALITIES:
                 r = mod_results[m]
+                rho_rc_str = f"{r['rho_rc_dc']:>+.4f}" if not np.isnan(r['rho_rc_dc']) else "   N/A   "
+                rho_rs_str = f"{r['rho_rs_ds']:>+.4f}" if not np.isnan(r['rho_rs_ds']) else "   N/A   "
+                p_rc_str = f"{r['p_rc_dc']:.2e}" if not np.isnan(r['p_rc_dc']) else "   N/A   "
+                p_rs_str = f"{r['p_rs_ds']:.2e}" if not np.isnan(r['p_rs_ds']) else "   N/A   "
                 print(
-                    f"{dataset:<12} {mr:<5} {MOD_NAMES[m]:<5} "
-                    f"{r['rho_rc_dc']:>+.4f}      {r['p_rc_dc']:.2e}  "
-                    f"{r['rho_rs_ds']:>+.4f}      {r['p_rs_ds']:.2e}  "
+                    f"{dataset:<12} {mr:<7} {MOD_NAMES[m]:<10} "
+                    f"{rho_rc_str}      {p_rc_str}  "
+                    f"{rho_rs_str}      {p_rs_str}  "
                     f"{r['delta_c_mean']:.4f}    {r['delta_s_mean']:.4f}"
+                )
+
+        if global_results and dataset in global_results:
+            print("-" * 90)
+            for m in MODALITIES:
+                g = global_results[dataset][m]
+                print(
+                    f"{dataset:<12} {'Global':<7} {MOD_NAMES[m]:<10} "
+                    f"{g['rho_rc_dc']:>+.4f}      {g['p_rc_dc']:.2e}  "
+                    f"{g['rho_rs_ds']:>+.4f}      {g['p_rs_ds']:.2e}  "
+                    f"{g['delta_c_mean']:.4f}    {g['delta_s_mean']:.4f}"
                 )
     print("=" * 90)
 
@@ -288,7 +353,7 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoint",
                         help="Directory containing dp-{dataset}-missing{rate}.pth checkpoints")
     parser.add_argument("--missing_rates", type=float, nargs="+",
-                        default=[0.0, 0.3, 0.5, 0.7],
+                        default=[0.0, 0.3, 0.5, 0.7, 0.9],
                         help="Missing rates to evaluate")
     parser.add_argument("--save_dir", type=str, default="./result/experiments/exp04")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=[0])
@@ -312,6 +377,7 @@ def main():
     model_args.mode = "test"
 
     all_results = {args.dataset: {}}
+    all_data_list = []
 
     for mr in args.missing_rates:
         ckpt_path = os.path.join(args.checkpoint_dir, f"dp-{args.dataset}-missing{mr}.pth")
@@ -326,6 +392,7 @@ def main():
 
         correlations, data = run_single(model_args, ckpt_path, mr, args.num_workers)
         all_results[args.dataset][mr] = correlations
+        all_data_list.append(data)
 
         # Save raw data
         torch.save(
@@ -333,15 +400,37 @@ def main():
             os.path.join(args.save_dir, f"exp04_{args.dataset}_mr{mr}.pt"),
         )
 
+    # Compute Global Pooled correlations across all evaluated missing rates
+    global_results = {args.dataset: {}}
+    if len(all_data_list) > 1:
+        for m in MODALITIES:
+            pooled_rc = np.concatenate([d[f"r_shared_{m}"].numpy() for d in all_data_list])
+            pooled_rs = np.concatenate([d[f"r_specific_{m}"].numpy() for d in all_data_list])
+            pooled_dc = np.concatenate([d[f"delta_c_{m}"].numpy() for d in all_data_list])
+            pooled_ds = np.concatenate([d[f"delta_s_{m}"].numpy() for d in all_data_list])
+
+            rho_rc, p_rc = stats.spearmanr(pooled_rc, pooled_dc)
+            rho_rs, p_rs = stats.spearmanr(pooled_rs, pooled_ds)
+
+            global_results[args.dataset][m] = {
+                "delta_c_mean": float(np.mean(pooled_dc)),
+                "delta_c_std": float(np.std(pooled_dc)),
+                "delta_s_mean": float(np.mean(pooled_ds)),
+                "delta_s_std": float(np.std(pooled_ds)),
+                "rho_rc_dc": float(rho_rc),
+                "p_rc_dc": float(p_rc),
+                "rho_rs_ds": float(rho_rs),
+                "p_rs_ds": float(p_rs),
+            }
+
     # Print tables
-    print_main_table(all_results)
-    print_appendix_table(all_results)
+    print_main_table(all_results, global_results)
+    print_appendix_table(all_results, global_results)
 
     # Save summary JSON
     summary_path = os.path.join(args.save_dir, f"exp04_{args.dataset}_summary.json")
-    # Convert numpy types for JSON serialization
     with open(summary_path, "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
+        json.dump({"per_mr": all_results, "global": global_results}, f, indent=2, default=str)
     print(f"\nSummary saved to {summary_path}")
 
 
