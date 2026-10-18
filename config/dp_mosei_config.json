@@ -13,12 +13,12 @@
     "embed_dropout": 0.0,
     "res_dropout": 0.0,
     "dst_feature_dim_nheads": [
-        30,
-        6
+        64,
+        8
     ],
     "nmb_prototypes": 7,
     "freeze_prototypes_niters": 600,
-    "batch_size": 256,
+    "batch_size": 128,
     "learning_rate": 0.00005,
     "nlevels": 4,
     "conv1d_kernel_size_l": 5,

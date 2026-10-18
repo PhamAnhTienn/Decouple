@@ -136,7 +136,6 @@ STAGES = {
     2: dict(desc="uncertainty dynamics & prototypes", kind="oat", screen=[0.5], factors=[
         F("tau_c", [0.5, 2.0]),
         F("tau_s", [0.5, 2.0]),
-        F("r_min", [0.0, 0.05, 0.2]),
         F("K_neighbors", [5, 20]),
         F("nmb_prototypes", [5, 10]),
     ]),
