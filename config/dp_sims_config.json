@@ -1,5 +1,4 @@
 {
-    "model_name": "dp",
     "need_data_aligned": false,
     "need_feature_standardized": true,
     "feature_standardize_modalities": [
@@ -42,7 +41,7 @@
     "is_distill": true,
     "transformers": "bert",
     "pretrained": "bert-base-chinese",
-    "KeyEval": "F1_score",
-    "selection_metric": "F1_score",
-    "scheduler_metric": "F1_score"
+    "KeyEval": "Loss",
+    "selection_metric": "SIMS",
+    "scheduler_metric": "SIMS"
 }
