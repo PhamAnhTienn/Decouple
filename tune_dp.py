@@ -420,7 +420,12 @@ def cmd_run(a):
     print(f"\n>>> Running Stage {a.stage} ({spec['desc']}):")
     print(f"    {len(meta['cands'])} trials x {len(runs)} runs = {total} total runs (skipping completed runs)")
 
-    for tid, ov in meta["cands"].items():
+    for i, (tid, ov) in enumerate(meta["cands"].items(), start=1):
+        print(
+            f"\n[Progress] Trial {i}/{len(meta['cands'])} | "
+            f"tid={tid}",
+            flush=True,
+        )
         for mr, seed in runs:
             run_one(a.stage, tid, ov, mr, seed, res, a.dry)
 
