@@ -76,8 +76,7 @@ CLI_FLAGS = {
 # Default values fallback when key is absent from json
 DEFAULTS = {
     "tau_c": 1.0,
-    "tau_s": 1.0,
-    "r_min": 0.1,
+    "tau_s": 0.5,
     "K_neighbors": 10,
     "bank_update_freq": 1,
     "weight_decay": 0.001,
