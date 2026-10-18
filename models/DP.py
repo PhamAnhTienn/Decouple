@@ -838,34 +838,26 @@ class DP(nn.Module):
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
         # ==============================================================
-        def align_time(feat, target_len):
-            if feat.shape[-1] != target_len:
-                return F.interpolate(feat, size=target_len, mode='linear', align_corners=False)
-            return feat
-
         # For target L: use shared from V and A + specific from L
-        t_l = s_l.shape[-1]
-        x_tilde_vl = self.decoder_vl(torch.cat([align_time(c_v, t_l), s_l], dim=1))  # (B, d, T_l)
-        x_tilde_al = self.decoder_al(torch.cat([align_time(c_a, t_l), s_l], dim=1))  # (B, d, T_l)
+        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l], dim=1))  # (B, d, T)
+        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l], dim=1))  # (B, d, T)
         x_tilde_l = self.fusion_l(
             torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_l)
+        ).permute(0, 2, 1)  # (B, d, T)
 
         # For target V: use shared from L and A + specific from V
-        t_v = s_v.shape[-1]
-        x_tilde_lv = self.decoder_lv(torch.cat([align_time(c_l, t_v), s_v], dim=1))  # (B, d, T_v)
-        x_tilde_av = self.decoder_av(torch.cat([align_time(c_a, t_v), s_v], dim=1))  # (B, d, T_v)
+        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v], dim=1))  # (B, d, T)
+        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v], dim=1))  # (B, d, T)
         x_tilde_v = self.fusion_v(
             torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_v)
+        ).permute(0, 2, 1)  # (B, d, T)
 
         # For target A: use shared from L and V + specific from A
-        t_a = s_a.shape[-1]
-        x_tilde_la = self.decoder_la(torch.cat([align_time(c_l, t_a), s_a], dim=1))  # (B, d, T_a)
-        x_tilde_va = self.decoder_va(torch.cat([align_time(c_v, t_a), s_a], dim=1))  # (B, d, T_a)
+        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a], dim=1))  # (B, d, T)
+        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a], dim=1))  # (B, d, T)
         x_tilde_a = self.fusion_a(
             torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_a)
+        ).permute(0, 2, 1)  # (B, d, T)
 
         # Re-disentangle reconstructed features (Eq. 9):
         #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
