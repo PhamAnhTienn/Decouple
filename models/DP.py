@@ -176,15 +176,6 @@ class DP(nn.Module):
         self.decoder_la = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
         self.decoder_va = nn.Conv1d(self.d_a * 2, self.d_a, kernel_size=1, padding=0, bias=False)
 
-        # Cross-attention temporal alignment modules for CRM (Method 1B)
-        # Dynamically aligns source shared H_n to target specific P_m's temporal dimension
-        self.align_vl = nn.MultiheadAttention(embed_dim=self.d_l, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-        self.align_al = nn.MultiheadAttention(embed_dim=self.d_l, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-        self.align_lv = nn.MultiheadAttention(embed_dim=self.d_v, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-        self.align_av = nn.MultiheadAttention(embed_dim=self.d_v, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-        self.align_la = nn.MultiheadAttention(embed_dim=self.d_a, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-        self.align_va = nn.MultiheadAttention(embed_dim=self.d_a, num_heads=self.num_heads, dropout=self.attn_dropout, batch_first=True)
-
         # Fusion layers F_m to combine two cross-reconstructed features per target
         self.fusion_l = nn.Linear(self.d_l * 2, self.d_l)
         self.fusion_v = nn.Linear(self.d_v * 2, self.d_v)
@@ -763,29 +754,33 @@ class DP(nn.Module):
         # h̃ = h_m + β * (b_{m←n} - h_m)
         return h_m + beta * (b_cross - h_m)
 
-    def _align_time_attention(self, h_src, p_tgt, align_module):
+    def _align_time_attention(self, h_src, p_tgt):
         """
         Dynamically aligns source shared feature h_src to target sequence length
-        via parametric Multi-Head Cross-Attention (Method 1B).
-        Target specific feature p_tgt acts as Query, source shared feature h_src acts as Key/Value.
+        via non-parametric soft cross-attention (Query = p_tgt, Key/Value = h_src).
         Preserves 100% of source temporal information without interpolation artifacts.
 
         Args:
             h_src: (B, d, T_src) — source shared feature
             p_tgt: (B, d, T_tgt) — target specific feature
-            align_module: nn.MultiheadAttention layer for this directed pair
         Returns:
             h_aligned: (B, d, T_tgt) — aligned shared feature matching T_tgt
         """
         if h_src.shape[-1] == p_tgt.shape[-1]:
             return h_src
 
-        # q: (B, T_tgt, d), kv: (B, T_src, d)
+        # q: (B, T_tgt, d), k: (B, T_src, d), v: (B, T_src, d)
         q = p_tgt.transpose(1, 2)
-        kv = h_src.transpose(1, 2)
+        k = h_src.transpose(1, 2)
+        v = k
 
-        # Multi-Head Cross-Attention: target specific queries source shared
-        h_aligned, _ = align_module(query=q, key=kv, value=kv)
+        d_k = q.size(-1)
+        # Scaled dot-product attention scores: (B, T_tgt, T_src)
+        attn_scores = torch.bmm(q, k.transpose(1, 2)) / (d_k ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # Weighted combination of ALL T_src frames: (B, T_tgt, d)
+        h_aligned = torch.bmm(attn_weights, v)
 
         return h_aligned.transpose(1, 2)  # (B, d, T_tgt)
 
@@ -872,12 +867,12 @@ class DP(nn.Module):
         # Cross-Reconstruction Module (CRM) (Section 3.3)
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
-        #   Dynamic attention alignment (Method 1B): H_n is softly aligned
-        #   to T_m using multi-head cross-attention with P_m as query.
+        #   Dynamic attention alignment: H_n is softly aligned to T_m
+        #   using P_m as query, preserving 100% of source information.
         # ==============================================================
         # For target L: use shared from V and A (aligned to T_l) + specific from L
-        c_v_l = self._align_time_attention(c_v, s_l, self.align_vl)
-        c_a_l = self._align_time_attention(c_a, s_l, self.align_al)
+        c_v_l = self._align_time_attention(c_v, s_l)
+        c_a_l = self._align_time_attention(c_a, s_l)
         x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
         x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
         x_tilde_l = self.fusion_l(
@@ -885,8 +880,8 @@ class DP(nn.Module):
         ).permute(0, 2, 1)  # (B, d, T_l)
 
         # For target V: use shared from L and A (aligned to T_v) + specific from V
-        c_l_v = self._align_time_attention(c_l, s_v, self.align_lv)
-        c_a_v = self._align_time_attention(c_a, s_v, self.align_av)
+        c_l_v = self._align_time_attention(c_l, s_v)
+        c_a_v = self._align_time_attention(c_a, s_v)
         x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
         x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
         x_tilde_v = self.fusion_v(
@@ -894,8 +889,8 @@ class DP(nn.Module):
         ).permute(0, 2, 1)  # (B, d, T_v)
 
         # For target A: use shared from L and V (aligned to T_a) + specific from A
-        c_l_a = self._align_time_attention(c_l, s_a, self.align_la)
-        c_v_a = self._align_time_attention(c_v, s_a, self.align_va)
+        c_l_a = self._align_time_attention(c_l, s_a)
+        c_v_a = self._align_time_attention(c_v, s_a)
         x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
         x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
         x_tilde_a = self.fusion_a(
