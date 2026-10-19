@@ -1,0 +1,19 @@
+{
+    "model_name": "cenet",
+    "need_data_aligned": false,
+    "need_model_aligned": false,
+    "need_normalized": false,
+    "use_bert": true,
+    "use_finetune": true,
+    "early_stop": 5,
+    "batch_size": 64,
+    "learning_rate": 1e-05,
+    "weight_decay": 0.0001,
+    "max_grad_norm": 2.0,
+    "adam_epsilon": 3e-08,
+    "transformers": "bert",
+    "pretrained": "bert-base-uncased",
+    "KeyEval": "Loss",
+    "selection_metric": "MOSI",
+    "scheduler_metric": "MOSI"
+}
