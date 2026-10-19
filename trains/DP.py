@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 from pathlib import Path
 
 import torch
@@ -341,6 +342,121 @@ class DP():
             eval_results['Labels'] = all_labels
 
         return eval_results
+
+    def do_test_with_diagnostics(self, model, dataloader, mode="TEST", K_neighbors=10):
+        """
+        Run evaluation and collect diagnostic outputs for experiments 6 & 7.
+
+        PREREQUISITE: Caller must call model.update_train_bank(train_dataloader, device)
+        before this method so that the KNN neighbor bank is populated.
+
+        Returns:
+            eval_results: standard metrics dict
+            diagnostics: dict with:
+                - 'gamma_c_all': (N,) tensor of joint gate values
+                - 'local_coh': dict m → float, LocalCoh per modality
+                - 'mean_gamma_c': float, mean gamma_c across test set
+                - 'z_s_all': dict m → (N, D) specific representations
+        """
+        model.eval()
+        y_pred, y_true = [], []
+        gamma_c_list = []
+        z_s_all = {'l': [], 'v': [], 'a': []}
+        z_c_all = {'l': [], 'v': [], 'a': []}
+
+        eval_loss = 0.0
+
+        with torch.no_grad():
+            with tqdm(dataloader) as td:
+                for batch_data in td:
+                    text = batch_data['text'].to(self.args.device)
+                    text_m = batch_data['text_m'].to(self.args.device)
+                    audio = batch_data['audio'].to(self.args.device)
+                    audio_m = batch_data['audio_m'].to(self.args.device)
+                    vision = batch_data['vision'].to(self.args.device)
+                    vision_m = batch_data['vision_m'].to(self.args.device)
+                    labels = batch_data['labels']['M'].to(self.args.device)
+                    if self.args.train_mode == 'classification':
+                        labels = labels.view(-1).long()
+                    else:
+                        labels = labels.view(-1, 1)
+                    output = model(text_m, audio_m, vision_m, text, audio, vision)
+
+                    loss = self.criterion(output['output_logit'], labels)
+                    eval_loss += loss.item()
+                    y_pred.append(output['output_logit'].cpu())
+                    y_true.append(labels.cpu())
+
+                    # Collect diagnostics
+                    gamma_c_list.append(output['gamma_c'].cpu())
+                    for m in ['l', 'v', 'a']:
+                        z_s_all[m].append(output['z_s'][m].cpu())
+                        z_c_all[m].append(output['z_c'][m].cpu())
+
+        eval_loss = eval_loss / len(dataloader)
+        pred, true = torch.cat(y_pred), torch.cat(y_true)
+
+        eval_results = self.metrics(pred, true)
+        eval_results["Loss"] = round(eval_loss, 4)
+        logger.info(f"{mode}-({self.args.model_name}) >> {dict_to_str(eval_results)}")
+
+        # Aggregate diagnostics
+        gamma_c_all = torch.cat(gamma_c_list, dim=0)  # (N,)
+        for m in ['l', 'v', 'a']:
+            z_s_all[m] = torch.cat(z_s_all[m], dim=0)  # (N, D)
+            z_c_all[m] = torch.cat(z_c_all[m], dim=0)  # (N, D)
+
+        # Compute LocalCoh per modality
+        # LocalCoh^m = (1 / N K) Σ_i Σ_{j∈N_K(i)} cos(z_s^{m,i}, z_s^{m,j})
+        local_coh = {}
+        for m in ['l', 'v', 'a']:
+            z_s_m = z_s_all[m]  # (N, D)
+            N = z_s_m.shape[0]
+            K = min(K_neighbors, N - 1)
+            if K <= 0:
+                local_coh[m] = 0.0
+                continue
+
+            # Build neighbor query based on neighbor_mode:
+            # Use the complementary shared features for SARM-style neighbor finding
+            neighbor_mode = getattr(self.args, 'neighbor_mode', 'complement')
+            if neighbor_mode == 'complement':
+                others = [n for n in ['l', 'v', 'a'] if n != m]
+                z_query = F.normalize(sum(z_c_all[n] for n in others), dim=1)
+            elif neighbor_mode == 'self':
+                z_query = z_c_all[m]
+            else:  # random
+                z_query = None
+
+            if z_query is not None:
+                sim = z_query @ z_query.t()  # (N, N)
+                sim.fill_diagonal_(-float('inf'))
+                _, topk_idx = sim.topk(K, dim=1)  # (N, K)
+            else:
+                topk_idx = torch.stack([
+                    torch.randperm(N)[:K] for _ in range(N)
+                ], dim=0)
+
+            z_s_neighbors = z_s_m[topk_idx]  # (N, K, D)
+            cos_vals = F.cosine_similarity(
+                z_s_m.unsqueeze(1), z_s_neighbors, dim=2
+            )  # (N, K)
+            local_coh[m] = cos_vals.mean().item()
+
+        diagnostics = {
+            'gamma_c_all': gamma_c_all,
+            'mean_gamma_c': gamma_c_all.mean().item(),
+            'local_coh': local_coh,
+            'z_s_all': z_s_all,
+        }
+
+        logger.info(
+            f"{mode}-Diagnostics: mean_gamma_c={diagnostics['mean_gamma_c']:.4f}, "
+            f"LocalCoh_l={local_coh['l']:.4f}, LocalCoh_v={local_coh['v']:.4f}, "
+            f"LocalCoh_a={local_coh['a']:.4f}"
+        )
+
+        return eval_results, diagnostics
 
     def do_test_uncertainty(self, model, dataloader, save_dir, K=10):
         """

@@ -5,79 +5,6 @@ from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
 
-class FSR(nn.Module):
-    """
-    Fine-grained Sentiment Refinement module (Section 3.4).
-    
-    Extracts fine-grained emotional cues from visual- and audio-specific
-    features and uses text-guided cross-attention to supplement textual semantics.
-    """
-
-    def __init__(self, d_model, num_heads, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1):
-        super(FSR, self).__init__()
-        # Feature refinement layers for P_V and P_A
-        self.refine_v = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-        self.refine_a = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-
-        # Text-guided cross-attention: P_L as query, [P'_V; P'_A] as key/value
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=attn_dropout,
-            batch_first=False,
-        )
-        self.layer_norm1 = nn.LayerNorm(d_model)
-        self.layer_norm2 = nn.LayerNorm(d_model)
-
-        # FFN after cross-attention
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.ReLU(inplace=True),
-            nn.Dropout(relu_dropout),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(res_dropout),
-        )
-
-    def forward(self, p_l, p_v, p_a):
-        """
-        Args:
-            p_l: (T_l, B, d) language specific features
-            p_v: (T_v, B, d) visual specific features
-            p_a: (T_a, B, d) audio specific features
-        Returns:
-            p_l_prime: (T_l, B, d) enhanced language features
-            p_v_prime: (T_v, B, d) refined visual features
-            p_a_prime: (T_a, B, d) refined audio features
-        """
-        # Refine visual and audio specific features
-        p_v_prime = p_v + self.refine_v(p_v)  # (T_v, B, d)
-        p_a_prime = p_a + self.refine_a(p_a)  # (T_a, B, d)
-
-        # Concatenate refined V and A as key/value for cross-attention
-        kv = torch.cat([p_v_prime, p_a_prime], dim=0)  # (T_v + T_a, B, d)
-
-        # Text-guided cross-attention: P_L queries [P'_V; P'_A]
-        residual = p_l
-        p_l_norm = self.layer_norm1(p_l)
-        attn_out, _ = self.cross_attn(query=p_l_norm, key=kv, value=kv)
-        p_l_enhanced = residual + attn_out  # (T_l, B, d)
-
-        # FFN
-        residual = p_l_enhanced
-        p_l_enhanced = self.layer_norm2(p_l_enhanced)
-        p_l_prime = residual + self.ffn(p_l_enhanced)  # (T_l, B, d)
-
-        return p_l_prime, p_v_prime, p_a_prime
-
-
 class DP(nn.Module):
     def __init__(self, args):
         super(DP, self).__init__()
@@ -112,10 +39,15 @@ class DP(nn.Module):
 
         # Uncertainty hyperparameters
         self.tau_c = getattr(args, 'tau_c', 1.0)    # temperature for shared reliability
-        self.tau_s = getattr(args, 'tau_s', 1.0)    # temperature for specific reliability
+        self.tau_s = getattr(args, 'tau_s', 0.5)    # temperature for specific reliability
         self.tau_f = getattr(args, 'tau_f', 1.0)    # temperature for shared fusion softmax
-        self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
+
+        # Ablation flags for experiments 6 & 7
+        # neighbor_mode: 'complement' (default SARM), 'self', or 'random'
+        self.neighbor_mode = getattr(args, 'neighbor_mode', 'complement')
+        # disable_gamma: when True, forces γ=1 everywhere (only normalized reliability)
+        self.disable_gamma = getattr(args, 'disable_gamma', False)
 
         # Train-set memory bank for KNN neighbor uncertainty
         # Populated by update_train_bank() after each epoch; None until first update.
@@ -174,17 +106,6 @@ class DP(nn.Module):
         self.fusion_l = nn.Linear(self.d_l * 2, self.d_l)
         self.fusion_v = nn.Linear(self.d_v * 2, self.d_v)
         self.fusion_a = nn.Linear(self.d_a * 2, self.d_a)
-
-        # =====================================================================
-        # 3c. Fine-grained Sentiment Refinement (FSR) (Section 3.4)
-        # =====================================================================
-        self.fsr = FSR(
-            d_model=self.d_l,
-            num_heads=self.num_heads,
-            attn_dropout=self.attn_dropout,
-            relu_dropout=self.relu_dropout,
-            res_dropout=self.res_dropout,
-        )
 
         # init prototype
         self.nmb_prototypes = args.nmb_prototypes
@@ -320,30 +241,34 @@ class DP(nn.Module):
             scores[m] = 1.0 - cos_sum / len(others)
         return scores
 
-    def _cycle_uncertainty(self, z_dict, zt_dict):
+    def _get_neighbor_query(self, z_c_dict, z_s_dict, m):
         """
-        u_m^{*,cy,i} = 1 - cos(z_m, z̃_m)
-        Works for both shared and specific.
+        Return the query vector used for KNN neighbor selection.
+        Routing is based on self.neighbor_mode.
 
-        Args:
-            z_dict:  dict m → (B, D) — original pooled repr
-            zt_dict: dict m → (B, D) — cycle-reconstructed pooled repr
-        Returns:
-            dict m → (B,) cycle uncertainty
+        - 'complement' (default SARM): leave-one-out shared z_{-m}^c
+        - 'self': modality m's own shared representation z_m^c
+        - 'random': returns None (neighbors will be selected randomly)
         """
-        return {
-            m: 1.0 - F.cosine_similarity(z_dict[m], zt_dict[m], dim=1)
-            for m in z_dict
-        }
+        if self.neighbor_mode == 'complement':
+            others = [n for n in z_c_dict if n != m]
+            return F.normalize(sum(z_c_dict[n] for n in others), dim=1)
+        elif self.neighbor_mode == 'self':
+            return z_c_dict[m]  # already L2-normed
+        elif self.neighbor_mode == 'random':
+            return None
+        else:
+            raise ValueError(f"Unknown neighbor_mode: {self.neighbor_mode}")
 
     def _neighbor_uncertainty(self, z_c_dict, z_s_dict, K):
         """
         In-batch neighbor uncertainty for specific representations.
         Used as fallback when train bank is not yet populated.
 
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)
-        N_K^m(i) = TopK_{j≠i}[cos(z_{-m}^{c,i}, z_{-m}^{c,j})]
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(z_m^{s,j}))
+        Supports three neighbor selection modes via self.neighbor_mode:
+        - 'complement': z_{-m}^c = Norm(Σ_{n≠m} z_n^c)  (default SARM)
+        - 'self': uses z_m^c directly
+        - 'random': random neighbor selection
 
         Args:
             z_c_dict: dict m → (B, D) — shared pooled repr (normed)
@@ -357,22 +282,27 @@ class DP(nn.Module):
         scores = {}
 
         for m in modalities:
-            # Leave-one-out shared feature
-            others = [n for n in modalities if n != m]
-            z_minus_m = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
-
-            # Pairwise cosine similarity (B, B); already L2-normed
-            sim_matrix = z_minus_m @ z_minus_m.t()
-            sim_matrix.fill_diagonal_(-float('inf'))  # mask self
+            z_query = self._get_neighbor_query(z_c_dict, z_s_dict, m)
 
             k_actual = min(K, B - 1)
             if k_actual <= 0:
                 scores[m] = torch.zeros(B, device=z_c_dict[m].device)
                 continue
 
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
+            if z_query is None:  # random mode
+                # Random neighbor indices (no self)
+                topk_idx = torch.stack([
+                    torch.randperm(B, device=z_c_dict[m].device)[:k_actual]
+                    if k_actual < B else
+                    torch.cat([torch.arange(i, device=z_c_dict[m].device),
+                               torch.arange(i+1, B, device=z_c_dict[m].device)])[:k_actual]
+                    for i in range(B)
+                ], dim=0)  # (B, K)
+            else:
+                # Pairwise cosine similarity (B, B); already L2-normed
+                sim_matrix = z_query @ z_query.t()
+                sim_matrix.fill_diagonal_(-float('inf'))  # mask self
+                _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
 
             z_s_m = z_s_dict[m]                    # (B, D)
             z_s_neighbors = z_s_m[topk_idx]         # (B, K, D)
@@ -392,12 +322,11 @@ class DP(nn.Module):
 
         Uses the full-train memory bank (_train_bank_z_c / _train_bank_z_s)
         to find K nearest neighbors for every query sample (train or test).
-        This avoids the in-batch bias and makes uncertainty comparable across
-        train/test splits.
 
-        Optimized: uses pre-computed leave-one-out bank features
-        (_train_bank_z_minus) and GPU-cached bank tensors to avoid
-        redundant computation and CPU→GPU transfers.
+        Supports three neighbor selection modes via self.neighbor_mode:
+        - 'complement': uses pre-computed leave-one-out z_minus (default SARM)
+        - 'self': uses z_m^c directly to find neighbors in the bank
+        - 'random': random neighbor selection from the bank
 
         Args:
             z_c_dict: dict m → (B, D) — query shared pooled repr (normed)
@@ -411,21 +340,24 @@ class DP(nn.Module):
         scores = {}
 
         for m in modalities:
-            others = [n for n in modalities if n != m]
+            if self.neighbor_mode == 'complement':
+                # --- Query: leave-one-out shared feature (B, D) ---
+                others = [n for n in modalities if n != m]
+                z_query = F.normalize(
+                    sum(z_c_dict[n] for n in others), dim=1
+                )  # (B, D)
+                # --- Bank: pre-computed leave-one-out shared feature (N, D) ---
+                bank_query = self._train_bank_z_minus[m]  # (N, D)
+            elif self.neighbor_mode == 'self':
+                z_query = z_c_dict[m]  # (B, D), already normed
+                bank_query = self._train_bank_z_c[m]  # (N, D)
+            elif self.neighbor_mode == 'random':
+                z_query = None
+                bank_query = None
+            else:
+                raise ValueError(f"Unknown neighbor_mode: {self.neighbor_mode}")
 
-            # --- Query: leave-one-out shared feature (B, D) ---
-            z_minus_m_query = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
-
-            # --- Bank: pre-computed leave-one-out shared feature (N, D) ---
-            # Already on GPU and L2-normalized (Strategy 2+3)
-            bank_z_minus_m = self._train_bank_z_minus[m]  # (N, D)
-
-            # Cosine similarity between query and bank: (B, N)
-            sim_matrix = z_minus_m_query @ bank_z_minus_m.t()
-
-            N_bank = bank_z_minus_m.shape[0]
+            N_bank = self._train_bank_z_s[m].shape[0]
             k_actual = min(K, N_bank)
             if k_actual <= 0:
                 scores[m] = torch.zeros(
@@ -433,7 +365,16 @@ class DP(nn.Module):
                 )
                 continue
 
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
+            B_q = z_c_dict[m].shape[0]
+            if z_query is None:  # random mode
+                topk_idx = torch.stack([
+                    torch.randperm(N_bank, device=device)[:k_actual]
+                    for _ in range(B_q)
+                ], dim=0)  # (B, K)
+            else:
+                # Cosine similarity between query and bank: (B, N)
+                sim_matrix = z_query @ bank_query.t()
+                _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
 
             # Specific features from bank (already on GPU)
             z_s_neighbors = self._train_bank_z_s[m][topk_idx]  # (B, K, D)
@@ -542,8 +483,8 @@ class DP(nn.Module):
             # u_s = 0.5 * (u_neighbor[m] + u_cycle_s[m])
             u_c = u_consensus[m]
             u_s = u_neighbor[m]
-            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=self.r_min, max=1.0)
-            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=self.r_min, max=1.0)
+            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=0.0, max=1.0)
+            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=0.0, max=1.0)
             r_shared[m] = r_c.detach()      # stop-gradient
             r_specific[m] = r_s.detach()     # stop-gradient
         return r_shared, r_specific
@@ -673,6 +614,8 @@ class DP(nn.Module):
             γ^{c,i} = 1 - Π_m (1 - r_m^{c,i})      (joint reliability gate)
             R^{c,i} = Σ_m r_m^{c,i}                   (total shared reliability)
 
+        When self.disable_gamma is True, γ is forced to 1.0 (ablation for Exp 7).
+
         Output is a single (B, D) vector (weighted average, NOT concat).
 
         Args:
@@ -680,6 +623,7 @@ class DP(nn.Module):
             r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
         Returns:
             c_fusion: (B, D) — reliability-gated consensus representation
+            gamma_c:  (B,)   — joint gate value (stored for logging)
         """
         modalities = list(c_att_dict.keys())
 
@@ -689,11 +633,17 @@ class DP(nn.Module):
             gamma_c = gamma_c * (1.0 - r_shared[m])         # accumulate product
         gamma_c = 1.0 - gamma_c                             # (B,)
 
+        # Ablation: disable_gamma forces γ=1 (Experiment 7)
+        if self.disable_gamma:
+            gamma_c_effective = torch.ones_like(gamma_c)
+        else:
+            gamma_c_effective = gamma_c
+
         # Total shared reliability: R^c = Σ_m r_m^c
         r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
         R_c = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)           # (B, 1)
 
-        gamma_c_expand = gamma_c.unsqueeze(1)  # (B, 1)
+        gamma_c_expand = gamma_c_effective.unsqueeze(1)  # (B, 1)
 
         # h̄ = γ^c * Σ_m (r_m / R^c) * h_m
         h_bar = torch.zeros_like(c_att_dict[modalities[0]])  # (B, D)
@@ -704,7 +654,7 @@ class DP(nn.Module):
 
         h_bar = gamma_c_expand * h_bar                  # (B, D)
 
-        return h_bar  # (B, D)
+        return h_bar, gamma_c  # (B, D), (B,)
 
     def _reliability_gated_complementary_exchange(self, h_m, b_cross, r_specific, m_recv, m_send):
         """
@@ -737,6 +687,10 @@ class DP(nn.Module):
 
         # γ_{m,n} = 1 - (1 - r_m)(1 - r_n)
         gamma_mn = 1.0 - (1.0 - r_m) * (1.0 - r_n)          # (B,)
+
+        # Ablation: disable_gamma forces γ=1 (Experiment 7)
+        if self.disable_gamma:
+            gamma_mn = torch.ones_like(gamma_mn)
 
         # β_{m←n} = γ_{m,n} * r_n / (r_m + r_n)
         denom = (r_m + r_n).clamp(min=1e-8)
@@ -974,7 +928,7 @@ class DP(nn.Module):
         # --- OLD: reliability-gated consensus (concat version, scale per slot) ---
         # c_fusion = self._reliability_gated_consensus(c_att_dict, r_shared)  # (B, 3*D)
         # --- NEW: reliability-gated consensus (sum version, single vector) ---
-        c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
+        c_fusion, gamma_c = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D), (B,)
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
@@ -1155,6 +1109,9 @@ class DP(nn.Module):
             'r_shared': r_shared,       # dict m → (B,) shared reliability
             'r_specific': r_specific,   # dict m → (B,) specific reliability
             'recon_weights': recon_weights,  # dict m → (B,) reconstruction suppression weights
+            'gamma_c': gamma_c,         # (B,) joint gate value (for Exp 7 logging)
+            'z_s': z_s,                 # dict m → (B, D) specific repr (for Exp 6 LocalCoh)
+            'z_c': z_c,                 # dict m → (B, D) shared repr (for Exp 6 analysis)
         }
         return res
 
@@ -1230,26 +1187,3 @@ class DP(nn.Module):
 
         loss_cpa /= 6.0  # average over 6 cross-modal pairs
         return loss_cpa
-
-    # def compute_push_loss(self, margin=2.0):
-    #     """
-    #     Compute L_push: margin-based prototype separation loss.
-    #     L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
-    #     """
-    #     C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-    #     K = C.shape[0]
-
-    #     # Pairwise squared L2 distances
-    #     # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-    #     # Since C is L2-normalized: ||c_i||^2 = 1
-    #     dots = C @ C.t()  # (K, K)
-    #     sq_dists = 2.0 - 2.0 * dots  # (K, K)
-
-    #     # Mask out diagonal
-    #     mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-    #     sq_dists_off = sq_dists[mask]  # K*(K-1)
-
-    #     # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-    #     return loss_push

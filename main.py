@@ -252,6 +252,11 @@ def parse_args():
         default=[],
         help='Override any config value with key=value. Can be repeated.',
     )
+    parser.add_argument('--neighbor_mode', type=str, default='complement',
+                        choices=['complement', 'self', 'random'],
+                        help='Neighbor selection mode for Exp 6: complement (SARM), self, or random')
+    parser.add_argument('--disable_gamma', action='store_true',
+                        help='Disable joint gate (γ=1) for Exp 7 ablation')
     return parser.parse_args()
 
 
@@ -267,6 +272,8 @@ def main():
             'missing_rate_eval_test': args.missing_rate_eval_test,
             'data_missing': args.data_missing,
             'K_neighbors': args.K_neighbors,
+            'neighbor_mode': args.neighbor_mode,
+            'disable_gamma': args.disable_gamma if args.disable_gamma else None,
         }.items()
         if value is not None
     })

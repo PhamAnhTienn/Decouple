@@ -194,6 +194,7 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
     else:
         dataset_config = {}
 
+    default_config.update(dataset_config)
     # Load from file if exists
     if config_file and os.path.exists(config_file):
         try:
@@ -205,7 +206,6 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
 
     # Dataset paths and task contracts should remain stable even when the
     # shared config file supplies model hyperparameters.
-    default_config.update(dataset_config)
     default_config['model_name'] = model_name.lower()
     default_config['dataset_name'] = dataset_name.lower()
 
