@@ -6,9 +6,10 @@ Generates:
   2. result/experiments/exp04/exp04_language_diagnostics_report.md
 
 Contains:
-  - Pairwise cosine & centroid collapse for all modalities (Complete vs Corrupted)
-  - KNN neighbor similarity changes before vs after masking
-  - Sample-level breakdowns (quantiles of distortion, sentence lengths, top distorted samples)
+  - SARM KNN References direct cosine measurement (Query z_m^s vs Bank KNN references) across MRs
+  - Modality comparison (Language vs Vision vs Audio)
+  - Embedding concentration (Pairwise cosine & Centroid norm)
+  - Sample-level breakdowns (quantiles of distortion & centroid proximity)
   - Centering / Residual norm validation proving the anisotropy mechanism
 """
 
@@ -23,6 +24,36 @@ SAVE_DIR = "result/experiments/exp04"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 mr_list = ["0.0", "0.4", "0.6", "0.8", "0.9"]
+
+# SARM KNN direct measurements from task-321
+SARM_KNN = {
+    "0.0": {
+        "l": {"knn_cos_comp": 0.5321, "knn_cos_miss": 0.5335, "diff_knn_cos": +0.0014, "r_s_comp": 0.4257, "r_s_miss": 0.4272, "diff_r_s": +0.0015, "query_bank_sim_comp": 0.8935, "query_bank_sim_miss": 0.8935},
+        "v": {"knn_cos_comp": 0.5173, "knn_cos_miss": 0.5153, "diff_knn_cos": -0.0020, "r_s_comp": 0.3893, "r_s_miss": 0.3878, "diff_r_s": -0.0016, "query_bank_sim_comp": 0.9725, "query_bank_sim_miss": 0.9725},
+        "a": {"knn_cos_comp": 0.5277, "knn_cos_miss": 0.5296, "diff_knn_cos": +0.0019, "r_s_comp": 0.4208, "r_s_miss": 0.4227, "diff_r_s": +0.0020, "query_bank_sim_comp": 0.9340, "query_bank_sim_miss": 0.9339},
+    },
+    "0.4": {
+        "l": {"knn_cos_comp": 0.5221, "knn_cos_miss": 0.5369, "diff_knn_cos": +0.0149, "r_s_comp": 0.4195, "r_s_miss": 0.4272, "diff_r_s": +0.0077, "query_bank_sim_comp": 0.9410, "query_bank_sim_miss": 0.9368},
+        "v": {"knn_cos_comp": 0.5333, "knn_cos_miss": 0.5174, "diff_knn_cos": -0.0159, "r_s_comp": 0.4029, "r_s_miss": 0.3912, "diff_r_s": -0.0117, "query_bank_sim_comp": 0.9799, "query_bank_sim_miss": 0.9780},
+        "a": {"knn_cos_comp": 0.5965, "knn_cos_miss": 0.5799, "diff_knn_cos": -0.0166, "r_s_comp": 0.4745, "r_s_miss": 0.4643, "diff_r_s": -0.0101, "query_bank_sim_comp": 0.9284, "query_bank_sim_miss": 0.9267},
+    },
+    "0.6": {
+        "l": {"knn_cos_comp": 0.4693, "knn_cos_miss": 0.5085, "diff_knn_cos": +0.0392, "r_s_comp": 0.3819, "r_s_miss": 0.4068, "diff_r_s": +0.0248, "query_bank_sim_comp": 0.9014, "query_bank_sim_miss": 0.8719},
+        "v": {"knn_cos_comp": 0.4887, "knn_cos_miss": 0.4601, "diff_knn_cos": -0.0286, "r_s_comp": 0.3698, "r_s_miss": 0.3535, "diff_r_s": -0.0163, "query_bank_sim_comp": 0.9759, "query_bank_sim_miss": 0.9700},
+        "a": {"knn_cos_comp": 0.5461, "knn_cos_miss": 0.4780, "diff_knn_cos": -0.0681, "r_s_comp": 0.4493, "r_s_miss": 0.4065, "diff_r_s": -0.0428, "query_bank_sim_comp": 0.9111, "query_bank_sim_miss": 0.9034},
+    },
+    "0.8": {
+        "l": {"knn_cos_comp": 0.2970, "knn_cos_miss": 0.3900, "diff_knn_cos": +0.0929, "r_s_comp": 0.2833, "r_s_miss": 0.3226, "diff_r_s": +0.0393, "query_bank_sim_comp": 0.8898, "query_bank_sim_miss": 0.7550},
+        "v": {"knn_cos_comp": 0.4650, "knn_cos_miss": 0.3744, "diff_knn_cos": -0.0906, "r_s_comp": 0.3526, "r_s_miss": 0.3068, "diff_r_s": -0.0457, "query_bank_sim_comp": 0.9667, "query_bank_sim_miss": 0.9471},
+        "a": {"knn_cos_comp": 0.5288, "knn_cos_miss": 0.4052, "diff_knn_cos": -0.1236, "r_s_comp": 0.4399, "r_s_miss": 0.3710, "diff_r_s": -0.0690, "query_bank_sim_comp": 0.8947, "query_bank_sim_miss": 0.8846},
+    },
+    "0.9": {
+        "l": {"knn_cos_comp": 0.2584, "knn_cos_miss": 0.4267, "diff_knn_cos": +0.1682, "r_s_comp": 0.2618, "r_s_miss": 0.3454, "diff_r_s": +0.0836, "query_bank_sim_comp": 0.9232, "query_bank_sim_miss": 0.5855},
+        "v": {"knn_cos_comp": 0.4683, "knn_cos_miss": 0.2695, "diff_knn_cos": -0.1988, "r_s_comp": 0.3534, "r_s_miss": 0.2554, "diff_r_s": -0.0980, "query_bank_sim_comp": 0.9713, "query_bank_sim_miss": 0.9626},
+        "a": {"knn_cos_comp": 0.5899, "knn_cos_miss": 0.3210, "diff_knn_cos": -0.2689, "r_s_comp": 0.4736, "r_s_miss": 0.3116, "diff_r_s": -0.1620, "query_bank_sim_comp": 0.9047, "query_bank_sim_miss": 0.9227},
+    },
+}
+
 diagnostics = {}
 
 for mr in mr_list:
@@ -63,6 +94,7 @@ for mr in mr_list:
             "mean_distortion_specific": float(raw[f"delta_s_{m}"].mean().item()),
             "mean_reliability_shared": float(raw[f"r_shared_{m}"].mean().item()),
             "mean_reliability_specific": float(raw[f"r_specific_{m}"].mean().item()),
+            "sarm_knn_refs": SARM_KNN[mr][m]
         }
     
     # 2. Detailed Language Analysis
