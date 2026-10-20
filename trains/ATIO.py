@@ -6,6 +6,7 @@ from .DAR import DAR
 from .DP import DP
 from .LNLN import LNLN
 from .CENET import CENET
+from .SELF_MM import SELF_MM
 __all__ = ["ATIO"]
 
 logger = logging.getLogger('DecAlign')
@@ -19,7 +20,8 @@ class ATIO():
             'dar': DAR,
             'dp': DP,
             'lnln': LNLN,
-            'cenet': CENET
+            'cenet': CENET,
+            'self_mm': SELF_MM
         }
 
     def getTrain(self, args):

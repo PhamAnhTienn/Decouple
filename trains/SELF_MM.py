@@ -19,13 +19,28 @@ class SELF_MM():
         self.args.tasks = "MTAV"
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
 
-        self.feature_map = {
-            'fusion': torch.zeros(args.train_samples, args.post_fusion_dim, requires_grad=False).to(args.device),
-            'text': torch.zeros(args.train_samples, args.post_text_dim, requires_grad=False).to(args.device),
-            'audio': torch.zeros(args.train_samples, args.post_audio_dim, requires_grad=False).to(args.device),
-            'vision': torch.zeros(args.train_samples, args.post_video_dim, requires_grad=False).to(args.device),
+        # These maps will be initialized in do_train once we know train_samples
+        self.feature_map = None
+        self.center_map = None
+        self.dim_map = None
+        self.label_map = None
+
+        self.name_map = {
+            'M': 'fusion',
+            'T': 'text',
+            'A': 'audio',
+            'V': 'vision'
         }
 
+    def _init_maps(self, train_samples):
+        """Initialize feature/label maps once train_samples is known."""
+        args = self.args
+        self.feature_map = {
+            'fusion': torch.zeros(train_samples, args.post_fusion_dim, requires_grad=False).to(args.device),
+            'text': torch.zeros(train_samples, args.post_text_dim, requires_grad=False).to(args.device),
+            'audio': torch.zeros(train_samples, args.post_audio_dim, requires_grad=False).to(args.device),
+            'vision': torch.zeros(train_samples, args.post_video_dim, requires_grad=False).to(args.device),
+        }
         self.center_map = {
             'fusion': {
                 'pos': torch.zeros(args.post_fusion_dim, requires_grad=False).to(args.device),
@@ -44,39 +59,34 @@ class SELF_MM():
                 'neg': torch.zeros(args.post_video_dim, requires_grad=False).to(args.device),
             }
         }
-
         self.dim_map = {
             'fusion': torch.tensor(args.post_fusion_dim).float(),
             'text': torch.tensor(args.post_text_dim).float(),
             'audio': torch.tensor(args.post_audio_dim).float(),
             'vision': torch.tensor(args.post_video_dim).float(),
         }
-        # new labels
         self.label_map = {
-            'fusion': torch.zeros(args.train_samples, requires_grad=False).to(args.device),
-            'text': torch.zeros(args.train_samples, requires_grad=False).to(args.device),
-            'audio': torch.zeros(args.train_samples, requires_grad=False).to(args.device),
-            'vision': torch.zeros(args.train_samples, requires_grad=False).to(args.device)
-        }
-
-        self.name_map = {
-            'M': 'fusion',
-            'T': 'text',
-            'A': 'audio',
-            'V': 'vision'
+            'fusion': torch.zeros(train_samples, requires_grad=False).to(args.device),
+            'text': torch.zeros(train_samples, requires_grad=False).to(args.device),
+            'audio': torch.zeros(train_samples, requires_grad=False).to(args.device),
+            'vision': torch.zeros(train_samples, requires_grad=False).to(args.device)
         }
 
     def do_train(self, model, dataloader, return_epoch_results=False):
+        # Compute train_samples from the dataloader
+        train_samples = len(dataloader['train'].dataset)
+        self._init_maps(train_samples)
+
         bert_no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-        bert_params = list(model.Model.text_model.named_parameters())
-        audio_params = list(model.Model.audio_model.named_parameters())
-        video_params = list(model.Model.video_model.named_parameters())
+        bert_params = list(model.text_model.named_parameters())
+        audio_params = list(model.audio_model.named_parameters())
+        video_params = list(model.video_model.named_parameters())
 
         bert_params_decay = [p for n, p in bert_params if not any(nd in n for nd in bert_no_decay)]
         bert_params_no_decay = [p for n, p in bert_params if any(nd in n for nd in bert_no_decay)]
         audio_params = [p for n, p in audio_params]
         video_params = [p for n, p in video_params]
-        model_params_other = [p for n, p in list(model.Model.named_parameters()) if 'text_model' not in n and \
+        model_params_other = [p for n, p in list(model.named_parameters()) if 'text_model' not in n and \
                                 'audio_model' not in n and 'video_model' not in n]
 
         optimizer_grouped_parameters = [
