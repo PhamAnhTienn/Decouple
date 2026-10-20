@@ -21,8 +21,8 @@
     "embed_dropout": 0.2,
     "res_dropout": 0.0,
     "dst_feature_dim_nheads": [
-        50,
-        10
+        32,
+        8
     ],
     "nmb_prototypes": 5,
     "freeze_prototypes_niters": 300,
