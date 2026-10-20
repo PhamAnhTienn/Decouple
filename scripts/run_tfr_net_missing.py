@@ -165,9 +165,13 @@ def main():
                 ret = subprocess.run(cmd, cwd=str(decouple_root), check=True)
             except subprocess.CalledProcessError as e:
                 print(f"[Error] Run failed for seed {seed}, missing rate {rate_str} with exit code {e.returncode}")
-                choice = input("Continue with next run? [Y/n]: ").strip().lower()
-                if choice == "n":
-                    print("Aborting benchmark.")
+                try:
+                    choice = input("Continue with next run? [Y/n]: ").strip().lower()
+                    if choice == "n":
+                        print("Aborting benchmark.")
+                        sys.exit(1)
+                except (EOFError, KeyboardInterrupt):
+                    print("Non-interactive session detected. Aborting benchmark.")
                     sys.exit(1)
 
     if not args.dry_run:
