@@ -45,7 +45,7 @@ class TFR_NET():
             optimizer = optim.Adam(model.parameters(), lr=lr_other, weight_decay=wd_other)
 
         patience = getattr(self.args, 'patience', 5)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, verbose=True, patience=patience)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience)
 
         epochs, best_epoch = 0, 0
         key_eval = getattr(self.args, 'KeyEval', 'Loss')
