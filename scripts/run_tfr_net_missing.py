@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="mosi", help="Dataset name (default: mosi)")
     parser.add_argument("--data_dir", type=str, default="./data", help="Path to data directory")
     parser.add_argument("--config_file", type=str, default="", help="Path to config JSON (default: config/tfr_net_{dataset}_config.json)")
-    parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use (default: 0)")
+    parser.add_argument("--gpu_ids", "--gpu", dest="gpu_ids", type=int, nargs="+", default=[0], help="GPU ID(s) to use (default: 0)")
     parser.add_argument("--seeds", type=int, nargs="+", default=[1111, 1112, 1113, 1114, 1115], help="Seeds to test")
     parser.add_argument(
         "--missing_rates",
@@ -142,7 +142,7 @@ def main():
                 "--data_missing",
                 "--missing_rate_eval_test", rate_str,
                 "--seeds", str(seed),
-                "--gpu_ids", str(args.gpu),
+                "--gpu_ids", *[str(g) for g in args.gpu_ids],
                 "--data_dir", args.data_dir,
                 "--model_save_dir", str(decouple_root / "pt" / f"seed_{seed}"),
                 "--res_save_dir", str(decouple_root / "result" / f"seed_{seed}"),
