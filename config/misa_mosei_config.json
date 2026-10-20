@@ -4,11 +4,11 @@
     "need_model_aligned": false,
     "use_finetune": true,
     "use_bert": true,
-    "early_stop": 3,
+    "early_stop": 8,
     "update_epochs": 2,
     "rnncell": "lstm",
     "use_cmd_sim": true,
-    "batch_size": 64,
+    "batch_size": 128,
     "learning_rate": 0.0001,
     "hidden_size": 128,
     "dropout": 0.5,
@@ -21,5 +21,7 @@
     "weight_decay": 5e-5,
     "transformers": "bert",
     "pretrained": "bert-base-uncased",
-    "KeyEval": "Loss"
+    "KeyEval": "Loss",
+    "selection_metric": "MOSI",
+    "scheduler_metric": "MOSI"
 }

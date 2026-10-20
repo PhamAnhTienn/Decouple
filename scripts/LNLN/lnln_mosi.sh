@@ -1,8 +1,7 @@
-#!/bin/bash
 python main.py \
     --data_missing \
-    --config_file "/home/tien/NCKH/DecAlign/config/misa_mosi_config.json" \
-    --model misa \
+    --config_file config/lnln_mosi_config.json \
+    --model lnln \
     --dataset mosi \
     --mode train \
     --seeds 1111 \

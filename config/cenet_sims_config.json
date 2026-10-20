@@ -1,0 +1,19 @@
+{
+    "model_name": "cenet",
+    "need_data_aligned": false,
+    "need_model_aligned": false,
+    "need_normalized": false,
+    "use_finetune": true,
+    "use_bert": true,
+    "early_stop": 5,
+    "batch_size": 64,
+    "learning_rate": 2e-06,
+    "weight_decay": 0.0,
+    "max_grad_norm": 2.0,
+    "adam_epsilon": 2e-08,
+    "transformers": "bert",
+    "pretrained": "bert-base-chinese",
+    "KeyEval": "Loss",
+    "selection_metric": "SIMS",
+    "scheduler_metric": "SIMS"
+}

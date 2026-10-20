@@ -139,45 +139,46 @@ class DP(nn.Module):
     def forward(self, text, audio, video, is_distill=False):
         if self.use_bert:
             text = self.text_model(text)
-        x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training)
-        x_a = audio.transpose(1, 2)
-        x_v = video.transpose(1, 2)
+        x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training) # B, Dl, T
+        x_a = audio.transpose(1, 2) # B, Da, T
+        x_v = video.transpose(1, 2) # B, Dv, T
 
-        proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
-        proj_x_a = x_a if self.orig_d_a == self.d_a else self.proj_a(x_a)
-        proj_x_v = x_v if self.orig_d_v == self.d_v else self.proj_v(x_v)
+        proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l) # B, d_l, Tl
+        proj_x_a = x_a if self.orig_d_a == self.d_a else self.proj_a(x_a) # B, d_l, Ta
+        proj_x_v = x_v if self.orig_d_v == self.d_v else self.proj_v(x_v) # B, d_l, Tv
 
-        s_l = self.encoder_s_l(proj_x_l)
-        s_v = self.encoder_s_v(proj_x_v)
-        s_a = self.encoder_s_a(proj_x_a)
+        s_l = self.encoder_s_l(proj_x_l) # B, d_l, Tl
+        s_v = self.encoder_s_v(proj_x_v) # B, d_l, Tv
+        s_a = self.encoder_s_a(proj_x_a) # B, d_l, Ta
 
-        c_l = self.encoder_c(proj_x_l)
-        c_v = self.encoder_c(proj_x_v)
-        c_a = self.encoder_c(proj_x_a)
+        c_l = self.encoder_c(proj_x_l) # B, d_l, Tl
+        c_v = self.encoder_c(proj_x_v) # B, d_l, Tv
+        c_a = self.encoder_c(proj_x_a) # B, d_l, Ta
         c_list = [c_l, c_v, c_a]
 
-        recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
-        recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
-        recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
+        recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1)) # B, d_l, Tl
+        recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1)) # B, d_l, Tv
+        recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1)) # B, d_l, Ta
 
-        s_l_r = self.encoder_s_l(recon_l)
-        s_v_r = self.encoder_s_v(recon_v)
-        s_a_r = self.encoder_s_a(recon_a)
+        s_l_r = self.encoder_s_l(recon_l) # B, d_l, Tl
+        s_v_r = self.encoder_s_v(recon_v) # B, d_l, Tv
+        s_a_r = self.encoder_s_a(recon_a) # B, d_l, Ta
 
-        s_l = s_l.permute(2, 0, 1)
-        s_v = s_v.permute(2, 0, 1)
-        s_a = s_a.permute(2, 0, 1)
+        s_l = s_l.permute(2, 0, 1) # Tl, B, d_l
+        s_v = s_v.permute(2, 0, 1) # Tv, B, d_l
+        s_a = s_a.permute(2, 0, 1) # Ta, B, d_l
 
-        c_l = c_l.permute(2, 0, 1)
-        c_v = c_v.permute(2, 0, 1)
-        c_a = c_a.permute(2, 0, 1)
-
-        hs_l_low = c_l.transpose(0, 1).contiguous().view(x_l.size(0), -1)
-        repr_l_low = self.proj1_l_low(hs_l_low)
+        c_l = c_l.permute(2, 0, 1) # Tl, B, d_l
+        c_v = c_v.permute(2, 0, 1) # Tv, B, d_l
+        c_a = c_a.permute(2, 0, 1) # Ta, B, d_l
+        
+        # Shared branch
+        hs_l_low = c_l.transpose(0, 1).contiguous().view(x_l.size(0), -1) # B, Tl * d_l
+        repr_l_low = self.proj1_l_low(hs_l_low) # B, d_l
         hs_proj_l_low = self.proj2_l_low(
-            F.dropout(F.relu(repr_l_low, inplace=True), p=self.output_dropout, training=self.training))
-        hs_proj_l_low += hs_l_low
-        logits_l_low = self.out_layer_l_low(hs_proj_l_low)
+            F.dropout(F.relu(repr_l_low, inplace=True), p=self.output_dropout, training=self.training)) # B, Tl * d_l
+        hs_proj_l_low += hs_l_low # B, Tl * d_l
+        logits_l_low = self.out_layer_l_low(hs_proj_l_low) # B, output_dim
 
         hs_v_low = c_v.transpose(0, 1).contiguous().view(x_v.size(0), -1)
         repr_v_low = self.proj1_v_low(hs_v_low)
@@ -193,19 +194,21 @@ class DP(nn.Module):
         hs_proj_a_low += hs_a_low
         logits_a_low = self.out_layer_a_low(hs_proj_a_low)
 
-        c_l_att = self.self_attentions_c_l(c_l)
+        # Self attention shared branch
+        c_l_att = self.self_attentions_c_l(c_l) # Tl, B, d_l
         if type(c_l_att) == tuple:
             c_l_att = c_l_att[0]
-        c_l_att = c_l_att[-1]
-        c_v_att = self.self_attentions_c_v(c_v)
+        c_l_att = c_l_att[-1] # B, d_l
+        c_v_att = self.self_attentions_c_v(c_v) # Tv, B, d_l
         if type(c_v_att) == tuple:
             c_v_att = c_v_att[0]
-        c_v_att = c_v_att[-1]
-        c_a_att = self.self_attentions_c_a(c_a)
+        c_v_att = c_v_att[-1] # B, d_l
+        c_a_att = self.self_attentions_c_a(c_a) # Ta, B, d_l
         if type(c_a_att) == tuple:
             c_a_att = c_a_att[0]
-        c_a_att = c_a_att[-1]
-        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)
+        c_a_att = c_a_att[-1] # B, d_l
+        
+        c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1) # B, 3*d_l
 
         c_proj = self.proj2_c(
             F.dropout(F.relu(self.proj1_c(c_fusion), inplace=True), p=self.output_dropout,
