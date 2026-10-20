@@ -148,12 +148,19 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
             'scheduler_mode': 'max',
         }
     elif dataset_name.lower() == 'sims':
-        chsims_path = os.path.join(data_dir, 'CH-SIMS/chsims.pkl')
-        mmsa_path = os.path.join(data_dir, 'SIMS/unaligned_39.pkl')
+        sims_candidates = [
+            os.path.join(data_dir, 'CH-SIMS/chsims.pkl'),
+            os.path.join(data_dir, 'CH-SIMS', 'chsims.pkl'),
+            os.path.join(data_dir, 'SIMS/unaligned_39.pkl'),
+            os.path.join(data_dir, 'SIMS/Processed/unaligned_39.pkl'),
+            os.path.join(data_dir, 'chsims.pkl'),
+            os.path.join(data_dir, 'unaligned_39.pkl'),
+        ]
+        sims_feature_path = next((p for p in sims_candidates if os.path.exists(p)), sims_candidates[0])
         dataset_config = {
             # DecAlign README uses CH-SIMS/chsims.pkl, while MMSA stores the same
             # preprocessed feature file as SIMS/Processed/unaligned_39.pkl.
-            'featurePath': chsims_path if os.path.exists(chsims_path) else mmsa_path,
+            'featurePath': sims_feature_path,
             'seq_lens': [39, 400, 55],
             'feature_dims': [768, 33, 709],
             'train_samples': 1368,
