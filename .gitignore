@@ -135,3 +135,5 @@ temp/
 .cache/
 transformers_cache/
 paper
+
+result/

@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size (recommended: 8 or 12 for 4GB VRAM)")
     parser.add_argument("--num_workers", type=int, default=0 if os.name == 'nt' else 4, help="Number of workers (default: 0 on Windows, 4 on Linux)")
     parser.add_argument("--num_epochs", type=int, default=None, help="Override number of epochs if desired")
+    parser.add_argument(
+        "--config_override",
+        action="append",
+        default=[],
+        help="Override any config value with key=value. Can be repeated.",
+    )
     parser.add_argument("--resume", action="store_true", default=True, help="Skip completed runs (default: True)")
     parser.add_argument("--no_resume", action="store_false", dest="resume", help="Do not skip completed runs")
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing")
@@ -155,6 +161,9 @@ def main():
 
             if args.num_epochs is not None:
                 cmd.extend(["--num_epochs", str(args.num_epochs)])
+
+            for override in args.config_override:
+                cmd.extend(["--config_override", override])
 
             print("Command:", " ".join(cmd))
 
