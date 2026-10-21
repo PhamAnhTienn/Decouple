@@ -121,7 +121,7 @@ class TFR_NET():
                     predict_loss += pred_loss.item()
                     generate_loss += gen_loss.item()
 
-                    y_pred.append(prediction.cpu())
+                    y_pred.append(prediction.detach().cpu())
                     y_true.append(labels.cpu())
 
                     if not left_epochs:
@@ -150,8 +150,7 @@ class TFR_NET():
             is_better = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
             if is_better:
                 best_valid, best_epoch = cur_valid, epochs
-                torch.save(model.cpu().state_dict(), self.args.model_save_path)
-                model.to(self.args.device)
+                torch.save(model.state_dict(), self.args.model_save_path)
 
             if return_epoch_results:
                 train_results["Loss"] = train_loss
