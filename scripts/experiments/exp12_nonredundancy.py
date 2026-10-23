@@ -300,7 +300,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoint")
     parser.add_argument("--missing_rates", type=float, nargs="+",
-                        default=[0.0, 0.3, 0.5, 0.7],
+                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
                         help="Missing rates to evaluate")
     parser.add_argument("--save_dir", type=str, default="./result/experiments/exp12")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=[0])
