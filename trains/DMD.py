@@ -241,7 +241,7 @@ class DMD():
 
                     combined_loss = loss_task + \
                                     graph_distill_loss_homo + graph_distill_loss_hetero + \
-                                    (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1
+                                    (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.5
 
                     # combined_loss = loss_task + \
                     #                 graph_distill_loss_homo + graph_distill_loss_hetero + \
