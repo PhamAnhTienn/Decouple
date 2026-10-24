@@ -160,10 +160,10 @@ class DP():
                     loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
 
                     # reconstruction loss (OLD uncertainty-reweighted — commented out)
-                    # loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
-                    # loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
-                    # loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
-                    # loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
+                    loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
+                    loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
+                    loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
+                    loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
                     # --- L_recon: cross-reconstruction loss (using CRM x_tilde features) ---
                     # # CAW-weighted version (commented out, CAW disabled):
@@ -173,23 +173,23 @@ class DP():
                     #     output['x_tilde_v'], output['origin_v'], recon_w['v'])
                     # loss_recon_a = self._weighted_recon_loss(
                     #     output['x_tilde_a'], output['origin_a'], recon_w['a'])
-                    loss_recon_l = self.MSE(output['x_tilde_l'], output['origin_l'])
-                    loss_recon_v = self.MSE(output['x_tilde_v'], output['origin_v'])
-                    loss_recon_a = self.MSE(output['x_tilde_a'], output['origin_a'])
-                    loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
+                    # loss_recon_l = self.MSE(output['x_tilde_l'], output['origin_l'])
+                    # loss_recon_v = self.MSE(output['x_tilde_v'], output['origin_v'])
+                    # loss_recon_a = self.MSE(output['x_tilde_a'], output['origin_a'])
+                    # loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
-                    # # cycle consistency loss (OLD — commented out, replaced by L_p)
-                    # loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0).detach(), output['s_l_r'])
-                    # loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0).detach(), output['s_v_r'])
-                    # loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0).detach(), output['s_a_r'])
-                    # loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
+                    # cycle consistency loss (OLD — commented out, replaced by L_p)
+                    loss_sl_slr = self.MSE(output['s_l'].permute(1, 2, 0).detach(), output['s_l_r'])
+                    loss_sv_slv = self.MSE(output['s_v'].permute(1, 2, 0).detach(), output['s_v_r'])
+                    loss_sa_sla = self.MSE(output['s_a'].permute(1, 2, 0).detach(), output['s_a_r'])
+                    loss_s_sr = loss_sl_slr + loss_sv_slv + loss_sa_sla
 
-                    # --- L_p (Eq. 10): specific preservation loss (replaces cycle consistency) ---
-                    # P̃_m should preserve original P_m after cross-reconstruction
-                    loss_p_l = self._specific_preservation_loss(output['p_tilde_l'], output['s_l'].permute(1, 2, 0))
-                    loss_p_v = self._specific_preservation_loss(output['p_tilde_v'], output['s_v'].permute(1, 2, 0))
-                    loss_p_a = self._specific_preservation_loss(output['p_tilde_a'], output['s_a'].permute(1, 2, 0))
-                    loss_p = loss_p_l + loss_p_v + loss_p_a
+                    # # --- L_p (Eq. 10): specific preservation loss (replaces cycle consistency) ---
+                    # # P̃_m should preserve original P_m after cross-reconstruction
+                    # loss_p_l = self._specific_preservation_loss(output['p_tilde_l'], output['s_l'].permute(1, 2, 0))
+                    # loss_p_v = self._specific_preservation_loss(output['p_tilde_v'], output['s_v'].permute(1, 2, 0))
+                    # loss_p_a = self._specific_preservation_loss(output['p_tilde_a'], output['s_a'].permute(1, 2, 0))
+                    # loss_p = loss_p_l + loss_p_v + loss_p_a
 
                     # ort loss
                     s_l = output['s_l'].transpose(0, 1).contiguous().view(labels.size(0), -1)
@@ -214,13 +214,13 @@ class DP():
                         output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
                     )
 
-                    combined_loss = loss_task + \
-                                        (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
-                    
                     # combined_loss = loss_task + \
-                    #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
+                    #                     (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
                     #                     + loss_cluster * LAMBDA_CLUSTER
+                    
+                    combined_loss = loss_task + \
+                                        (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
+                                        + loss_cluster * LAMBDA_CLUSTER
                     
                     combined_loss.backward()
 

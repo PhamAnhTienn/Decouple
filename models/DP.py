@@ -854,58 +854,58 @@ class DP(nn.Module):
         c_a = self.encoder_c(proj_x_a)
         c_list = [c_l, c_v, c_a]
 
-        # # --- OLD reconstruction (commented out, replaced by CRM) ---
-        # recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
-        # recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
-        # recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
+        # --- OLD reconstruction (commented out, replaced by CRM) ---
+        recon_l = self.decoder_l(torch.cat([s_l, c_list[0]], dim=1))
+        recon_v = self.decoder_v(torch.cat([s_v, c_list[1]], dim=1))
+        recon_a = self.decoder_a(torch.cat([s_a, c_list[2]], dim=1))
         
-        # s_l_r = self.encoder_s_l(recon_l)
-        # s_v_r = self.encoder_s_v(recon_v)
-        # s_a_r = self.encoder_s_a(recon_a)
+        s_l_r = self.encoder_s_l(recon_l)
+        s_v_r = self.encoder_s_v(recon_v)
+        s_a_r = self.encoder_s_a(recon_a)
 
-        # ==============================================================
-        # Cross-Reconstruction Module (CRM) (Section 3.3)
-        #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
-        #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
-        #   Dynamic attention alignment: H_n is softly aligned to T_m
-        #   using P_m as query, preserving 100% of source information.
-        # ==============================================================
-        # For target L: use shared from V and A (aligned to T_l) + specific from L
-        c_v_l = self._align_time_attention(c_v, s_l)
-        c_a_l = self._align_time_attention(c_a, s_l)
-        x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
-        x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
-        x_tilde_l = self.fusion_l(
-            torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_l)
+        # # ==============================================================
+        # # Cross-Reconstruction Module (CRM) (Section 3.3)
+        # #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
+        # #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
+        # #   Dynamic attention alignment: H_n is softly aligned to T_m
+        # #   using P_m as query, preserving 100% of source information.
+        # # ==============================================================
+        # # For target L: use shared from V and A (aligned to T_l) + specific from L
+        # c_v_l = self._align_time_attention(c_v, s_l)
+        # c_a_l = self._align_time_attention(c_a, s_l)
+        # x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
+        # x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
+        # x_tilde_l = self.fusion_l(
+        #     torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
+        # ).permute(0, 2, 1)  # (B, d, T_l)
 
-        # For target V: use shared from L and A (aligned to T_v) + specific from V
-        c_l_v = self._align_time_attention(c_l, s_v)
-        c_a_v = self._align_time_attention(c_a, s_v)
-        x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
-        x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
-        x_tilde_v = self.fusion_v(
-            torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_v)
+        # # For target V: use shared from L and A (aligned to T_v) + specific from V
+        # c_l_v = self._align_time_attention(c_l, s_v)
+        # c_a_v = self._align_time_attention(c_a, s_v)
+        # x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
+        # x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
+        # x_tilde_v = self.fusion_v(
+        #     torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
+        # ).permute(0, 2, 1)  # (B, d, T_v)
 
-        # For target A: use shared from L and V (aligned to T_a) + specific from A
-        c_l_a = self._align_time_attention(c_l, s_a)
-        c_v_a = self._align_time_attention(c_v, s_a)
-        x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
-        x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
-        x_tilde_a = self.fusion_a(
-            torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_a)
+        # # For target A: use shared from L and V (aligned to T_a) + specific from A
+        # c_l_a = self._align_time_attention(c_l, s_a)
+        # c_v_a = self._align_time_attention(c_v, s_a)
+        # x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
+        # x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
+        # x_tilde_a = self.fusion_a(
+        #     torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
+        # ).permute(0, 2, 1)  # (B, d, T_a)
 
-        # Re-disentangle reconstructed features (Eq. 9):
-        #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
-        h_tilde_l = self.encoder_c(x_tilde_l)     # (B, d, T)
-        h_tilde_v = self.encoder_c(x_tilde_v)
-        h_tilde_a = self.encoder_c(x_tilde_a)
+        # # Re-disentangle reconstructed features (Eq. 9):
+        # #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
+        # h_tilde_l = self.encoder_c(x_tilde_l)     # (B, d, T)
+        # h_tilde_v = self.encoder_c(x_tilde_v)
+        # h_tilde_a = self.encoder_c(x_tilde_a)
 
-        p_tilde_l = self.encoder_s_l(x_tilde_l)   # (B, d, T)
-        p_tilde_v = self.encoder_s_v(x_tilde_v)
-        p_tilde_a = self.encoder_s_a(x_tilde_a)
+        # p_tilde_l = self.encoder_s_l(x_tilde_l)   # (B, d, T)
+        # p_tilde_v = self.encoder_s_v(x_tilde_v)
+        # p_tilde_a = self.encoder_s_a(x_tilde_a)
 
         # ==============================================================
         # Conflict-Aware Weighting (CAW) (Section 3.2) — commented out,
@@ -1161,23 +1161,23 @@ class DP(nn.Module):
             'c_l': c_l,
             'c_v': c_v, # T, B, D
             'c_a': c_a,
-            # # --- OLD reconstruction outputs (commented out, replaced by CRM) ---
-            # 's_l_r': s_l_r,
-            # 's_v_r': s_v_r,
-            # 's_a_r': s_a_r,
-            # 'recon_l': recon_l,
-            # 'recon_v': recon_v,
-            # 'recon_a': recon_a,
-            # --- CRM cross-reconstruction outputs ---
-            'x_tilde_l': x_tilde_l,  # (B, d, T) cross-reconstructed features
-            'x_tilde_v': x_tilde_v,
-            'x_tilde_a': x_tilde_a,
-            'h_tilde_l': h_tilde_l,  # (B, d, T) re-disentangled shared
-            'h_tilde_v': h_tilde_v,
-            'h_tilde_a': h_tilde_a,
-            'p_tilde_l': p_tilde_l,  # (B, d, T) re-disentangled specific (replaces s_l_r)
-            'p_tilde_v': p_tilde_v,
-            'p_tilde_a': p_tilde_a,
+            # --- OLD reconstruction outputs (commented out, replaced by CRM) ---
+            's_l_r': s_l_r,
+            's_v_r': s_v_r,
+            's_a_r': s_a_r,
+            'recon_l': recon_l,
+            'recon_v': recon_v,
+            'recon_a': recon_a,
+            # # --- CRM cross-reconstruction outputs ---
+            # 'x_tilde_l': x_tilde_l,  # (B, d, T) cross-reconstructed features
+            # 'x_tilde_v': x_tilde_v,
+            # 'x_tilde_a': x_tilde_a,
+            # 'h_tilde_l': h_tilde_l,  # (B, d, T) re-disentangled shared
+            # 'h_tilde_v': h_tilde_v,
+            # 'h_tilde_a': h_tilde_a,
+            # 'p_tilde_l': p_tilde_l,  # (B, d, T) re-disentangled specific (replaces s_l_r)
+            # 'p_tilde_v': p_tilde_v,
+            # 'p_tilde_a': p_tilde_a,
             'logits_l_hetero': logits_l_high,
             'logits_v_hetero': logits_v_high,
             'logits_a_hetero': logits_a_high,

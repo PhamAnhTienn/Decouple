@@ -27,7 +27,7 @@
     "nmb_prototypes": 5,
     "freeze_prototypes_niters": 300,
     "batch_size": 64,
-    "learning_rate": 0.00005,
+    "learning_rate": 1e-4,
     "nlevels": 4,
     "conv1d_kernel_size_l": 5,
     "conv1d_kernel_size_a": 5,
