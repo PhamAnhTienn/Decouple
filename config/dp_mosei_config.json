@@ -35,5 +35,9 @@
     "pretrained": "bert-base-uncased",
     "KeyEval": "Loss",
     "selection_metric": "MOSI",
-    "scheduler_metric": "MOSI"
+    "scheduler_metric": "MOSI",
+    "lambda_recon_group": 0.1,
+    "lambda_ort": 0.1,
+    "lambda_cluster": 0.1,
+    "lambda_preserve": 0.1
 }

@@ -248,6 +248,11 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate')
     parser.add_argument('--missing_rate_eval_test', type=float, default=0.0, help='Missing rate for evaluation and testing')
     parser.add_argument('--data_missing', action='store_true', help='Enable missing modality simulation')
+    parser.add_argument('--lambda_recon_group', type=float, default=None, help='Weight for reconstruction group loss')
+    parser.add_argument('--lambda_ort', type=float, default=None, help='Weight for orthogonality loss')
+    parser.add_argument('--lambda_cluster', type=float, default=None, help='Weight for CPA/clustering loss')
+    parser.add_argument('--lambda_preserve', type=float, default=None, help='Weight for specific preservation loss')
+    parser.add_argument('--lambda_recon', type=float, default=None, help='Weight for reconstruction loss within group')
     parser.add_argument(
         '--config_override',
         action='append',
@@ -269,6 +274,11 @@ def main():
             'missing_rate_eval_test': args.missing_rate_eval_test,
             'data_missing': args.data_missing,
             'K_neighbors': args.K_neighbors,
+            'lambda_recon_group': args.lambda_recon_group,
+            'lambda_ort': args.lambda_ort,
+            'lambda_cluster': args.lambda_cluster,
+            'lambda_preserve': args.lambda_preserve,
+            'lambda_recon': args.lambda_recon,
         }.items()
         if value is not None
     })

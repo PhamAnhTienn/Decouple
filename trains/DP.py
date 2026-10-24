@@ -54,6 +54,31 @@ class DP():
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
 
+        # Loss weights configurable via config / CLI overrides
+        self.lambda_recon_group = getattr(
+            args, 'lambda_recon_group',
+            getattr(args, 'LAMBDA_RECON_GROUP', LAMBDA_RECON_GROUP)
+        )
+        self.lambda_ort = getattr(
+            args, 'lambda_ort',
+            getattr(args, 'lambda_ort_inner',
+            getattr(args, 'LAMBDA_ORT_INNER',
+            getattr(args, 'LAMBDA_ORT', LAMBDA_ORT_INNER)))
+        )
+        self.lambda_cluster = getattr(
+            args, 'lambda_cluster',
+            getattr(args, 'lambda_cpa',
+            getattr(args, 'LAMBDA_CLUSTER', LAMBDA_CLUSTER))
+        )
+        self.lambda_preserve = getattr(
+            args, 'lambda_preserve',
+            getattr(args, 'LAMBDA_PRESERVE', LAMBDA_PRESERVE)
+        )
+        self.lambda_recon = getattr(
+            args, 'lambda_recon',
+            getattr(args, 'LAMBDA_RECON', 1.0)
+        )
+
     def _weighted_recon_loss(self, x_tilde, x_orig, w):
         """
         Weighted cross-reconstruction loss (Eq. 8).
@@ -114,6 +139,37 @@ class DP():
         # bank_update_freq=N → every N epochs (cheaper, slightly stale)
         bank_update_freq = getattr(self.args, 'bank_update_freq', 1)
         global_iter = 0
+
+        # Loss weights configurable via config / CLI overrides
+        lambda_recon_group = getattr(
+            self.args, 'lambda_recon_group',
+            getattr(self.args, 'LAMBDA_RECON_GROUP', self.lambda_recon_group)
+        )
+        lambda_ort = getattr(
+            self.args, 'lambda_ort',
+            getattr(self.args, 'lambda_ort_inner',
+            getattr(self.args, 'LAMBDA_ORT_INNER',
+            getattr(self.args, 'LAMBDA_ORT', self.lambda_ort)))
+        )
+        lambda_cluster = getattr(
+            self.args, 'lambda_cluster',
+            getattr(self.args, 'lambda_cpa',
+            getattr(self.args, 'LAMBDA_CLUSTER', self.lambda_cluster))
+        )
+        lambda_preserve = getattr(
+            self.args, 'lambda_preserve',
+            getattr(self.args, 'LAMBDA_PRESERVE', self.lambda_preserve)
+        )
+        lambda_recon = getattr(
+            self.args, 'lambda_recon',
+            getattr(self.args, 'LAMBDA_RECON', getattr(self, 'lambda_recon', 1.0))
+        )
+
+        # logger.info(
+        #     f">> Loss weights: lambda_recon_group={lambda_recon_group}, "
+        #     f"lambda_ort={lambda_ort}, lambda_cluster={lambda_cluster}, "
+        #     f"lambda_preserve={lambda_preserve}, lambda_recon={lambda_recon}"
+        # )
 
         while True:
             epochs += 1
@@ -210,17 +266,20 @@ class DP():
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
                     # CPA loss (Cross-modal Prototype Alignment)
+                    cpa_tau = getattr(self.args, 'cpa_tau', 0.1)
+                    cpa_epsilon = getattr(self.args, 'cpa_epsilon', 0.05)
+                    cpa_sinkhorn_iterations = getattr(self.args, 'sinkhorn_iterations', 3)
                     loss_cluster = model.compute_cpa_loss(
-                        output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                        output, tau=cpa_tau, epsilon=cpa_epsilon, sinkhorn_iterations=cpa_sinkhorn_iterations
                     )
 
                     combined_loss = loss_task + \
-                                        (loss_p + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                                        + loss_cluster * LAMBDA_CLUSTER
+                                        (loss_p * lambda_preserve + loss_recon * lambda_recon + loss_ort * lambda_ort) * lambda_recon_group \
+                                        + loss_cluster * lambda_cluster
                     
                     # combined_loss = loss_task + \
-                    #                     (loss_s_sr + loss_recon + loss_ort * LAMBDA_ORT_INNER) * LAMBDA_RECON_GROUP \
-                    #                     + loss_cluster * LAMBDA_CLUSTER
+                    #                     (loss_s_sr + loss_recon + loss_ort * lambda_ort) * lambda_recon_group \
+                    #                     + loss_cluster * lambda_cluster
                     
                     combined_loss.backward()
 
@@ -232,6 +291,8 @@ class DP():
 
                     if self.args.grad_clip != -1.0:
                         nn.utils.clip_grad_value_(model.parameters(), self.args.grad_clip)
+
+                    global_iter += 1
 
                     train_loss += combined_loss.item()
 
