@@ -11,6 +11,7 @@ from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
 
+LAMBDA_TASK        = 1.0
 LAMBDA_RECON_GROUP = 0.1
 LAMBDA_ORT_INNER   = 0.1
 LAMBDA_CLUSTER     = 0.1
@@ -55,6 +56,10 @@ class DP():
         self.MSE = MSE()
 
         # Loss weights configurable via config / CLI overrides
+        self.lambda_task = getattr(
+            args, 'lambda_task',
+            getattr(args, 'LAMBDA_TASK', LAMBDA_TASK)
+        )
         self.lambda_recon_group = getattr(
             args, 'lambda_recon_group',
             getattr(args, 'LAMBDA_RECON_GROUP', LAMBDA_RECON_GROUP)
@@ -141,6 +146,10 @@ class DP():
         global_iter = 0
 
         # Loss weights configurable via config / CLI overrides
+        lambda_task = getattr(
+            self.args, 'lambda_task',
+            getattr(self.args, 'LAMBDA_TASK', self.lambda_task)
+        )
         lambda_recon_group = getattr(
             self.args, 'lambda_recon_group',
             getattr(self.args, 'LAMBDA_RECON_GROUP', self.lambda_recon_group)
@@ -273,7 +282,7 @@ class DP():
                         output, tau=cpa_tau, epsilon=cpa_epsilon, sinkhorn_iterations=cpa_sinkhorn_iterations
                     )
 
-                    combined_loss = loss_task + \
+                    combined_loss = loss_task * lambda_task + \
                                         (loss_p * lambda_preserve + loss_recon * lambda_recon + loss_ort * lambda_ort) * lambda_recon_group \
                                         + loss_cluster * lambda_cluster
                     

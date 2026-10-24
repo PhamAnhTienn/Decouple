@@ -36,6 +36,7 @@
     "KeyEval": "Loss",
     "selection_metric": "MOSI",
     "scheduler_metric": "MOSI",
+    "lambda_task": 1.0,
     "lambda_recon_group": 0.1,
     "lambda_ort": 0.1,
     "lambda_cluster": 0.1,
