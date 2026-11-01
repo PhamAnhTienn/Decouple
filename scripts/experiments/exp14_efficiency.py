@@ -117,19 +117,31 @@ def count_param_groups(model):
 def compute_bank_size(model):
     """
     Compute the memory bank size in bytes and MB.
+    With centered standardized subspace repr, we store mu_dir (1, D) and sigma (scalar)
+    per modality per subspace {c, s} instead of the full (N_train, D) banks.
     """
     total_bytes = 0
-    for key in ["l", "v", "a"]:
-        if key in model._train_bank_z_c:
-            total_bytes += model._train_bank_z_c[key].nelement() * model._train_bank_z_c[key].element_size()
-        if key in model._train_bank_z_s:
-            total_bytes += model._train_bank_z_s[key].nelement() * model._train_bank_z_s[key].element_size()
+
+    def _add_stats(mu_dir_dict, sigma_dict):
+        nonlocal total_bytes
+        for key in ["l", "v", "a"]:
+            if key in mu_dir_dict:
+                total_bytes += mu_dir_dict[key].nelement() * mu_dir_dict[key].element_size()
+            if key in sigma_dict:
+                sigma = sigma_dict[key]
+                if hasattr(sigma, 'nelement'):
+                    total_bytes += sigma.nelement() * sigma.element_size()
+                else:
+                    total_bytes += 4  # scalar float32
+
+    _add_stats(model._train_mu_dir_c, model._train_sigma_c)  # shared
+    _add_stats(model._train_mu_dir_s, model._train_sigma_s)  # specific
 
     return {
         "bytes": total_bytes,
         "MB": total_bytes / (1024 ** 2),
-        "entries": model._train_bank_z_c["l"].shape[0] if "l" in model._train_bank_z_c else 0,
-        "dim": model._train_bank_z_c["l"].shape[1] if "l" in model._train_bank_z_c else 0,
+        "entries": "N/A (centroid+sigma per subspace)",
+        "dim": model._train_mu_dir_s["l"].shape[1] if "l" in model._train_mu_dir_s else 0,
     }
 
 
@@ -214,12 +226,12 @@ def time_inference(model, dataloader, device, max_batches=None):
 
 
 # =====================================================================
-# Timing: KNN retrieval
+# Timing: specific residual uncertainty
 # =====================================================================
 
-def time_knn_retrieval(model, dataloader, device, K=10, max_batches=5):
+def time_specific_uncertainty(model, dataloader, device, K=10, max_batches=5):
     """
-    Time KNN retrieval specifically (bank lookup).
+    Time specific residual uncertainty computation (centroid-based).
     """
     model.eval()
     times = []
@@ -235,17 +247,16 @@ def time_knn_retrieval(model, dataloader, device, K=10, max_batches=5):
             audio_m = batch.get("audio_m", batch["audio"]).to(device)
             vision_m = batch.get("vision_m", batch["vision"]).to(device)
 
-            # Run through encoders to get z_c, z_s
+            # Run through encoders to get features
             output = model(text_m, audio_m, vision_m, text, audio, vision)
 
-            # Extract z_c and z_s
-            z_c = {m: F.normalize(output[f"c_{m}"].mean(dim=0), dim=1) for m in ["l", "v", "a"]}
-            z_s = {m: F.normalize(output[f"s_{m}"].mean(dim=0), dim=1) for m in ["l", "v", "a"]}
+            # Unnormalized mean-pooled specific features
+            s_bar = {m: output[f"s_{m}"].mean(dim=0) for m in ["l", "v", "a"]}
 
-            # Time just the bank lookup
+            # Time the residual uncertainty computation
             torch.cuda.synchronize()
             t0 = time.time()
-            _ = model._neighbor_uncertainty_bank(z_c, z_s, K)
+            _ = model._specific_residual_uncertainty(s_bar)
             torch.cuda.synchronize()
             t1 = time.time()
 
@@ -393,11 +404,10 @@ def main():
     model.update_train_bank(model, dataloader["train"], model_args.device)
     results["bank"] = compute_bank_size(model)
 
-    # 3. KNN retrieval latency
-    print("[3/5] Measuring KNN retrieval latency...")
-    results["knn_latency_ms"] = time_knn_retrieval(
+    # 3. Specific residual uncertainty latency
+    print("[3/5] Measuring specific uncertainty latency...")
+    results["specific_uncertainty_latency_ms"] = time_specific_uncertainty(
         model, dataloader["test"], model_args.device,
-        K=getattr(model_args, "K_neighbors", 10),
     )
 
     # 4. Train epoch timing

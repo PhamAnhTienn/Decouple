@@ -266,7 +266,7 @@ class DP():
                         train_dataloader=dataloader['train'],
                         device=self.args.device,
                     )
-                    logger.info(f">> Train bank updated: {model._train_bank_z_c['l'].shape[0]} samples.")
+                    logger.info(f">> Train bank updated: {len(dataloader['train'].dataset)} samples.")
 
                 # validation
                 val_results = self.do_test(model, dataloader['valid'], mode="VAL")

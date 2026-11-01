@@ -133,7 +133,7 @@ def common_heat_scale(arrays):
 
 def plot_line(data, out_dir, venue, kind):
     apply_style(venue, kind)
-    fig, axes = new_fig(1, 2, height=2.75, sharey=True)
+    fig, axes = new_fig(1, 2, height=2.75, sharey=False)
     fs = FS[kind]
     series = ((data["shared"], "Mean shared reliability"),
               (data["specific"], "Mean specific reliability"))
@@ -160,8 +160,9 @@ def plot_line(data, out_dir, venue, kind):
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.grid(axis="y", zorder=0)
         ax.set_axisbelow(True)
+        # Each panel gets its own y-range so small differences are more visible.
+        ax.set_ylim(*get_common_ylim([matrix]))
 
-    axes[0].set_ylim(*get_common_ylim([data["shared"], data["specific"]]))
     shared_legend(fig, all_handles, [h.get_label() for h in all_handles], ncol=3)
     save_fig(fig, out_dir / "exp05_mean_reliability_line")
 

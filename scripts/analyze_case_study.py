@@ -1,779 +1,690 @@
+"""Create the MOSI missing-modality motivation figure.
+
+The figure compares one MOSI test example per model under MR=0.0 and MR=0.5
+for SARM, DecAlign, and DMD. It uses only two scores available for every model
+
+Examples
+  python scripts/analyze_case_study.py
+  python scripts/analyze_case_study.py --reuse_cache
+
+Outputs: result/figures/motivation/ and result/case_study_scores/.
 """
-Case Study & Fusion Weight Analysis.
 
-Computes fusion weights (r_m^c, r_m^s) from saved uncertainty metrics,
-finds failure/success case studies, and produces publication-quality figures:
-
-  A. Qualitative Case Study panels (similar to CICA paper Figure)
-  B. Fusion Weight vs Missing Rate trend chart
-  C. Per-sample weight distribution violin plots
-
-Usage:
-    conda activate baseline
-    python scripts/analyze_case_study.py [--tau_c 1.0] [--tau_s 1.0] [--r_min 0.1]
-
-Output: result/figures/case_study/
-"""
+from __future__ import annotations
 
 import argparse
+import csv
+import gc
+import math
+import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Tuple
 
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import torch
-import seaborn as sns
+import torch.nn.functional as F
+from tqdm import tqdm
 
-# ─── Configuration ────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
-UNCERTAINTY_DIR = ROOT / 'result' / 'uncertainty'
-FIG_DIR = ROOT / 'result' / 'figures' / 'case_study'
-FIG_DIR.mkdir(parents=True, exist_ok=True)
+# Allow ``python scripts/analyze_case_study.py`` from the repository root.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+CHECKPOINT_DIR = ROOT / "pt"
+CACHE_DIR = ROOT / "result" / "case_study_scores"
+FIG_DIR = ROOT / "result" / "figures" / "motivation"
 
-MISSING_RATES = [round(x * 0.1, 1) for x in range(10)]
-SEED = 1111
-MODALITIES = ['l', 'v', 'a']
-MOD_NAMES = {'l': 'Text (T)', 'v': 'Video (V)', 'a': 'Audio (A)'}
-MOD_NAMES_SHORT = {'l': 'T', 'v': 'V', 'a': 'A'}
-MOD_COLORS = {'l': '#4CAF50', 'v': '#2196F3', 'a': '#F44336'}
+MODALITIES = ("l", "v", "a")
+MODEL_SPECS = {
+    "sarm": {
+        "model_name": "dp",
+        "display_name": "SARM",
+        "config": ROOT / "config" / "dp_mosi_config.json",
+    },
+    "decalign": {
+        "model_name": "decalign",
+        "display_name": "DecAlign",
+        "config": ROOT / "config" / "dec_mosi_config.json",
+    },
+    "dmd": {
+        "model_name": "dmd",
+        "display_name": "DMD",
+        "config": ROOT / "config" / "dmd_mosi_config.json",
+    },
+}
+MODEL_ORDER = ("sarm", "decalign", "dmd")
 
-# Aesthetics
-sns.set_theme(style='whitegrid', font_scale=1.05)
-plt.rcParams['font.family'] = 'DejaVu Sans'
-plt.rcParams['axes.titleweight'] = 'bold'
+# Hardcoded Acc-7 values for the figure (from official evaluation)
+ACC7_VALUES = {
+    0.0: {"sarm": 44.23, "decalign": 37.73, "dmd": 44.0},
+    0.5: {"sarm": 33.67, "decalign": 27.0,  "dmd": 30.67},
+}
+
+ACL_COL_W = 3.03  # in, \columnwidth
+SHOW_VALUES = False  # số trên thanh ở 5 pt rất nhỏ; bật nếu thật cần
+
+_DISPLAY = {"sarm": "SARM", "decalign": "DecAlign", "dmd": "DMD"} 
+
+COLOR_CON, COLOR_SPEC = "#F28E2B", "#4E79A7"
+EDGE_CON, EDGE_SPEC = "#D07520", "#3A6186"
+MISS_FACE = "#FBE4E4"      # band behind the missing modality
+ACCENT = "#C0392B"         # red: missing tick / delta label
+ 
+SUMMARY_TITLE = r"Text missing: Change on $u^{\mathrm{specific}}$"
+ 
+ 
+def _np(x) -> np.ndarray:
+    """torch.Tensor / ndarray -> ndarray (keeps this module torch-free)."""
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+ 
+ 
+def _minus(s: str) -> str:
+    return s.replace("-", "\u2212")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Infer MOSI checkpoints and plot shared/specific uncertainty."
+    )
+    parser.add_argument("--checkpoint_dir", type=Path, default=CHECKPOINT_DIR)
+    parser.add_argument("--cache_dir", type=Path, default=CACHE_DIR)
+    parser.add_argument("--fig_dir", type=Path, default=FIG_DIR)
+    parser.add_argument("--seed", type=int, default=1111)
+    parser.add_argument("--neighbors", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override inference batch size (useful on a small GPU/CPU).")
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--reuse_cache", action="store_true",
+                        help="Do not run inference; require the six cached score files.")
+    parser.add_argument("--models", nargs="+", choices=MODEL_ORDER,
+                        default=list(MODEL_ORDER),
+                        help="Models to infer. The comparative figure needs all three.")
+    parser.add_argument("--summary", choices=("dataset", "case"),
+                        default="dataset")
+    return parser.parse_args()
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Data loading & weight computation
-# ═══════════════════════════════════════════════════════════════════════
-def load_uncertainty(mr: float, uncertainty_dir=None):
-    if uncertainty_dir is None:
-        uncertainty_dir = UNCERTAINTY_DIR
-    path = uncertainty_dir / f'uncertainty_mosi_mr{mr:.1f}_seed{SEED}.pt'
-    if not path.exists():
-        raise FileNotFoundError(f'Missing file: {path}')
-    return torch.load(path, weights_only=False)
+def resolve_device(requested: str) -> torch.device:
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is not available.")
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(requested)
 
 
-def compute_weights_from_data(data, tau_c=1.0, tau_s=1.0, r_min=0.1):
-    """
-    Compute fusion weights from raw uncertainty metrics in a data dict.
-    Works on pre-existing .pt files that may not have fusion weights yet.
-
-    Returns updated data dict with added keys:
-        u_{m}_shared, u_{m}_specific, r_{m}_shared, r_{m}_specific
-    """
-    for m in MODALITIES:
-        # Aggregated uncertainties
-        u_c = 0.5 * (data[f'u_{m}_shared_consensus'] + data[f'u_{m}_shared_cycle'])
-        u_s = 0.5 * (data[f'u_{m}_specific_neighbor'] + data[f'u_{m}_specific_cycle'])
-
-        # Fusion weights
-        r_c = torch.clamp(torch.exp(-u_c / tau_c), min=r_min, max=1.0)
-        r_s = torch.clamp(torch.exp(-u_s / tau_s), min=r_min, max=1.0)
-
-        data[f'u_{m}_shared'] = u_c
-        data[f'u_{m}_specific'] = u_s
-        data[f'r_{m}_shared'] = r_c
-        data[f'r_{m}_specific'] = r_s
-
-    return data
+def set_seed(seed: int) -> None:
+    """Keep modality masking and the selected case reproducible."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def load_all(tau_c=1.0, tau_s=1.0, r_min=0.1, missing_rates=None, uncertainty_dir=None):
-    """Load and compute weights for all missing rates."""
-    if missing_rates is None:
-        missing_rates = MISSING_RATES
-    datasets = {}
-    for mr in missing_rates:
-        data = load_uncertainty(mr, uncertainty_dir=uncertainty_dir)
-        data = compute_weights_from_data(data, tau_c, tau_s, r_min)
-        datasets[mr] = data
-    return datasets
+def checkpoint_path(checkpoint_dir: Path, model_key: str, missing_rate: float) -> Path:
+    filename_key = "dp" if model_key == "sarm" else model_key
+    path = checkpoint_dir / f"{filename_key}-mosi-missing{missing_rate:.1f}.pth"
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    return path
 
 
-def get_error(data):
-    """Per-sample absolute prediction error."""
-    return (data['labels'] - data['predictions']).abs().numpy()
+def cache_path(cache_dir: Path, model_key: str, missing_rate: float, seed: int) -> Path:
+    return cache_dir / f"{model_key}_mosi_mr{missing_rate:.1f}_seed{seed}.pt"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# A. Qualitative Case Study (CICA-style 3-panel)
-# ═══════════════════════════════════════════════════════════════════════
-def find_case_studies(data, n_failure=3, n_conflict=3):
-    """
-    Find case studies:
-      - conflict (CICA-style success): Unimodal conflict, Avg Fusion gives wrong sentiment sign
-        or large error, but DecAlign is correct because it suppresses corrupted modalities.
-      - failure: Samples where DecAlign has the highest prediction error.
-    """
-    error = get_error(data)
-    preds = data['predictions'].numpy()
-    labels = data['labels'].numpy()
+def build_args(model_key: str, missing_rate: float, seed: int, device: torch.device,
+               batch_size: int | None) -> SimpleNamespace:
+    """Build the exact architecture configuration for each checkpoint."""
+    from config import get_config_regression
 
-    # Failure cases: top-N highest error
-    failure_idx = np.argsort(-error)[:n_failure]
+    spec = MODEL_SPECS[model_key]
+    args = get_config_regression(
+        spec["model_name"], "mosi", config_file=spec["config"], data_dir=ROOT / "data"
+    )
+    args.data_missing = True
+    args.missing_rate_eval_test = missing_rate
+    args.cur_seed = seed
+    args.device = device
+    if batch_size is not None:
+        args.batch_size = batch_size
+    return args
 
-    # Conflict cases (CICA-style input conflict)
-    has_uni = 'pred_l' in data and 'pred_v' in data and 'pred_a' in data
-    if has_uni:
-        pred_l = data['pred_l'].numpy()
-        pred_v = data['pred_v'].numpy()
-        pred_a = data['pred_a'].numpy()
-        pred_avg = (pred_l + pred_v + pred_a) / 3.0
 
-        err_avg = np.abs(labels - pred_avg)
-        improvement = err_avg - error
+def _mean_pool(feature: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Pool either (T, B, D) or (B, D, T) features into (B, D)."""
+    if feature.ndim != 3:
+        raise ValueError(f"Expected a 3-D representation, got {tuple(feature.shape)}")
+    if feature.shape[1] == batch_size:  # (T, B, D), used by SARM
+        return feature.mean(dim=0)
+    if feature.shape[0] == batch_size:  # (B, D, T), used by DecAlign
+        return feature.mean(dim=2)
+    raise ValueError(f"Cannot locate batch dimension in representation {tuple(feature.shape)}")
 
-        signs = np.sign(np.stack([pred_l, pred_v, pred_a], axis=1))
-        conflict_mask = (signs.min(axis=1) * signs.max(axis=1) < 0)
-        gt_sign = np.sign(labels)
-        model_sign_correct = (np.sign(preds) == gt_sign) & (np.abs(labels) > 0.2)
-        avg_sign_wrong = (np.sign(pred_avg) != gt_sign)
-        ideal_mask = conflict_mask & model_sign_correct & avg_sign_wrong
-
-        if ideal_mask.sum() >= n_conflict:
-            cand = np.where(ideal_mask)[0]
-            conflict_idx = cand[np.argsort(-improvement[cand])][:n_conflict]
-        else:
-            cand = np.where(conflict_mask)[0] if conflict_mask.sum() > 0 else np.arange(len(labels))
-            conflict_idx = cand[np.argsort(-improvement[cand])][:n_conflict]
+def _bar(ax, x, val, w, fc, ec, ref=None, z=3.0):
+    """Solid bar. If `ref` (value at MR=0.0) is given, draw the change on top:
+    gain -> hatched segment above the old level, loss -> dashed outline."""
+    if ref is None:
+        ax.bar(x, val, w, color=fc, edgecolor=ec, linewidth=0.5, zorder=z)
+        return
+    ax.bar(x, min(val, ref), w, color=fc, edgecolor=ec, linewidth=0.5, zorder=z)
+    d = val - ref
+    if d >= 0:
+        ax.bar(x, d, w, bottom=ref, facecolor=fc, edgecolor="white", hatch="//////",
+               linewidth=0, zorder=z)
+        ax.bar(x, d, w, bottom=ref, facecolor="none", edgecolor=ec, linewidth=0.8,
+               zorder=z + 0.1)
     else:
-        low_error_mask = error < np.percentile(error, 30)
-        r_all = np.stack([
-            data[f'r_{m}_shared'].numpy() for m in MODALITIES
-        ] + [
-            data[f'r_{m}_specific'].numpy() for m in MODALITIES
-        ], axis=1)
-        weight_range = r_all.max(axis=1) - r_all.min(axis=1)
-        weight_range[~low_error_mask] = -1
-        conflict_idx = np.argsort(-weight_range)[:n_conflict]
-
-    return failure_idx, conflict_idx
-
-
-def plot_case_study_panel(data, sample_idx, case_type, fig_path, mr=0.5, model_name='DecAlign'):
-    """
-    Plot a single case study sample in CICA-style 3-panel layout.
-
-    Panel (a): The Input Conflict (uni_pred)
-    Panel (b): Perception & Decision Metrics
-    Panel (c): Sentiment Outcome Comparison (Ground Truth vs Avg Fusion vs Model)
-    """
-    labels = data['labels'].numpy()
-    preds = data['predictions'].numpy()
-    error = get_error(data)
-
-    i = sample_idx
-    sample_id = data['ids'][i] if data['ids'] else f'Sample {i}'
-    sample_id = str(sample_id).replace('$_$', '_').replace('$', '')
-    label_val = labels[i]
-    pred_val = preds[i]
-    err_val = error[i]
-
-    has_uni = 'pred_l' in data and 'pred_v' in data and 'pred_a' in data
-    if has_uni:
-        pred_l = data['pred_l'][i].item()
-        pred_v = data['pred_v'][i].item()
-        pred_a = data['pred_a'][i].item()
-        uni_preds = {'l': pred_l, 'v': pred_v, 'a': pred_a}
-        avg_pred = (pred_l + pred_v + pred_a) / 3.0
-    else:
-        avg_pred = pred_val
-
-    # Collect per-modality metrics for this sample
-    u_shared = {m: data[f'u_{m}_shared'][i].item() for m in MODALITIES}
-    u_specific = {m: data[f'u_{m}_specific'][i].item() for m in MODALITIES}
-    r_shared = {m: data[f'r_{m}_shared'][i].item() for m in MODALITIES}
-    r_specific = {m: data[f'r_{m}_specific'][i].item() for m in MODALITIES}
-
-    # --- Figure ---
-    fig = plt.figure(figsize=(19, 5.8))
-    gs = gridspec.GridSpec(1, 3, width_ratios=[1.0, 1.35, 0.9], wspace=0.32)
-
-    # ── Panel (a): The Input Conflict (uni_pred) ──
-    ax_a = fig.add_subplot(gs[0])
-    x_mods = np.arange(len(MODALITIES))
-    bar_w = 0.52
-
-    if has_uni:
-        uni_vals = [uni_preds[m] for m in MODALITIES]
-        bar_colors_a = ['#C8E6C9', '#FFCDD2', '#BBDEFB']
-        edge_colors_a = ['#2E7D32', '#C62828', '#1565C0']
-        hatches_a = ['///', '///', 'xxx']
-
-        bars_a = ax_a.bar(x_mods, uni_vals, bar_w, color=bar_colors_a,
-                          edgecolor=edge_colors_a, hatch=hatches_a, linewidth=1.5)
-
-        for bar, val, m in zip(bars_a, uni_vals, MODALITIES):
-            tag = MOD_NAMES_SHORT[m]
-            if abs(val) < 0.2:
-                s_label = 'Neutral'
-            elif val > 0:
-                s_label = 'Positive!' if val > 0.8 else 'Positive'
+        ax.bar(x, -d, w, bottom=val, facecolor="none", edgecolor=ec, linewidth=0.7,
+               linestyle=(0, (2, 1.5)), zorder=z)
+ 
+ 
+def _draw_summary_panel(ax, results, sample_indices, mode: str) -> None:
+    """Bottom panel: change of the *text* score (MR 0.5 - MR 0.0) for every model."""
+    off, w = 0.205, 0.37
+    tops, bots = [0.0], [0.0]
+    entries = []
+    for gi, mk in enumerate(MODEL_ORDER):
+        for score, fc, ec, dx in (("u_con", COLOR_CON, EDGE_CON, -off),
+                                  ("u_specific", COLOR_SPEC, EDGE_SPEC, +off)):
+            a = _np(results[0.0][mk][score]["l"])
+            b = _np(results[0.5][mk][score]["l"])
+            if mode == "case":
+                si = sample_indices[mk]
+                delta, err = float(b[si] - a[si]), 0.0
             else:
-                s_label = 'Negative!' if val < -0.8 else 'Negative'
+                diff = b - a
+                delta = float(diff.mean())
+                err = float(diff.std(ddof=1) / math.sqrt(len(diff)))
+            entries.append((gi + dx, delta, err, fc, ec, score))
+            tops.append(delta + err)
+            bots.append(delta - err)
+ 
+    lo, hi = min(bots), max(tops)
+    span = max(hi - lo, 1e-6)
+    ax.set_ylim(lo - (0.28 * span if lo < 0 else 0.0), hi + 0.34 * span)
+ 
+    for x, delta, err, fc, ec, score in entries:
+        ax.bar(x, delta, w, color=fc, edgecolor=ec, linewidth=0.5, zorder=3)
+        if err > 0:
+            ax.errorbar(x, delta, yerr=err, color="#333333", linewidth=0.5,
+                        capsize=1.2, capthick=0.5, zorder=4)
+        y = delta + err + 0.03 * span if delta >= 0 else delta - err - 0.03 * span
+        spec = score == "u_specific"
+        ax.text(x, y, _minus(f"{delta:+.2f}"), ha="center",
+                va="bottom" if delta >= 0 else "top",
+                fontsize=6.2 if spec else 5.6, fontweight="bold" if spec else "normal",
+                color=ACCENT if spec else "#444444", zorder=5)
+ 
+    ax.axhline(0, color="#555555", linewidth=0.5, zorder=4)
+    ax.set_xlim(-0.55, len(MODEL_ORDER) - 0.45)
+    ax.set_xticks(range(len(MODEL_ORDER)))
+    ax.set_xticklabels([_DISPLAY[k] for k in MODEL_ORDER], fontweight="bold")
+    ax.tick_params(axis="x", length=0, pad=2)
+    ax.yaxis.set_major_locator(MaxNLocator(3))
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.3, zorder=0)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_ylabel(r"$\Delta$ on text", fontsize=7, labelpad=2)
+    ax.set_title(SUMMARY_TITLE, fontweight="bold", loc="left", pad=2)
+    # ax.set_xlabel("mean $\\pm$ s.e. over the MOSI test set" if mode == "dataset"
+    #               else "same samples as above", fontsize=5.8, color="#555555", labelpad=1)
 
-            y_pos = val + 0.08 if val >= 0 else val - 0.20
-            ax_a.text(bar.get_x() + bar.get_width() / 2., y_pos,
-                      f'($\\hat{{y}}_{{{tag}}}$): {val:+.3f}\n({s_label})',
-                      ha='center', va='bottom' if val >= 0 else 'top',
-                      fontsize=8.5, fontweight='bold')
+def forward_and_representations(
+    model_key: str, model: torch.nn.Module, batch: dict, device: torch.device
+) -> Tuple[torch.Tensor, dict, dict]:
+    """Return predictions plus normalized shared and specific features."""
+    text = batch["text"].to(device)
+    audio = batch["audio"].to(device)
+    vision = batch["vision"].to(device)
+    text_m = batch["text_m"].to(device)
+    audio_m = batch["audio_m"].to(device)
+    vision_m = batch["vision_m"].to(device)
+    batch_size = text.shape[0]
 
-        ax_a.set_xticks(x_mods)
-        ax_a.set_xticklabels([MOD_NAMES[m] for m in MODALITIES], fontsize=10.5)
-        ax_a.set_ylabel('Unimodal Sentiment Prediction', fontsize=11)
-        ax_a.set_title('(a) The Input Conflict (uni_pred)', fontsize=12.5, fontweight='bold')
-        ax_a.axhline(y=0, color='grey', linestyle='--', linewidth=0.8, alpha=0.6)
-        y_a_min = min(min(uni_vals), 0) - 0.60
-        y_a_max = max(max(uni_vals), 0) + 0.60
-        ax_a.set_ylim(y_a_min, y_a_max)
-    else:
-        # Fallback to raw uncertainty metrics if uni_preds not available
-        u_shared_con = {m: data[f'u_{m}_shared_consensus'][i].item() for m in MODALITIES}
-        u_shared_cy  = {m: data[f'u_{m}_shared_cycle'][i].item() for m in MODALITIES}
-        u_spec_nei   = {m: data[f'u_{m}_specific_neighbor'][i].item() for m in MODALITIES}
-        u_spec_cy    = {m: data[f'u_{m}_specific_cycle'][i].item() for m in MODALITIES}
-        metric_vals = [
-            [u_shared_con[m] for m in MODALITIES],
-            [u_shared_cy[m] for m in MODALITIES],
-            [u_spec_nei[m] for m in MODALITIES],
-            [u_spec_cy[m] for m in MODALITIES],
-        ]
-        metrics_labels = [r'$u^{c,\mathrm{con}}$', r'$u^{c,\mathrm{cy}}$',
-                          r'$u^{s,\mathrm{nei}}$', r'$u^{s,\mathrm{cy}}$']
-        metric_colors = ['#81D4FA', '#42A5F5', '#FFAB91', '#FF7043']
-        hatches = ['///', '', '\\\\\\', '']
-        w = 0.18
-        for j, (vals, label, color, hatch) in enumerate(
-                zip(metric_vals, metrics_labels, metric_colors, hatches)):
-            offset = (j - 1.5) * w
-            bars = ax_a.bar(x_mods + offset, vals, w, label=label,
-                            color=color, hatch=hatch, edgecolor='white', linewidth=0.5)
-            for bar, val in zip(bars, vals):
-                ax_a.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.01,
-                          f'{val:.2f}', ha='center', va='bottom', fontsize=7.5, fontweight='bold')
-        ax_a.set_xticks(x_mods)
-        ax_a.set_xticklabels([MOD_NAMES[m] for m in MODALITIES], fontsize=10)
-        ax_a.set_ylabel('Uncertainty Score', fontsize=10)
-        ax_a.set_title('(a) Raw Uncertainty Metrics', fontsize=12, fontweight='bold')
-        ax_a.legend(fontsize=8, loc='upper left', ncol=2, framealpha=0.9)
-        ax_a.set_ylim(0, max(max(v) for v in metric_vals) * 1.35)
+    if model_key == "sarm":
+        output = model(text_m, audio, vision, text, audio, vision)
+        prediction = output["output_logit"]
+        shared = {m: _mean_pool(output[f"c_{m}"], batch_size) for m in MODALITIES}
+        specific = {m: _mean_pool(output[f"s_{m}"], batch_size) for m in MODALITIES}
+    elif model_key == "decalign":
+        # DecAlign has one input per modality: pass the corrupted test inputs.
+        output = model(text_m, audio, vision)
+        prediction = output["output_logit"]
+        shared = {m: _mean_pool(output[f"c_{m}"], batch_size) for m in MODALITIES}
+        specific = {m: _mean_pool(output[f"s_{m}"], batch_size) for m in MODALITIES}
+    elif model_key == "dmd":
+        # DMD takes (text, audio, video) — same 3 inputs.
+        output = model(text_m, audio, vision)
+        prediction = output["output_logit"]
+        shared = {m: _mean_pool(output[f"c_{m}"], batch_size) for m in MODALITIES}
+        specific = {m: _mean_pool(output[f"s_{m}"], batch_size) for m in MODALITIES}
+    else:  # pragma: no cover - protected by argparse / MODEL_SPECS
+        raise KeyError(model_key)
 
-    # ── Panel (b): DecAlign Perception & Decision Metrics ──
-    ax_b = fig.add_subplot(gs[1])
-    width_b = 0.18
-    vals_u_shared = [u_shared[m] for m in MODALITIES]
-    vals_u_specific = [u_specific[m] for m in MODALITIES]
-    vals_r_shared = [r_shared[m] for m in MODALITIES]
-    vals_r_specific = [r_specific[m] for m in MODALITIES]
+    shared = {m: F.normalize(value.detach(), dim=1).cpu() for m, value in shared.items()}
+    specific = {m: F.normalize(value.detach(), dim=1).cpu() for m, value in specific.items()}
+    return prediction.detach().cpu().view(-1), shared, specific
 
-    bars_us = ax_b.bar(x_mods - 1.5 * width_b, vals_u_shared, width_b,
-                       label=r'Shared Unc. ($u_m^c$)', color='#90CAF9',
-                       hatch='///', edgecolor='#1976D2', linewidth=0.8)
-    bars_usp = ax_b.bar(x_mods - 0.5 * width_b, vals_u_specific, width_b,
-                        label=r'Specific Unc. ($u_m^s$)', color='#FFE082',
-                        hatch='\\\\\\', edgecolor='#FFA000', linewidth=0.8)
-    bars_rs = ax_b.bar(x_mods + 0.5 * width_b, vals_r_shared, width_b,
-                       label=r'Shared Wt. ($r_m^c$)', color='#81C784',
-                       edgecolor='#2E7D32', linewidth=0.8)
-    bars_rsp = ax_b.bar(x_mods + 1.5 * width_b, vals_r_specific, width_b,
-                        label=r'Specific Wt. ($r_m^s$)', color='#FF8A65',
-                        edgecolor='#D84315', linewidth=0.8)
 
-    for bars, vals in [(bars_us, vals_u_shared), (bars_usp, vals_u_specific),
-                       (bars_rs, vals_r_shared), (bars_rsp, vals_r_specific)]:
-        for bar, val in zip(bars, vals):
-            ax_b.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.015,
-                      f'{val:.2f}', ha='center', va='bottom', fontsize=8,
-                      fontweight='bold')
+def compute_scores(shared: Dict[str, torch.Tensor], specific: Dict[str, torch.Tensor],
+                   neighbors: int) -> Tuple[dict, dict]:
+    """Calculate u_con and u_specific for every test sample and modality."""
+    n_samples = shared["l"].shape[0]
+    if n_samples < 2:
+        raise ValueError("At least two examples are required for KNN uncertainty.")
+    k = min(neighbors, n_samples - 1)
+    u_con, u_specific = {}, {}
+    for modality in MODALITIES:
+        others = [other for other in MODALITIES if other != modality]
+        consensus = sum(
+            F.cosine_similarity(shared[modality], shared[other], dim=1)
+            for other in others
+        ) / len(others)
+        u_con[modality] = 1.0 - consensus
 
-    # Annotate high uncertainty, suppressed, amplified
-    all_unc = [(vals_u_shared[k], 'c', k) for k in range(3)] + [(vals_u_specific[k], 's', k) for k in range(3)]
-    max_u_val, max_u_type, max_u_mod = max(all_unc, key=lambda x: x[0])
-    offset_u = -1.5 * width_b if max_u_type == 'c' else -0.5 * width_b
-    ax_b.annotate(f'High uncertainty\n{max_u_val:.2f}',
-                  xy=(max_u_mod + offset_u, max_u_val),
-                  xytext=(max_u_mod + offset_u, max_u_val + 0.22),
-                  ha='center', fontsize=7.5, color='#D32F2F', fontweight='bold',
-                  arrowprops=dict(arrowstyle='->', color='#757575', lw=1.8))
+        # Retrieve neighbours without modality m, then assess m's private
+        # representation against those neighbours.
+        leave_one_out = F.normalize(sum(shared[other] for other in others), dim=1)
+        similarities = leave_one_out @ leave_one_out.T
+        similarities.fill_diagonal_(-math.inf)
+        neighbour_index = similarities.topk(k, dim=1).indices
+        neighbour_specific = specific[modality][neighbour_index]
+        neighbour_similarity = F.cosine_similarity(
+            specific[modality].unsqueeze(1), neighbour_specific, dim=2
+        )
+        u_specific[modality] = 1.0 - neighbour_similarity.mean(dim=1)
+    return u_con, u_specific
 
-    all_w = [(vals_r_shared[k], 'c', k) for k in range(3)] + [(vals_r_specific[k], 's', k) for k in range(3)]
-    min_w_val, min_w_type, min_w_mod = min(all_w, key=lambda x: x[0])
-    offset_w = 0.5 * width_b if min_w_type == 'c' else 1.5 * width_b
-    ax_b.annotate(f'suppressed\n{min_w_val:.2f}',
-                  xy=(min_w_mod + offset_w, min_w_val),
-                  xytext=(min_w_mod + offset_w, min_w_val + 0.22),
-                  ha='center', fontsize=7.5, color='#D32F2F', fontweight='bold',
-                  arrowprops=dict(arrowstyle='->', color='#757575', lw=1.8))
 
-    max_w_val, max_w_type, max_w_mod = max(all_w, key=lambda x: x[0])
-    offset_max_w = 0.5 * width_b if max_w_type == 'c' else 1.5 * width_b
-    ax_b.annotate(f'amplified\n{max_w_val:.2f}',
-                  xy=(max_w_mod + offset_max_w, max_w_val),
-                  xytext=(max_w_mod + offset_max_w, max_w_val + 0.22),
-                  ha='center', fontsize=7.5, color='#2E7D32', fontweight='bold',
-                  arrowprops=dict(arrowstyle='->', color='#757575', lw=1.8))
+def compute_performance(predictions: torch.Tensor, labels: torch.Tensor) -> dict:
+    """Compute MOSI metrics on the same test pass used for the scores."""
+    from utils.metricsTop import MetricsTop
 
-    ax_b.set_xticks(x_mods)
-    ax_b.set_xticklabels([MOD_NAMES[m] for m in MODALITIES], fontsize=10.5)
-    ax_b.set_ylabel('Score / Weight', fontsize=11)
-    ax_b.set_title(f'(b) {model_name} Perception & Decision Metrics', fontsize=12.5, fontweight='bold')
-    ax_b.legend(fontsize=7.5, loc='upper left', ncol=2, framealpha=0.9, edgecolor='grey')
-    all_vals_b = vals_u_shared + vals_u_specific + vals_r_shared + vals_r_specific
-    ax_b.set_ylim(0, max(all_vals_b) * 1.55)
-
-    # ── Panel (c): Sentiment Outcome Comparison ──
-    ax_c = fig.add_subplot(gs[2])
-
-    if has_uni:
-        bar_model_label = f'{model_name} (Ours)' if model_name == 'DecAlign' else model_name
-        bar_labels = ['Ground Truth', 'Avg Fusion', bar_model_label]
-        bar_vals = [label_val, avg_pred, pred_val]
-        bar_colors = ['#FFCDD2', '#E0E0E0', '#FF8A65']
-        bar_edges = ['#C62828', '#757575', '#D84315']
-        bar_hatches = ['///', '\\\\\\', '']
-    else:
-        bar_labels = ['Ground Truth', 'Model Output']
-        bar_vals = [label_val, pred_val]
-        bar_colors = ['#E8EAF6', '#FFCDD2']
-        bar_edges = ['#3F51B5', '#E53935']
-        bar_hatches = ['', '']
-
-    bars_c = ax_c.bar(range(len(bar_labels)), bar_vals, color=bar_colors,
-                      edgecolor=bar_edges, hatch=bar_hatches, linewidth=1.5,
-                      width=0.55)
-
-    for bar, val in zip(bars_c, bar_vals):
-        if abs(val) < 0.2:
-            sentiment = 'Neutral'
-        elif val > 0:
-            sentiment = 'Positive'
-        else:
-            sentiment = 'Negative'
-
-        y_pos = bar.get_height() + 0.08 if val >= 0 else bar.get_height() - 0.22
-        ax_c.text(bar.get_x() + bar.get_width() / 2., y_pos,
-                  f'{sentiment}\n({val:+.3f})', ha='center',
-                  va='bottom' if val >= 0 else 'top',
-                  fontsize=9, fontweight='bold')
-
-    ax_c.set_xticks(range(len(bar_labels)))
-    ax_c.set_xticklabels(bar_labels, fontsize=9.5, fontweight='bold')
-    ax_c.set_ylabel('Final Sentiment Score', fontsize=11)
-    ax_c.set_title('(c) Sentiment Outcome Comparison', fontsize=12.5, fontweight='bold')
-    ax_c.axhline(y=0, color='grey', linestyle='--', linewidth=0.8, alpha=0.6)
-
-    y_min = min(0, min(bar_vals)) - 0.65
-    y_max = max(0, max(bar_vals)) + 0.65
-    ax_c.set_ylim(y_min, y_max)
-
-    # --- Suptitle ---
-    fig.suptitle(
-        f'{case_type} Case Study  |  ID: {sample_id}  |  '
-        f'Error = {err_val:.3f}  |  MR = {mr}',
-        fontsize=13, fontweight='bold', y=0.98,
-        color='#D32F2F' if case_type == 'Failure' else '#2E7D32'
+    return MetricsTop("regression").getMetrics("mosi")(
+        predictions.view(-1, 1), labels.view(-1, 1)
     )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    fig.savefig(fig_path, dpi=250, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
+
+def infer_checkpoint(model_key: str, missing_rate: float, args: argparse.Namespace,
+                     device: torch.device) -> dict:
+    """Run one checkpoint on MOSI test and return portable CPU tensors."""
+    from data_loader import MMDataLoader
+    from models import build_model
+
+    set_seed(args.seed)
+    model_args = build_args(model_key, missing_rate, args.seed, device, args.batch_size)
+    loaders = MMDataLoader(model_args, num_workers=args.num_workers)
+    checkpoint = checkpoint_path(args.checkpoint_dir, model_key, missing_rate)
+    model = build_model(model_args).to(device)
+    state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+
+    pred_list, label_list, id_list = [], [], []
+    shared_parts = {m: [] for m in MODALITIES}
+    specific_parts = {m: [] for m in MODALITIES}
+    with torch.no_grad():
+        for batch in tqdm(
+            loaders["test"],
+            desc=f"{MODEL_SPECS[model_key]['display_name']} MR={missing_rate:.1f}",
+        ):
+            prediction, shared, specific = forward_and_representations(model_key, model, batch, device)
+            pred_list.append(prediction)
+            label_list.append(batch["labels"]["M"].view(-1).cpu())
+            id_list.extend(str(item) for item in batch["id"])
+            for modality in MODALITIES:
+                shared_parts[modality].append(shared[modality])
+                specific_parts[modality].append(specific[modality])
+
+    predictions = torch.cat(pred_list)
+    labels = torch.cat(label_list)
+    shared = {m: torch.cat(parts) for m, parts in shared_parts.items()}
+    specific = {m: torch.cat(parts) for m, parts in specific_parts.items()}
+    u_con, u_specific = compute_scores(shared, specific, args.neighbors)
+    metrics = compute_performance(predictions, labels)
+
+    del model, loaders
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "ids": id_list,
+        "labels": labels,
+        "predictions": predictions,
+        "u_con": u_con,
+        "u_specific": u_specific,
+        "metrics": metrics,
+        "metadata": {
+            "model": model_key,
+            "display_name": MODEL_SPECS[model_key]["display_name"],
+            "missing_rate": missing_rate,
+            "seed": args.seed,
+            "neighbors": args.neighbors,
+            "checkpoint": str(checkpoint),
+        },
+    }
 
 
-def run_case_studies(datasets, mr=0.5, n_failure=3, n_conflict=3, fig_dir=None, model_name='DecAlign'):
-    """Find and plot case study panels."""
-    if fig_dir is None:
-        fig_dir = FIG_DIR
-    data = datasets[mr]
-    failure_idx, conflict_idx = find_case_studies(data, n_failure=n_failure, n_conflict=n_conflict)
-
-    print(f'\n  Conflict / Resolution cases (CICA-style, MR={mr}):')
-    error = get_error(data)
-    for rank, idx in enumerate(conflict_idx):
-        pred_l_str = f"T={data['pred_l'][idx]:.2f}, V={data['pred_v'][idx]:.2f}, A={data['pred_a'][idx]:.2f}" if 'pred_l' in data else ""
-        print(f'    #{rank+1}: sample {idx} | ID={data["ids"][idx]} | '
-              f'label={data["labels"][idx]:.3f} | pred={data["predictions"][idx]:.3f} | '
-              f'error={error[idx]:.3f} | {pred_l_str}')
-        fig_path = fig_dir / f'case_conflict_{rank+1}_mr{mr:.1f}.png'
-        plot_case_study_panel(data, idx, 'Conflict Resolution', fig_path, mr=mr, model_name=model_name)
-        print(f'    -> Saved {fig_path.name}')
-
-    print(f'\n  Failure cases (MR={mr}):')
-    for rank, idx in enumerate(failure_idx):
-        pred_l_str = f"T={data['pred_l'][idx]:.2f}, V={data['pred_v'][idx]:.2f}, A={data['pred_a'][idx]:.2f}" if 'pred_l' in data else ""
-        print(f'    #{rank+1}: sample {idx} | ID={data["ids"][idx]} | '
-              f'label={data["labels"][idx]:.3f} | pred={data["predictions"][idx]:.3f} | '
-              f'error={error[idx]:.3f} | {pred_l_str}')
-        fig_path = fig_dir / f'case_failure_{rank+1}_mr{mr:.1f}.png'
-        plot_case_study_panel(data, idx, 'Failure', fig_path, mr=mr, model_name=model_name)
-        print(f'    -> Saved {fig_path.name}')
+def load_or_infer_all(args: argparse.Namespace, device: torch.device) -> dict:
+    if set(args.models) != set(MODEL_ORDER):
+        raise ValueError("The comparative figure requires --models sarm decalign misa.")
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    for missing_rate in (0.0, 0.5):
+        results[missing_rate] = {}
+        for model_key in MODEL_ORDER:
+            path = cache_path(args.cache_dir, model_key, missing_rate, args.seed)
+            if args.reuse_cache:
+                if not path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing cached inference: {path}. Run without --reuse_cache first."
+                    )
+                data = torch.load(path, map_location="cpu", weights_only=False)
+                if data["metadata"].get("neighbors") != args.neighbors:
+                    raise ValueError(f"{path} was created with a different --neighbors value.")
+                print(f"Loaded {path.relative_to(ROOT)}")
+            else:
+                print(f"\nInferring {MODEL_SPECS[model_key]['display_name']} at MR={missing_rate:.1f} ...")
+                data = infer_checkpoint(model_key, missing_rate, args, device)
+                torch.save(data, path)
+                print(f"Saved {path.relative_to(ROOT)}")
+            results[missing_rate][model_key] = data
+    return results
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# B. Weight vs Missing Rate Trend Chart
-# ═══════════════════════════════════════════════════════════════════════
-def plot_weight_vs_missing_rate(datasets, missing_rates=None, fig_dir=None):
-    """
-    Line chart: mean fusion weight vs missing rate.
-    6 lines: 3 modalities × 2 types (shared solid, specific dashed).
-    Shows how shared and specific weights diverge under increasing corruption.
-    """
-    if fig_dir is None:
-        fig_dir = FIG_DIR
-    if missing_rates is None:
-        missing_rates = sorted(datasets.keys())
-
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
-
-    # --- Panel 1: Shared & Specific weights together ---
-    ax = axes[0]
-    mrs = np.array(missing_rates)
-
-    for m in MODALITIES:
-        color = MOD_COLORS[m]
-        # Shared weight
-        r_shared_means = [datasets[mr][f'r_{m}_shared'].mean().item() for mr in missing_rates]
-        r_shared_stds = [datasets[mr][f'r_{m}_shared'].std().item() for mr in missing_rates]
-
-        # Specific weight
-        r_specific_means = [datasets[mr][f'r_{m}_specific'].mean().item() for mr in missing_rates]
-        r_specific_stds = [datasets[mr][f'r_{m}_specific'].std().item() for mr in missing_rates]
-
-        ax.plot(mrs, r_shared_means, 'o-', color=color, linewidth=2.2, markersize=7,
-                label=f'{MOD_NAMES_SHORT[m]} shared ($r_m^c$)')
-        ax.fill_between(mrs,
-                         np.array(r_shared_means) - np.array(r_shared_stds),
-                         np.array(r_shared_means) + np.array(r_shared_stds),
-                         alpha=0.12, color=color)
-
-        ax.plot(mrs, r_specific_means, 's--', color=color, linewidth=2.2, markersize=7,
-                label=f'{MOD_NAMES_SHORT[m]} specific ($r_m^s$)')
-        ax.fill_between(mrs,
-                         np.array(r_specific_means) - np.array(r_specific_stds),
-                         np.array(r_specific_means) + np.array(r_specific_stds),
-                         alpha=0.08, color=color)
-
-    ax.set_xlabel('Missing Rate', fontsize=12)
-    ax.set_ylabel('Mean Fusion Weight', fontsize=12)
-    ax.set_title('Fusion Weights vs Missing Rate', fontsize=13, fontweight='bold')
-    ax.set_xticks(mrs)
-    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.9)
-    ax.set_ylim(0, 1.05)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel 2: Gap between shared and specific ---
-    ax2 = axes[1]
-
-    for m in MODALITIES:
-        color = MOD_COLORS[m]
-        gaps = []
-        for mr in missing_rates:
-            r_c_mean = datasets[mr][f'r_{m}_shared'].mean().item()
-            r_s_mean = datasets[mr][f'r_{m}_specific'].mean().item()
-            gaps.append(r_c_mean - r_s_mean)
-
-        ax2.plot(mrs, gaps, 'D-', color=color, linewidth=2.2, markersize=7,
-                 label=f'{MOD_NAMES_SHORT[m]}: $r_m^c - r_m^s$')
-
-    ax2.axhline(y=0, color='grey', linestyle='--', linewidth=0.8, alpha=0.5)
-    ax2.set_xlabel('Missing Rate', fontsize=12)
-    ax2.set_ylabel('Weight Gap (shared − specific)', fontsize=12)
-    ax2.set_title('Shared vs Specific Weight Divergence', fontsize=13, fontweight='bold')
-    ax2.set_xticks(mrs)
-    ax2.legend(fontsize=9, loc='best', framealpha=0.9)
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    fig_path = fig_dir / 'weight_vs_missing_rate.png'
-    fig.savefig(fig_path, dpi=300, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f'  -> Saved {fig_path.name}')
-
-    # Also print numeric table
-    print('\n  Mean Fusion Weights Table:')
-    print(f'  {"MR":>5}  ', end='')
-    for m in MODALITIES:
-        print(f' {MOD_NAMES_SHORT[m]}_r^c  {MOD_NAMES_SHORT[m]}_r^s  ', end='')
-    print()
-    print('  ' + '-' * 55)
-    for mr in missing_rates:
-        print(f'  {mr:5.1f}  ', end='')
-        for m in MODALITIES:
-            rc = datasets[mr][f'r_{m}_shared'].mean().item()
-            rs = datasets[mr][f'r_{m}_specific'].mean().item()
-            print(f' {rc:.4f}  {rs:.4f}  ', end='')
-        print()
+def average_score(data: dict, score_name: str, sample_index: int) -> float:
+    return float(np.mean([data[score_name][m][sample_index].item() for m in MODALITIES]))
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# C. Per-Sample Weight Distribution (Violin Plots)
-# ═══════════════════════════════════════════════════════════════════════
-def plot_weight_distributions(datasets, mr_list=None, fig_dir=None):
-    """
-    Violin plots showing distribution of r_m^c and r_m^s per modality,
-    across different missing rates.
-    """
-    if fig_dir is None:
-        fig_dir = FIG_DIR
-    if mr_list is None:
-        all_mrs = sorted(datasets.keys())
-        if len(all_mrs) <= 5:
-            mr_list = all_mrs
-        else:
-            mr_list = [0.0, 0.3, 0.5, 0.7, 0.9]
-            mr_list = [mr for mr in mr_list if mr in datasets]
-
-    n_cols = len(mr_list)
-    fig, axes = plt.subplots(2, n_cols, figsize=(4.8 * n_cols, 10), squeeze=False)
-    fig.suptitle('Per-Sample Fusion Weight Distributions',
-                 fontsize=15, fontweight='bold', y=0.99)
-
-    weight_types = [('shared', r'$r_m^c$ (Shared Weight)'),
-                    ('specific', r'$r_m^s$ (Specific Weight)')]
-
-    for row, (wtype, title) in enumerate(weight_types):
-        for col, mr in enumerate(mr_list):
-            ax = axes[row, col]
-            data = datasets[mr]
-
-            plot_data = []
-            positions = []
-            colors = []
-            tick_labels = []
-
-            for i, m in enumerate(MODALITIES):
-                vals = data[f'r_{m}_{wtype}'].numpy()
-                plot_data.append(vals)
-                positions.append(i)
-                colors.append(MOD_COLORS[m])
-                tick_labels.append(MOD_NAMES[m])
-
-            parts = ax.violinplot(plot_data, positions=positions,
-                                  showmeans=True, showmedians=True,
-                                  widths=0.65)
-            for i, pc in enumerate(parts['bodies']):
-                pc.set_facecolor(colors[i])
-                pc.set_alpha(0.6)
-                pc.set_edgecolor('white')
-            parts['cmeans'].set_color('#D32F2F')
-            parts['cmeans'].set_linewidth(2)
-            parts['cmedians'].set_color('black')
-
-            # Overlay box plot for quartiles
-            bp = ax.boxplot(plot_data, positions=positions, widths=0.15,
-                            patch_artist=True, showfliers=False,
-                            medianprops={'color': 'black', 'linewidth': 1.5},
-                            boxprops={'facecolor': 'white', 'alpha': 0.7, 'edgecolor': 'grey'},
-                            whiskerprops={'color': 'grey'},
-                            capprops={'color': 'grey'})
-
-            # Add mean value annotation
-            for i, vals in enumerate(plot_data):
-                mean_val = vals.mean()
-                std_val = vals.std()
-                ax.text(positions[i], ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1.05,
-                        f'μ={mean_val:.3f}\nσ={std_val:.3f}',
-                        ha='center', va='top', fontsize=8,
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                                  alpha=0.85, edgecolor='grey'))
-
-            ax.set_xticks(positions)
-            ax.set_xticklabels(tick_labels, fontsize=10)
-            ax.set_ylim(-0.05, 1.15)
-            if col == 0:
-                ax.set_ylabel(title, fontsize=11)
-            ax.set_title(f'Missing Rate = {mr}', fontsize=12, fontweight='bold')
-            ax.axhline(y=0.1, color='grey', linestyle=':', linewidth=0.8,
-                       alpha=0.5, label=r'$r_{\min}$' if (row == 0 and col == 0) else '')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    fig_path = fig_dir / 'weight_distributions.png'
-    fig.savefig(fig_path, dpi=250, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f'  -> Saved {fig_path.name}')
+def display_sample_id(sample_id: object) -> str:
+    """Make MOSI IDs literal text instead of Matplotlib mathtext."""
+    return str(sample_id).replace("$", "").replace("_", "-")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# D. Comprehensive 4-metric decomposition per missing rate
-# ═══════════════════════════════════════════════════════════════════════
-def plot_uncertainty_decomposition(datasets, mr_list=None, fig_dir=None):
-    """
-    Stacked bar chart showing how each of the 4 raw uncertainty metrics
-    contributes to the aggregated shared/specific uncertainty, per modality,
-    across missing rates. Helps reviewer see which metric drives the weight change.
-    """
-    if fig_dir is None:
-        fig_dir = FIG_DIR
-    if mr_list is None:
-        all_mrs = sorted(datasets.keys())
-        if len(all_mrs) <= 5:
-            mr_list = all_mrs
-        else:
-            mr_list = [0.0, 0.3, 0.5, 0.7, 0.9]
-            mr_list = [mr for mr in mr_list if mr in datasets]
+def select_case(results: dict) -> dict:
+    reference_ids = results[0.0]["sarm"]["ids"]
+    for model_key in MODEL_ORDER:
+        for missing_rate in (0.0, 0.5):
+            if results[missing_rate][model_key]["ids"] != reference_ids:
+                raise RuntimeError("Model outputs are not aligned to the same MOSI test order.")
+ 
+    selected: Dict[str, int] = {}
+    for model_key in MODEL_ORDER:
+        d0, d5 = results[0.0][model_key], results[0.5][model_key]
+        n = len(d0["ids"])
+ 
+        candidates = []
+        for i in range(n):
+            avg_con_0 = np.mean([d0["u_con"][m][i].item() for m in MODALITIES])
+            avg_spec_0 = np.mean([d0["u_specific"][m][i].item() for m in MODALITIES])
+            if avg_con_0 <= avg_spec_0:                 # shared dominates at MR=0
+                continue
+ 
+            t_con_0, t_con_5 = d0["u_con"]["l"][i].item(), d5["u_con"]["l"][i].item()
+            t_spec_0, t_spec_5 = d0["u_specific"]["l"][i].item(), d5["u_specific"]["l"][i].item()
+            if t_spec_5 <= t_con_5:                     # specific dominates at MR=0.5
+                continue
+ 
+            jump = t_spec_5 - t_spec_0
+            if jump <= 0:
+                continue
+            d_con = t_con_5 - t_con_0
+            if d_con > 0.5 * jump:                      # shared also reacts -> weak story
+                continue
+ 
+            gap = t_spec_5 - t_con_5
+            candidates.append((i, (jump - max(d_con, 0.0)) * gap))
+ 
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            selected[model_key] = candidates[0][0]
+        else:                                           # relaxed fallback
+            selected[model_key] = int(_np(d5["u_specific"]["l"]).argmax())
+    return selected
 
-    n_cols = len(mr_list)
-    fig, axes = plt.subplots(1, n_cols, figsize=(4.8 * n_cols, 5.5), squeeze=False)
-    fig.suptitle('Uncertainty Metric Decomposition by Missing Rate',
-                 fontsize=14, fontweight='bold', y=1.02)
 
-    metric_labels = [
-        (r'$u^{c,\mathrm{con}}$', 'shared_consensus', '#BBDEFB'),
-        (r'$u^{c,\mathrm{cy}}$', 'shared_cycle', '#42A5F5'),
-        (r'$u^{s,\mathrm{nei}}$', 'specific_neighbor', '#FFCCBC'),
-        (r'$u^{s,\mathrm{cy}}$', 'specific_cycle', '#FF7043'),
+def write_summary(results: dict, sample_indices: dict, output_path: Path) -> None:
+    fieldnames = [
+        "missing_rate", "model", "sample_index", "sample_id",
+        "u_con_T", "u_spec_T", "u_con_V", "u_spec_V", "u_con_A", "u_spec_A",
+        "Acc_2", "MAE", "Corr",
     ]
-
-    for col, mr in enumerate(mr_list):
-        ax = axes[0, col]
-        data = datasets[mr]
-
-        x = np.arange(len(MODALITIES))
-        width = 0.18
-
-        for j, (label, metric_key, color) in enumerate(metric_labels):
-            vals = [data[f'u_{m}_{metric_key}'].mean().item() for m in MODALITIES]
-            offset = (j - 1.5) * width
-            bars = ax.bar(x + offset, vals, width, label=label, color=color,
-                          edgecolor='white', linewidth=0.5)
-            for bar, val in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + 0.01,
-                        f'{val:.3f}', ha='center', va='bottom', fontsize=7, rotation=45)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels([MOD_NAMES[m] for m in MODALITIES], fontsize=10)
-        ax.set_ylabel('Mean Uncertainty Score', fontsize=10)
-        ax.set_title(f'Missing Rate = {mr}', fontsize=12, fontweight='bold')
-        if col == 0:
-            ax.legend(fontsize=8, loc='upper left', framealpha=0.9)
-
-    plt.tight_layout()
-    fig_path = fig_dir / 'uncertainty_decomposition.png'
-    fig.savefig(fig_path, dpi=250, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f'  -> Saved {fig_path.name}')
+    rows = []
+    for missing_rate in (0.0, 0.5):
+        for model_key in MODEL_ORDER:
+            si = sample_indices[model_key]
+            data = results[missing_rate][model_key]
+            metrics = data["metrics"]
+            row = {
+                "missing_rate": missing_rate,
+                "model": MODEL_SPECS[model_key]["display_name"],
+                "sample_index": si,
+                "sample_id": data["ids"][si],
+                "Acc_2": metrics["Acc_2"],
+                "MAE": metrics["MAE"],
+                "Corr": metrics["Corr"],
+            }
+            for m, tag in zip(MODALITIES, ("T", "V", "A")):
+                row[f"u_con_{tag}"] = data["u_con"][m][si].item()
+                row[f"u_spec_{tag}"] = data["u_specific"][m][si].item()
+            rows.append(row)
+    with output_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# E. Print detailed weight summary
-# ═══════════════════════════════════════════════════════════════════════
-def print_weight_summary(datasets, missing_rates=None):
-    """Print comprehensive summary of fusion weights across all missing rates."""
-    if missing_rates is None:
-        missing_rates = sorted(datasets.keys())
-    print('\n' + '=' * 80)
-    print('FUSION WEIGHT SUMMARY')
-    print('=' * 80)
-
-    for mr in missing_rates:
-        data = datasets[mr]
-        print(f'\n--- Missing Rate = {mr} ---')
-        print(f'  {"Mod":>5}  '
-              f'{"u_c":>8}  {"u_s":>8}  '
-              f'{"r_c":>8}  {"r_s":>8}  '
-              f'{"r_c-r_s":>8}')
-        print('  ' + '-' * 55)
-
+def plot_motivation_figure_1col(results: dict, sample_indices: dict, output_dir: Path,
+                                fig_w: float = ACL_COL_W, fig_h: float = 4.3,
+                                summary: str = "dataset",
+                                acc7_values: dict | None = None,
+                                display_names: dict | None = None) -> None:
+    """summary: "dataset" (mean +- s.e. over the whole test set) or "case" (same sample)."""
+    global _DISPLAY
+    if display_names:
+        _DISPLAY = display_names
+    if acc7_values is None:
+        acc7_values = ACC7_VALUES                                   # noqa: F821  (from the original file)
+ 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Nimbus Roman", "TeX Gyre Termes",
+                       "Liberation Serif", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "axes.linewidth": 0.6,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.major.size": 2.0, "ytick.major.size": 2.0,
+        "xtick.major.width": 0.5, "ytick.major.width": 0.5,
+        "font.size": 6.5, "xtick.labelsize": 6.5, "ytick.labelsize": 6.5,
+        "axes.titlesize": 8, "legend.fontsize": 7,
+        "hatch.linewidth": 0.5,
+        "pdf.fonttype": 42, "ps.fonttype": 42,
+    })
+ 
+    MOD_LABELS_MAP = {"l": "T", "v": "V", "a": "A"}
+    MRS = (0.0, 0.5)
+ 
+    # -- x layout: unchanged (2 MR blocks x 3 modality groups x 2 bars) --
+    bar_w, group_gap, block_gap = 0.38, 0.30, 0.90
+    pos, group_centre, block_centre, block_edges = {}, {}, {}, {}
+    x = 0.0
+    for mr in MRS:
+        left = x - bar_w / 2
         for m in MODALITIES:
-            u_c = data[f'u_{m}_shared'].mean().item()
-            u_s = data[f'u_{m}_specific'].mean().item()
-            r_c = data[f'r_{m}_shared'].mean().item()
-            r_s = data[f'r_{m}_specific'].mean().item()
-            gap = r_c - r_s
-            print(f'  {MOD_NAMES_SHORT[m]:>5}  '
-                  f'{u_c:8.4f}  {u_s:8.4f}  '
-                  f'{r_c:8.4f}  {r_s:8.4f}  '
-                  f'{gap:+8.4f}')
+            pos[(mr, m)] = (x, x + bar_w)
+            group_centre[(mr, m)] = x + bar_w / 2
+            x += 2 * bar_w + group_gap
+        right = x - group_gap - bar_w / 2
+        block_edges[mr] = (left, right)
+        block_centre[mr] = (left + right) / 2
+        x += block_gap - group_gap
+    x_lo, x_hi = block_edges[0.0][0] - 0.15, block_edges[0.5][1] + 0.15
+    divider_x = (block_edges[0.0][1] + block_edges[0.5][0]) / 2
+ 
+    # -- figure: 3 model rows + 1 summary row --
+    fig = plt.figure(figsize=(fig_w, fig_h), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.03, h_pad=0.03, hspace=0.07)
+    gs = fig.add_gridspec(len(MODEL_ORDER) + 1, 1, height_ratios=[1, 1, 1, 0.82])
+    axes = []
+    for r in range(len(MODEL_ORDER)):
+        axes.append(fig.add_subplot(gs[r], sharey=axes[0] if axes else None))
+    ax_sum = fig.add_subplot(gs[len(MODEL_ORDER)])
+ 
+    # y range: much less headroom than before, because MR/Acc-7 boxes are gone
+    global_ymax = 0.0
+    for mk in MODEL_ORDER:
+        si = sample_indices[mk]
+        for mr in MRS:
+            for m in MODALITIES:
+                global_ymax = max(global_ymax,
+                                  results[mr][mk]["u_con"][m][si].item(),
+                                  results[mr][mk]["u_specific"][m][si].item())
+    y_top = max(0.7, math.ceil(global_ymax / 0.78 * 10) / 10)
+ 
+    for row, (ax, model_key) in enumerate(zip(axes, MODEL_ORDER)):
+        si = sample_indices[model_key]
+        t_ref_con = results[0.0][model_key]["u_con"]["l"][si].item()
+        t_ref_spec = results[0.0][model_key]["u_specific"]["l"][si].item()
+ 
+        for mr in MRS:
+            data = results[mr][model_key]
+            for m in MODALITIES:
+                u_con_val = data["u_con"][m][si].item()
+                u_spec_val = data["u_specific"][m][si].item()
+                x_con, x_spec = pos[(mr, m)]
+                is_missing = (m == "l" and mr == 0.5)
+ 
+                if is_missing:
+                    ax.axvspan(x_con - bar_w / 2 - 0.08, x_spec + bar_w / 2 + 0.08,
+                               facecolor=MISS_FACE, edgecolor="none", zorder=1)
+                    _bar(ax, x_con, u_con_val, bar_w, COLOR_CON, EDGE_CON, ref=t_ref_con)
+                    _bar(ax, x_spec, u_spec_val, bar_w, COLOR_SPEC, EDGE_SPEC, ref=t_ref_spec)
+                    d = u_spec_val - t_ref_spec
+                    ax.text(x_spec, max(u_spec_val, t_ref_spec) + 0.02 * y_top,
+                            _minus(f"{d:+.2f}"), ha="center", va="bottom", fontsize=6.5,
+                            fontweight="bold", color=ACCENT, zorder=6)
+                else:
+                    _bar(ax, x_con, u_con_val, bar_w, COLOR_CON, EDGE_CON)
+                    _bar(ax, x_spec, u_spec_val, bar_w, COLOR_SPEC, EDGE_SPEC)
+       
+            # Acc-7: highlight SARM in bold black
+            is_sarm = model_key == "sarm"
 
-    print('\n' + '=' * 80)
+            ax.text(
+                block_edges[mr][1], 0.985,
+                rf"$\star$ Acc-7 {acc7_values[mr][model_key]:.1f}%",
+                transform=ax.get_xaxis_transform(),
+                ha="right",
+                va="top",
+                fontsize=6,
+                color="black" if is_sarm else "#444444",
+                fontweight="bold" if is_sarm else "normal",
+                zorder=5,
+            )
+
+        # MR headers only once (top row) instead of 6 boxes
+        if row == 0:
+            for mr in MRS:
+                ax.text(block_centre[mr], 1.0, f"MR = {mr:.1f}",
+                        transform=ax.get_xaxis_transform(), ha="center", va="bottom",
+                        fontsize=7, fontweight="bold", color="#222222")
+ 
+        ax.axvline(divider_x, color="#BBBBBB", linewidth=0.5, linestyle=(0, (3, 2)), zorder=2)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(0, y_top)
+        ax.set_xticks([group_centre[(mr, m)] for mr in MRS for m in MODALITIES])
+        ax.set_xticklabels([MOD_LABELS_MAP[m] for _ in MRS for m in MODALITIES],
+                           fontweight="bold")
+        # the missing modality: red tick label
+        for lab, (mr, m) in zip(ax.get_xticklabels(), [(a, b) for a in MRS for b in MODALITIES]):
+            if m == "l" and mr == 0.5:
+                lab.set_color(ACCENT)
+        ax.tick_params(axis="x", length=0, pad=2)
+        ax.yaxis.set_major_locator(MultipleLocator(0.5))
+        ax.grid(axis="y", color="#D9D9D9", linewidth=0.3, zorder=0)
+        ax.set_axisbelow(True)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.set_title(_DISPLAY[model_key], fontweight="bold", loc="left", pad=2)
+ 
+    # "missing" caption once, under the last model row
+    ax_last = axes[-1]
+    ax_last.text(group_centre[(0.5, "l")], -0.17, "missing", transform=ax_last.get_xaxis_transform(),
+                 ha="center", va="top", fontsize=5.8, color=ACCENT, style="italic")
+    axes[1].set_ylabel("Uncertainty score", fontsize=7.5, labelpad=2)
+ 
+    _draw_summary_panel(ax_sum, results, sample_indices, summary)
+ 
+    legend_handles = [
+        Patch(facecolor=COLOR_CON, edgecolor=EDGE_CON, linewidth=0.5, label=r"$u^{\mathrm{con}}$"),
+        Patch(facecolor=COLOR_SPEC, edgecolor=EDGE_SPEC, linewidth=0.5,
+              label=r"$u^{\mathrm{specific}}$"),
+        Patch(facecolor=MISS_FACE, edgecolor="#E3B5B5", linewidth=0.5, label="Missing text"),
+        Patch(facecolor="#BDBDBD", edgecolor="white", hatch="//////", linewidth=0,
+              label=r"$\Delta$ vs. MR = 0.0"),
+    ]
+    fig.legend(handles=legend_handles, loc="outside lower center", ncol=4, frameon=False,
+               fontsize=6.5, handlelength=1.2, columnspacing=1.0, handletextpad=0.4)
+ 
+    for suffix in ("pdf", "png"):
+        fig.savefig(output_dir / f"mosi_shared_specific_case_study_1col.{suffix}",
+                    dpi=400, facecolor="white")
+    plt.close(fig)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(description='Case Study & Fusion Weight Analysis')
-    parser.add_argument('--model', type=str, default='dp', choices=['dp', 'dmd'],
-                        help='Model to analyze: dp or dmd (default: dp)')
-    parser.add_argument('--uncertainty_dir', type=str, default=None,
-                        help='Directory containing uncertainty .pt files (default: auto)')
-    parser.add_argument('--fig_dir', type=str, default=None,
-                        help='Directory to save output figures (default: auto)')
-    parser.add_argument('--tau_c', type=float, default=1.0,
-                        help='Temperature for shared fusion weight')
-    parser.add_argument('--tau_s', type=float, default=1.0,
-                        help='Temperature for specific fusion weight')
-    parser.add_argument('--r_min', type=float, default=0.1,
-                        help='Minimum fusion weight (clamp floor)')
-    parser.add_argument('--case_mr', type=float, default=0.5,
-                        help='Missing rate for case study selection')
-    parser.add_argument('--n_failure', type=int, default=3,
-                        help='Number of failure cases to plot')
-    parser.add_argument('--n_conflict', '--n_success', dest='n_conflict', type=int, default=3,
-                        help='Number of conflict / resolution cases to plot')
-    parser.add_argument('--missing_rates', type=float, nargs='+', default=None,
-                        help='Missing rates to analyze (default: 0.0 to 0.9)')
-    args = parser.parse_args()
+def print_summary(results: dict, sample_indices: dict) -> None:
+    print("\nSelected MOSI test examples (per-model)")
+    for model_key in MODEL_ORDER:
+        si = sample_indices[model_key]
+        sid = results[0.0][model_key]["ids"][si]
+        print(f"  {MODEL_SPECS[model_key]['display_name']:>10}: index={si}, id={sid}")
 
-    missing_rates = args.missing_rates if args.missing_rates is not None else MISSING_RATES
-
-    model_key = args.model.lower()
-    if args.uncertainty_dir is not None:
-        uncertainty_dir = Path(args.uncertainty_dir)
-    else:
-        uncertainty_dir = ROOT / 'result' / ('uncertainty_dmd' if model_key == 'dmd' else 'uncertainty')
-
-    if args.fig_dir is not None:
-        fig_dir = Path(args.fig_dir)
-    else:
-        fig_dir = ROOT / 'result' / 'figures' / ('case_study_dmd' if model_key == 'dmd' else 'case_study')
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    model_name = 'DMD' if model_key == 'dmd' else 'DecAlign'
-
-    print(f'Model: {model_name} ({model_key})')
-    print(f'Uncertainty dir: {uncertainty_dir}')
-    print(f'Configuration: tau_c={args.tau_c}, tau_s={args.tau_s}, r_min={args.r_min}')
-    print(f'Missing rates: {missing_rates}')
-    print(f'Figures will be saved to: {fig_dir}\n')
-
-    print('Loading uncertainty data ...')
-    datasets = load_all(tau_c=args.tau_c, tau_s=args.tau_s, r_min=args.r_min, missing_rates=missing_rates, uncertainty_dir=uncertainty_dir)
-
-    # Verify predictions exist
-    for mr in missing_rates:
-        if 'predictions' not in datasets[mr]:
-            print(f'  WARNING: Missing predictions for MR={mr}. '
-                  f'Re-run uncertainty mode to include predictions.')
-            sys.exit(1)
-
-    # Print numeric summary
-    print_weight_summary(datasets, missing_rates=missing_rates)
-
-    # A. Case studies
-    print(f'\n[A] Qualitative Case Studies (MR={args.case_mr}) ...')
-    run_case_studies(datasets, mr=args.case_mr,
-                     n_failure=args.n_failure, n_conflict=args.n_conflict,
-                     fig_dir=fig_dir, model_name=model_name)
-
-    # B. Weight vs Missing Rate
-    print('\n[B] Weight vs Missing Rate ...')
-    plot_weight_vs_missing_rate(datasets, missing_rates=missing_rates, fig_dir=fig_dir)
-
-    # C. Weight distributions
-    print('\n[C] Weight Distributions ...')
-    plot_weight_distributions(datasets, fig_dir=fig_dir)
-
-    # D. Uncertainty decomposition
-    print('\n[D] Uncertainty Decomposition ...')
-    plot_uncertainty_decomposition(datasets, fig_dir=fig_dir)
-
-    print(f'\nAll figures saved to: {fig_dir}')
+    print("\n  MR   Model       sample  u_con_T  u_spec_T  u_con_V  u_spec_V  u_con_A  u_spec_A   Acc-2(%)")
+    print("  " + "-" * 100)
+    for missing_rate in (0.0, 0.5):
+        for model_key in MODEL_ORDER:
+            si = sample_indices[model_key]
+            data = results[missing_rate][model_key]
+            vals = []
+            for m in MODALITIES:
+                vals.append(data["u_con"][m][si].item())
+                vals.append(data["u_specific"][m][si].item())
+            acc = 100 * data["metrics"]["Acc_2"]
+            print(
+                f"  {missing_rate:.1f}  {MODEL_SPECS[model_key]['display_name']:<10} "
+                f" {si:>5}   "
+                + "  ".join(f"{v:7.4f}" for v in vals)
+                + f"   {acc:6.2f}"
+            )
 
 
-if __name__ == '__main__':
+def main() -> None:
+    args = parse_args()
+    device = resolve_device(args.device)
+    print(f"Running on {device}. Checkpoints: {args.checkpoint_dir}")
+    results = load_or_infer_all(args, device)
+    sample_indices = select_case(results)
+    args.fig_dir.mkdir(parents=True, exist_ok=True)
+    plot_motivation_figure_1col(results, sample_indices, args.fig_dir,
+                                summary=args.summary,
+                                display_names={k: v["display_name"] for k, v in MODEL_SPECS.items()})
+    summary_path = args.fig_dir / "mosi_shared_specific_case_study.csv"
+    write_summary(results, sample_indices, summary_path)
+    print_summary(results, sample_indices)
+    print(f"\nFigure: {args.fig_dir / 'mosi_shared_specific_case_study.pdf'}")
+    print(f"Data:   {summary_path}")
+
+
+if __name__ == "__main__":
     main()

@@ -127,11 +127,15 @@ class DP(nn.Module):
         #   'swapped'       – shared→r^s, specific→r^c  (role-swapped)
         self.reliability_mode = getattr(args, 'reliability_mode', 'full')
 
-        # Train-set memory bank for KNN neighbor uncertainty
-        # Populated by update_train_bank() after each epoch; None until first update.
-        # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
-        self._train_bank_z_c: dict = {}   # shared representations of full train set
-        self._train_bank_z_s: dict = {}   # specific representations of full train set
+        # Population statistics for Centered Standardized Subspace Representation
+        # Populated by update_train_bank() after each epoch; empty until first update.
+        # Keys: 'l', 'v', 'a'
+        # Shared subspace (q=c)
+        self._train_mu_dir_c: dict = {}  # m -> (1, D) unit direction centroid μ̂_m^c on S^{d-1}
+        self._train_sigma_c: dict = {}   # m -> scalar nominal dispersion σ_m^c
+        # Specific subspace (q=s)
+        self._train_mu_dir_s: dict = {}  # m -> (1, D) unit direction centroid μ̂_m^s on S^{d-1}
+        self._train_sigma_s: dict = {}   # m -> scalar nominal dispersion σ_m^s
 
         # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
         # self.tau = getattr(args, 'tau', 0.5)
@@ -309,161 +313,105 @@ class DP(nn.Module):
         """
         return F.normalize(h.mean(dim=2), dim=1)
 
-    def _shared_consensus(self, z_c_dict):
+    def _center_standardize(self, bar_dict, mu_dir_bank, sigma_bank, eps=1e-8):
         """
-        u_m^{c,con,i} = 1 - (1/(|M|-1)) * Σ_{n≠m} cos(z_m^c, z_n^c)
+        Compute homogeneously centered and standardized vectors v̊.
+
+        For each modality m:
+            z       = v_bar / (||v_bar|| + eps)              — unit direction
+            v̊       = ||v_bar|| * (z - μ̂_m) / σ_m           — centered & standardized
+
+        Falls back to in-batch statistics when training-set stats are unavailable.
 
         Args:
-            z_c_dict: dict m → (B, D) — L2-normed shared pooled repr
+            bar_dict:    dict m → (B, D)  — unnormalized mean-pooled repr
+            mu_dir_bank: dict m → (1, D)  — training-set directional centroid
+            sigma_bank:  dict m → scalar  — training-set nominal dispersion
+            eps: numerical stability constant
         Returns:
-            dict m → (B,) consensus uncertainty
+            dict m → (B, D) centered standardized representation v̊
         """
-        modalities = list(z_c_dict.keys())
+        v_ring = {}
+        has_stats = bool(mu_dir_bank) and all(
+            m in mu_dir_bank for m in bar_dict
+        )
+        for m, v_bar in bar_dict.items():
+            norm_v = v_bar.norm(p=2, dim=1, keepdim=True)            # (B, 1)
+            z_v = v_bar / (norm_v + eps)                             # (B, D)
+
+            if has_stats:
+                mu_dir = mu_dir_bank[m].to(v_bar.device)             # (1, D)
+                sigma = sigma_bank[m].to(v_bar.device)               # scalar
+            else:
+                # In-batch fallback (Epoch 1 before first update_train_bank)
+                mu_dir = z_v.detach().mean(dim=0, keepdim=True)      # (1, D)
+                sigma = (
+                    norm_v.detach().squeeze(1)
+                    * (z_v.detach() - mu_dir).norm(p=2, dim=1)
+                ).mean().clamp(min=eps)                              # scalar
+
+            v_ring[m] = (norm_v * (z_v - mu_dir)) / (sigma + eps)    # (B, D)
+        return v_ring
+
+    def _shared_consensus(self, c_bar_dict, eps=1e-8):
+        """
+        Single-component Angular Consensus Uncertainty:
+            v̊_m^c = ||c̄_m|| * (z_m^c - μ̂_m^c) / σ_m^c
+            u_m^c  = 1 - cos(v̊_m^c, Σ_{n≠m} v̊_n^c)
+
+        Args:
+            c_bar_dict: dict m → (B, D) — unnormalized mean-pooled shared repr
+        Returns:
+            dict m → (B,) consensus uncertainty in [0, 2]
+        """
+        v_ring_c = self._center_standardize(
+            c_bar_dict, self._train_mu_dir_c, self._train_sigma_c, eps=eps
+        )
+        modalities = list(v_ring_c.keys())
         scores = {}
         for m in modalities:
-            others = [n for n in modalities if n != m]
-            cos_sum = sum(
-                F.cosine_similarity(z_c_dict[m], z_c_dict[n], dim=1)
-                for n in others
+            others_sum = sum(
+                v_ring_c[n] for n in modalities if n != m
+            )  # (B, D)
+            cos_sim = F.cosine_similarity(
+                v_ring_c[m], others_sum, dim=1, eps=eps
             )
-            scores[m] = 1.0 - cos_sum / len(others)
+            scores[m] = 1.0 - cos_sim                               # (B,)
         return scores
 
-    def _cycle_uncertainty(self, z_dict, zt_dict):
+    def _specific_uncertainty(self, s_bar_dict, eps=1e-8):
         """
-        u_m^{*,cy,i} = 1 - cos(z_m, z̃_m)
-        Works for both shared and specific.
+        Single-component Radial Energy Uncertainty:
+            v̊_m^s = ||s̄_m|| * (z_m^s - μ̂_m^s) / σ_m^s
+            u_m^s  = 1 / (1 + ||v̊_m^s||_2)  ∈ (0, 1]
+
+        Handles both failure modes via the 1-homogeneous residual:
+          • Zero-masking (V/A):    ||s̄|| → 0  ⟹  ||v̊|| → 0  ⟹  u → 1
+          • BERT [UNK] collapse:   z → μ̂    ⟹  ||v̊|| → 0  ⟹  u → 1
 
         Args:
-            z_dict:  dict m → (B, D) — original pooled repr
-            zt_dict: dict m → (B, D) — cycle-reconstructed pooled repr
+            s_bar_dict: dict m → (B, D) — unnormalized mean-pooled specific repr
         Returns:
-            dict m → (B,) cycle uncertainty
+            dict m → (B,) specific uncertainty in (0, 1]
         """
+        v_ring_s = self._center_standardize(
+            s_bar_dict, self._train_mu_dir_s, self._train_sigma_s, eps=eps
+        )
         return {
-            m: 1.0 - F.cosine_similarity(z_dict[m], zt_dict[m], dim=1)
-            for m in z_dict
+            m: 1.0 / (1.0 + v_ring_s[m].norm(p=2, dim=1))
+            for m in v_ring_s
         }
 
-    def _neighbor_uncertainty(self, z_c_dict, z_s_dict, K):
-        """
-        In-batch neighbor uncertainty for specific representations.
-        Used as fallback when train bank is not yet populated.
-
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)
-        N_K^m(i) = TopK_{j≠i}[cos(z_{-m}^{c,i}, z_{-m}^{c,j})]
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(z_m^{s,j}))
-
-        Args:
-            z_c_dict: dict m → (B, D) — shared pooled repr (normed)
-            z_s_dict: dict m → (B, D) — specific pooled repr (normed)
-            K: number of neighbors
-        Returns:
-            dict m → (B,) neighbor uncertainty
-        """
-        modalities = list(z_c_dict.keys())
-        B = z_c_dict[modalities[0]].shape[0]
-        scores = {}
-
-        for m in modalities:
-            # Leave-one-out shared feature
-            others = [n for n in modalities if n != m]
-            z_minus_m = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
-
-            # Pairwise cosine similarity (B, B); already L2-normed
-            sim_matrix = z_minus_m @ z_minus_m.t()
-            sim_matrix.fill_diagonal_(-float('inf'))  # mask self
-
-            k_actual = min(K, B - 1)
-            if k_actual <= 0:
-                scores[m] = torch.zeros(B, device=z_c_dict[m].device)
-                continue
-
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
-
-            z_s_m = z_s_dict[m]                    # (B, D)
-            z_s_neighbors = z_s_m[topk_idx]         # (B, K, D)
-
-            cos_neighbors = F.cosine_similarity(
-                z_s_m.unsqueeze(1),
-                z_s_neighbors.detach(),  # stop-gradient on neighbors
-                dim=2,
-            )  # (B, K)
-            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
-
-        return scores
-
-    def _neighbor_uncertainty_bank(self, z_c_dict, z_s_dict, K):
-        """
-        Train-set KNN neighbor uncertainty for specific representations.
-
-        Uses the full-train memory bank (_train_bank_z_c / _train_bank_z_s)
-        to find K nearest neighbors for every query sample (train or test).
-        This avoids the in-batch bias and makes uncertainty comparable across
-        train/test splits.
-
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)  — query leave-one-out shared feature
-        N_K^m(i) = TopK_j [cos(z_{-m}^{c,i}, bank_z_{-m}^{c,j})]   (no self-mask needed)
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(bank_z_m^{s,j}))
-
-        Args:
-            z_c_dict: dict m → (B, D) — query shared pooled repr (normed)
-            z_s_dict: dict m → (B, D) — query specific pooled repr (normed)
-            K: number of neighbors
-        Returns:
-            dict m → (B,) neighbor uncertainty
-        """
-        modalities = list(z_c_dict.keys())
-        device = z_c_dict[modalities[0]].device
-        scores = {}
-
-        for m in modalities:
-            others = [n for n in modalities if n != m]
-
-            # --- Query: leave-one-out shared feature (B, D) ---
-            z_minus_m_query = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
-
-            # --- Bank: leave-one-out shared feature (N, D) ---
-            bank_z_minus_m = F.normalize(
-                sum(self._train_bank_z_c[n].to(device) for n in others), dim=1
-            )  # (N, D)
-
-            # Cosine similarity between query and bank: (B, N)
-            sim_matrix = z_minus_m_query @ bank_z_minus_m.t()
-
-            N_bank = bank_z_minus_m.shape[0]
-            k_actual = min(K, N_bank)
-            if k_actual <= 0:
-                scores[m] = torch.zeros(
-                    z_c_dict[m].shape[0], device=device
-                )
-                continue
-
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
-
-            # Specific features from bank: (N, D)
-            bank_z_s_m = self._train_bank_z_s[m].to(device)  # (N, D)
-            z_s_neighbors = bank_z_s_m[topk_idx]              # (B, K, D)
-
-            z_s_m = z_s_dict[m]  # (B, D)
-            cos_neighbors = F.cosine_similarity(
-                z_s_m.unsqueeze(1),
-                z_s_neighbors.detach(),  # stop-gradient on bank
-                dim=2,
-            )  # (B, K)
-            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
-
-        return scores
-
     @torch.no_grad()
-    def update_train_bank(self, model_forward_fn, train_dataloader, device):
+    def update_train_bank(self, model_forward_fn, train_dataloader, device,
+                          eps=1e-8):
         """
-        Rebuild the full-train memory bank by passing the entire training set
-        through the encoder in eval mode (no gradients).
+        Compute population statistics for both subspaces (q ∈ {c, s}).
+
+        Passes the entire training set through the encoder in eval mode
+        (no gradients) and records per modality m, per subspace q:
+            μ̂_m^q = (1/N) Σ_j z_{m,j}^q                   — directional centroid
+            σ_m^q = (1/N) Σ_j ||v̄_m^q||₂ ‖z_m^q − μ̂_m^q‖  — nominal dispersion
 
         Should be called once after each training epoch (before validation).
 
@@ -473,54 +421,50 @@ class DP(nn.Module):
                               Typically just `model` itself.
             train_dataloader: DataLoader for the training split.
             device: torch device.
+            eps: small constant to avoid division by zero in normalization.
         """
         self.eval()
-        bank_z_c = {'l': [], 'v': [], 'a': []}
-        bank_z_s = {'l': [], 'v': [], 'a': []}
+        bank_c = {'l': [], 'v': [], 'a': []}
+        bank_s = {'l': [], 'v': [], 'a': []}
 
         for batch_data in train_dataloader:
-            text    = batch_data['text'].to(device)
-            text_m  = batch_data['text_m'].to(device)
-            audio   = batch_data['audio'].to(device)
-            audio_m = batch_data['audio_m'].to(device)
-            vision  = batch_data['vision'].to(device)
+            text     = batch_data['text'].to(device)
+            text_m   = batch_data['text_m'].to(device)
+            audio    = batch_data['audio'].to(device)
+            audio_m  = batch_data['audio_m'].to(device)
+            vision   = batch_data['vision'].to(device)
             vision_m = batch_data['vision_m'].to(device)
 
             output = model_forward_fn(text_m, audio_m, vision_m, text, audio, vision)
 
-            # c_l, c_v, c_a are (T, B, D) in output (after permute in forward)
-            c_l = output['c_l']  # (T, B, D)
-            c_v = output['c_v']
-            c_a = output['c_a']
-            s_l = output['s_l']  # (T, B, D)
-            s_v = output['s_v']
-            s_a = output['s_a']
+            for m in ['l', 'v', 'a']:
+                bank_c[m].append(output[f'c_{m}'].mean(dim=0).cpu())
+                bank_s[m].append(output[f's_{m}'].mean(dim=0).cpu())
 
-            # Pool over time dim and L2-normalize  → (B, D)
-            # c_* are already (T, B, D), mean over dim=0 gives (B, D)
-            for m, feat_c, feat_s in [
-                ('l', c_l, s_l),
-                ('v', c_v, s_v),
-                ('a', c_a, s_a),
-            ]:
-                z_c_m = F.normalize(feat_c.mean(dim=0), dim=1)  # (B, D)
-                z_s_m = F.normalize(feat_s.mean(dim=0), dim=1)  # (B, D)
-                bank_z_c[m].append(z_c_m.cpu())
-                bank_z_s[m].append(z_s_m.cpu())
-
-        # Concatenate all batches → (N_train, D) on CPU
         for m in ['l', 'v', 'a']:
-            self._train_bank_z_c[m] = torch.cat(bank_z_c[m], dim=0)
-            self._train_bank_z_s[m] = torch.cat(bank_z_s[m], dim=0)
+            for bank, mu_dict, sig_dict in [
+                (bank_c[m], self._train_mu_dir_c, self._train_sigma_c),
+                (bank_s[m], self._train_mu_dir_s, self._train_sigma_s),
+            ]:
+                all_v = torch.cat(bank, dim=0)                     # (N, D)
+                norm_v = all_v.norm(p=2, dim=1, keepdim=True)      # (N, 1)
+                z_v = all_v / (norm_v + eps)                       # (N, D)
+                mu_dir = z_v.mean(dim=0, keepdim=True)             # (1, D)
+                sigma = (
+                    norm_v.squeeze(1)
+                    * (z_v - mu_dir).norm(p=2, dim=1)
+                ).mean().clamp(min=eps)                            # scalar
+                mu_dict[m] = mu_dir
+                sig_dict[m] = sigma
 
         self.train()
 
-    def _compute_reliability(self, u_consensus, u_cycle_c, u_neighbor, u_cycle_s):
+    def _compute_reliability(self, u_consensus, u_cycle_c, u_specific, u_cycle_s):
         """
         Aggregate per-modality uncertainties into reliability scores.
 
-        u_m^c = 0.5 * (u_con + u_cy_c)
-        u_m^s = 0.5 * (u_nei + u_cy_s)
+        u_m^c = u_consensus (or 0.5 * (u_con + u_cy_c) when cycle is used)
+        u_m^s = u_specific  (or 0.5 * (u_spec + u_cy_s) when cycle is used)
         r_m^c = clamp(exp(-u_m^c / tau_c), r_min, 1)
         r_m^s = clamp(exp(-u_m^s / tau_s), r_min, 1)
 
@@ -533,9 +477,9 @@ class DP(nn.Module):
         r_shared, r_specific = {}, {}
         for m in u_consensus:
             # u_c = 0.5 * (u_consensus[m] + u_cycle_c[m])
-            # u_s = 0.5 * (u_neighbor[m] + u_cycle_s[m])
+            # u_s = 0.5 * (u_specific[m] + u_cycle_s[m])
             u_c = u_consensus[m]
-            u_s = u_neighbor[m]
+            u_s = u_specific[m]
             r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=1e-4, max=1.0)
             r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=1e-4, max=1.0)
             r_shared[m] = r_c.detach()      # stop-gradient
@@ -869,30 +813,28 @@ class DP(nn.Module):
         # ==============================================================
         # Online Uncertainty Computation
         # ==============================================================
-        # Pool + normalize shared and specific features (Conv1d format: B,D,T)
-        z_c = {
-            'l': self._pool_norm(c_l),  # (B, D)
-            'v': self._pool_norm(c_v),
-            'a': self._pool_norm(c_a),
+        # Unnormalized mean-pooled features (Conv1d format: B,D,T → B,D)
+        c_bar = {
+            'l': c_l.mean(dim=2),  # (B, D) — NOT L2-normalized
+            'v': c_v.mean(dim=2),
+            'a': c_a.mean(dim=2),
         }
-        z_s = {
-            'l': self._pool_norm(s_l),  # (B, D)
-            'v': self._pool_norm(s_v),
-            'a': self._pool_norm(s_a),
+        s_bar = {
+            'l': s_l.mean(dim=2),  # (B, D) — NOT L2-normalized
+            'v': s_v.mean(dim=2),
+            'a': s_a.mean(dim=2),
         }
 
-        # Shared consensus uncertainty: u_m^c = 1 - (1/(|M|-1)) Σ_{n≠m} cos(z_m^c, z_n^c)
-        u_consensus = self._shared_consensus(z_c)
-        # Specific neighbor uncertainty: u_m^s via leave-one-out KNN
-        # Use train-set memory bank if populated, otherwise fall back to in-batch KNN
-        if self._train_bank_z_c and all(m in self._train_bank_z_c for m in ['l', 'v', 'a']):
-            u_neighbor = self._neighbor_uncertainty_bank(z_c, z_s, self.K_neighbors)
-        else:
-            u_neighbor = self._neighbor_uncertainty(z_c, z_s, self.K_neighbors)
+        # Shared uncertainty: Angular Consensus on v̊_m^c
+        # u_m^c = 1 - cos(v̊_m^c, Σ_{n≠m} v̊_n^c)
+        u_consensus = self._shared_consensus(c_bar)
+        # Specific uncertainty: Radial Energy on v̊_m^s
+        # u_m^s = 1 / (1 + ||v̊_m^s||_2)  ∈ (0, 1]
+        u_specific = self._specific_uncertainty(s_bar)
 
         # Reliability scores (all stop-gradient): r = clamp(exp(-u/tau), r_min, 1)
         r_shared, r_specific = self._compute_reliability(
-            u_consensus, None, u_neighbor, None
+            u_consensus, None, u_specific, None
         )
 
         # ── Role-conditioned reliability routing ──
