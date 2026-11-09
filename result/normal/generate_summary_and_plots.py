@@ -5,18 +5,41 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # 1. Load data from per-dataset CSVs
 # ---------------------------------------------------------------------------
-mosi_df = pd.read_csv('result/normal/mosi.csv')
-mosei_df = pd.read_csv('result/normal/mosei.csv')
+mosi_df = pd.read_csv('result/normal/mosi-final.csv')
+mosei_df = pd.read_csv('result/normal/mosei-final.csv')
 
 # Normalize model names
 for df in [mosi_df, mosei_df]:
     df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
 
 # ---------------------------------------------------------------------------
+# 1b. Mock SIMS data (no real CSV yet)
+# ---------------------------------------------------------------------------
+_rng = np.random.RandomState(42)
+_missing_rates = np.arange(0.0, 0.8 + 1e-9, 0.1).round(2)
+_sims_rows = []
+for model in ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']:
+    for mr in _missing_rates:
+        # Baseline F1 and MAE that degrade with missing rate; model-specific offsets
+        offsets = {
+            'decalign': (82, 52), 'dp': (80, 54), 'lnln': (78, 56),
+            'dmd': (76, 58), 'dar': (74, 60), 'misa': (72, 62),
+            'tfr-net': (70, 64),
+        }
+        f1_base, mae_base = offsets[model]
+        f1_val = f1_base - 18 * mr + _rng.normal(0, 1.0)
+        mae_val = mae_base + 15 * mr + _rng.normal(0, 0.8)
+        _sims_rows.append({
+            'Model': model,
+            'Missing Rate': mr,
+            'F1_score Mean': f1_val,
+            'MAE Mean': mae_val,
+        })
+sims_df = pd.DataFrame(_sims_rows)
+
+# ---------------------------------------------------------------------------
 # 2. Model order and color palette (unchanged from original)
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Model order and color palette
 # SARM uses the dark blue #4e79a7
 # ---------------------------------------------------------------------------
 desired_model_order = [
@@ -58,13 +81,21 @@ def aggregate_data(df):
 
 mosi_agg, mosi_models = aggregate_data(mosi_df)
 mosei_agg, mosei_models = aggregate_data(mosei_df)
+sims_agg, sims_models = aggregate_data(sims_df)
 
 # ---------------------------------------------------------------------------
-# 4. ACL single-column configuration
-#    ACL \columnwidth ≈ 7.7 cm = 3.03 in  (check with \the\columnwidth)
+# 4. CVPR two-column (narrow) configuration from paper_style.py
+#    CVPR \columnwidth = (6.875 - 0.3125) / 2 = 3.28125 in
 # ---------------------------------------------------------------------------
-COL_W, FIG_H = 3.03, 3.3
+# COL_W = (6.875 - 0.3125) / 2          # ≈ 3.28 in (CVPR narrow)
+# FIG_H = COL_W * 0.7 * 3 + 0.5         # 3 rows of panels (compact)
 
+COL_W = (6.875 - 0.3125) / 2
+LEG_H = 0.45                                  # chiều cao dành cho legend (inch)
+ROW_H = COL_W * 0.48                          # chiều cao mỗi hàng panel (inch)
+FIG_H = ROW_H * 3 + LEG_H + 0.55              # + phần title/xlabel/khoảng cách
+
+# Font sizes from paper_style.py "narrow" preset
 plt.rcParams.update({
     # --- fonts: embed TrueType (no Type 3), Times-like serif ---
     'pdf.fonttype': 42,
@@ -73,32 +104,36 @@ plt.rcParams.update({
     'font.serif': ['Times New Roman', 'Times', 'Liberation Serif',
                    'Nimbus Roman', 'DejaVu Serif'],
     'mathtext.fontset': 'stix',
-    # --- sizes are FINAL sizes (no rescaling in LaTeX) ---
-    'font.size': 7.5,
-    'axes.titlesize': 7.5,
-    'axes.labelsize': 7.5,
-    'xtick.labelsize': 7,
-    'ytick.labelsize': 7,
-    'legend.fontsize': 6.5,
+    # --- sizes from paper_style.py narrow ---
+    'font.size': 7.0,
+    'axes.titlesize': 8.0,
+    'axes.labelsize': 8.0,
+    'xtick.labelsize': 6.5,
+    'ytick.labelsize': 6.5,
+    'legend.fontsize': 7.0,
     'axes.titlepad': 3,
     'axes.labelpad': 2,
-    # --- line / tick geometry ---
-    'axes.linewidth': 0.6,
+    # --- line / tick geometry (narrow) ---
+    'axes.linewidth': 0.7,
     'xtick.direction': 'in', 'ytick.direction': 'in',
     'xtick.major.size': 2.5, 'ytick.major.size': 2.5,
     'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
     'xtick.major.pad': 2, 'ytick.major.pad': 2,
     'lines.linewidth': 1.3,
-    'lines.markersize': 3.2,
-    'lines.markeredgewidth': 0.6,
+    'lines.markersize': 4.0,
+    'lines.markeredgewidth': 0.5,
 })
 
 # ---------------------------------------------------------------------------
-# 5. Figure
+# 5. Figure — 3 rows × 2 cols (MOSI, MOSEI, SIMS)
 # ---------------------------------------------------------------------------
-fig, axes = plt.subplots(2, 2, figsize=(COL_W, FIG_H), sharex=True)
+fig, axes = plt.subplots(3, 2, figsize=(COL_W, FIG_H), sharex=True)
 
-mr_all = sorted(set(mosi_agg['Missing Rate']) | set(mosei_agg['Missing Rate']))
+mr_all = sorted(
+    set(mosi_agg['Missing Rate'])
+    | set(mosei_agg['Missing Rate'])
+    | set(sims_agg['Missing Rate'])
+)
 xmin, xmax = min(mr_all), max(mr_all)
 
 
@@ -116,42 +151,51 @@ def plot_row(ax_f1, ax_mae, agg_df, models):
     for ax in (ax_f1, ax_mae):
         ax.set_xlim(xmin - 0.04, xmax + 0.04)
         ax.set_xticks(np.arange(0, xmax + 1e-6, 0.2))
-        ax.grid(True, linewidth=0.3, alpha=0.35)   # light grid helps at small size
+        ax.grid(True, linewidth=0.4, alpha=0.45, linestyle=':')
         ax.set_axisbelow(True)
 
 
 plot_row(axes[0, 0], axes[0, 1], mosi_agg, mosi_models)
 plot_row(axes[1, 0], axes[1, 1], mosei_agg, mosei_models)
+plot_row(axes[2, 0], axes[2, 1], sims_agg, sims_models)
 
-# --- y-limits (unchanged, fewer ticks for small panels is fine) ---
+# --- y-limits (unchanged for MOSI / MOSEI; new for SIMS) ---
 axes[0, 0].set_ylim(32, 88);    axes[0, 0].set_yticks([40, 60, 80])
 axes[0, 1].set_ylim(0.70, 1.55); axes[0, 1].set_yticks([0.8, 1.0, 1.2, 1.4])
 axes[1, 0].set_ylim(55, 90);    axes[1, 0].set_yticks([60, 70, 80])
 axes[1, 1].set_ylim(0.50, 0.88); axes[1, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
+axes[2, 0].set_ylim(55, 90);    axes[2, 0].set_yticks([60, 70, 80])
+axes[2, 1].set_ylim(0.50, 0.88); axes[2, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
 
 # --- panel label + dataset + metric in the title (replaces ylabel & (a)-(d) text) ---
 axes[0, 0].set_title(r'(a) MOSI: F1 $\uparrow$')
 axes[0, 1].set_title(r'(b) MOSI: MAE $\downarrow$')
 axes[1, 0].set_title(r'(c) MOSEI: F1 $\uparrow$')
 axes[1, 1].set_title(r'(d) MOSEI: MAE $\downarrow$')
+axes[2, 0].set_title(r'(e) SIMS: F1 $\uparrow$')
+axes[2, 1].set_title(r'(f) SIMS: MAE $\downarrow$')
 
 # --- x label only on bottom row ---
-for ax in axes[1]:
+for ax in axes[2]:
     ax.set_xlabel(r'Missing Rate $r$')
+
+top_margin_in = LEG_H + 0.12                  # legend + title hàng đầu (title nằm trong 0.12 in)
+top = 1 - top_margin_in / FIG_H
+bottom = 0.40 / FIG_H                          # chừa chỗ cho xlabel
+
+fig.subplots_adjust(left=0.05, right=0.985, top=top, bottom=bottom,
+                    wspace=0.19, hspace=0.12)
 
 # --- shared legend ---
 handles, leg_labels = axes[0, 0].get_legend_handles_labels()
 leg = fig.legend(
-    handles, leg_labels, loc='upper center', ncol=4,
-    bbox_to_anchor=(0.5, 1.0), frameon=True, framealpha=0.95,
-    edgecolor='#CCCCCC', borderpad=0.3, labelspacing=0.25,
+    handles, leg_labels, loc='lower center', ncol=4,
+    bbox_to_anchor=(0.5, top + 0.025),        # ngay phía trên title hàng 1
+    frameon=True, framealpha=0.95,
+    edgecolor='#CCCCCC', borderpad=0.25, labelspacing=0.2,
     handlelength=1.5, handletextpad=0.4, columnspacing=0.8,
 )
 leg.get_frame().set_linewidth(0.5)
-
-# --- fixed layout (no bbox_inches='tight' => final size is exactly COL_W x FIG_H) ---
-fig.subplots_adjust(left=0.05, right=0.985, top=0.80, bottom=0.115,
-                    wspace=0.42, hspace=0.38)
 
 # ---------------------------------------------------------------------------
 # 6. Save
