@@ -23,12 +23,6 @@ class DP(nn.Module):
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 500
-        if args.dataset_name == 'sims':
-            if args.need_data_aligned:
-                self.len_l, self.len_v, self.len_a = 39, 39, 39
-            else:
-                # SIMS unaligned: Text=39, Vision=55, Audio=400
-                self.len_l, self.len_v, self.len_a = 39, 55, 400
         self.orig_d_l, self.orig_d_a, self.orig_d_v = args.feature_dims
         self.d_l = self.d_a = self.d_v = dst_feature_dims
         self.num_heads = nheads
@@ -532,36 +526,6 @@ class DP(nn.Module):
         # h̃ = h_m + β * (b_{m←n} - h_m)
         return h_m + beta * (b_cross - h_m)
 
-    def _align_time_attention(self, h_src, p_tgt):
-        """
-        Dynamically aligns source shared feature h_src to target sequence length
-        via non-parametric soft cross-attention (Query = p_tgt, Key/Value = h_src).
-        Preserves 100% of source temporal information without interpolation artifacts.
-
-        Args:
-            h_src: (B, d, T_src) — source shared feature
-            p_tgt: (B, d, T_tgt) — target specific feature
-        Returns:
-            h_aligned: (B, d, T_tgt) — aligned shared feature matching T_tgt
-        """
-        if h_src.shape[-1] == p_tgt.shape[-1]:
-            return h_src
-
-        # q: (B, T_tgt, d), k: (B, T_src, d), v: (B, T_src, d)
-        q = p_tgt.transpose(1, 2)
-        k = h_src.transpose(1, 2)
-        v = k
-
-        d_k = q.size(-1)
-        # Scaled dot-product attention scores: (B, T_tgt, T_src)
-        attn_scores = torch.bmm(q, k.transpose(1, 2)) / (d_k ** 0.5)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        # Weighted combination of ALL T_src frames: (B, T_tgt, d)
-        h_aligned = torch.bmm(attn_weights, v)
-
-        return h_aligned.transpose(1, 2)  # (B, d, T_tgt)
-
     def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
             text = self.text_model(text)
@@ -604,35 +568,27 @@ class DP(nn.Module):
         # Cross-Reconstruction Module (CRM) (Section 3.3)
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
-        #   Dynamic attention alignment: H_n is softly aligned to T_m
-        #   using P_m as query, preserving 100% of source information.
         # ==============================================================
-        # For target L: use shared from V and A (aligned to T_l) + specific from L
-        c_v_l = self._align_time_attention(c_v, s_l)
-        c_a_l = self._align_time_attention(c_a, s_l)
-        x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
-        x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
+        # For target L: use shared from V and A + specific from L
+        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l.expand_as(c_a)], dim=1))  # (B, d, T_a)
         x_tilde_l = self.fusion_l(
             torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_l)
+        ).permute(0, 2, 1)  # (B, d, T)
 
-        # For target V: use shared from L and A (aligned to T_v) + specific from V
-        c_l_v = self._align_time_attention(c_l, s_v)
-        c_a_v = self._align_time_attention(c_a, s_v)
-        x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
-        x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
+        # For target V: use shared from L and A + specific from V
+        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v.expand_as(c_l)], dim=1))  # (B, d, T_l)
+        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v.expand_as(c_a)], dim=1))  # (B, d, T_a)
         x_tilde_v = self.fusion_v(
             torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_v)
+        ).permute(0, 2, 1)  # (B, d, T)
 
-        # For target A: use shared from L and V (aligned to T_a) + specific from A
-        c_l_a = self._align_time_attention(c_l, s_a)
-        c_v_a = self._align_time_attention(c_v, s_a)
-        x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
-        x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
+        # For target A: use shared from L and V + specific from A
+        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a.expand_as(c_l)], dim=1))  # (B, d, T_l)
+        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a.expand_as(c_v)], dim=1))  # (B, d, T_v)
         x_tilde_a = self.fusion_a(
             torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T_a)
+        ).permute(0, 2, 1)  # (B, d, T)
 
         # Re-disentangle reconstructed features (Eq. 9):
         #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
@@ -697,18 +653,6 @@ class DP(nn.Module):
                 {m: r_shared[m].clone() for m in r_shared},
             )
         # elif self.reliability_mode == 'full':  → default, no change needed
-
-        # ==============================================================
-        # Fine-grained Sentiment Refinement (FSR) (Section 3.4)
-        #   Using original P_m (specific) features
-        #   — commented out for now, testing CRM first
-        # ==============================================================
-        # # Convert specific features to (T, B, D) for FSR
-        # s_l_seq = s_l.permute(2, 0, 1)  # (T, B, D)
-        # s_v_seq = s_v.permute(2, 0, 1)
-        # s_a_seq = s_a.permute(2, 0, 1)
-        # s_l_prime, s_v_prime, s_a_prime = self.fsr(s_l_seq, s_v_seq, s_a_seq)
-        # # s_l_prime: (T, B, d), s_v_prime: (T, B, d), s_a_prime: (T, B, d)
 
         # ==============================================================
         # Permute to (T, B, D) for transformer layers
@@ -841,24 +785,6 @@ class DP(nn.Module):
                       training=self.training))
         hs_proj_a_high += last_h_a
         logits_a_high = self.out_layer_a_high(hs_proj_a_high)
-
-        # ==============================================================
-        # Shared branch: self-attention on H̃ (re-disentangled shared features)
-        #   — commented out for now, testing CRM first
-        # ==============================================================
-        # h_tilde_l_seq = h_tilde_l.permute(2, 0, 1)  # (T, B, d)
-        # h_tilde_v_seq = h_tilde_v.permute(2, 0, 1)
-        # h_tilde_a_seq = h_tilde_a.permute(2, 0, 1)
-        # h_tilde_concat = torch.cat([h_tilde_l_seq, h_tilde_v_seq, h_tilde_a_seq], dim=2)
-        # t_h_tilde = self.trans_shared(h_tilde_concat)
-        # if type(t_h_tilde) == tuple:
-        #     t_h_tilde = t_h_tilde[0]
-        # t_h_tilde_last = t_h_tilde[-1]  # (B, 3d)
-        # hs_shared = self.proj2_shared(
-        #     F.dropout(F.relu(self.proj1_shared(t_h_tilde_last), inplace=True),
-        #               p=self.output_dropout, training=self.training))
-        # hs_shared += t_h_tilde_last
-        # logits_shared = self.out_layer_shared(hs_shared)
 
         last_h_l = torch.sigmoid(self.weight_l(last_h_l))
         last_h_v = torch.sigmoid(self.weight_v(last_h_v))
@@ -1023,26 +949,3 @@ class DP(nn.Module):
 
         loss_cpa /= 6.0  # average over 6 cross-modal pairs
         return loss_cpa
-
-    # def compute_push_loss(self, margin=2.0):
-    #     """
-    #     Compute L_push: margin-based prototype separation loss.
-    #     L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
-    #     """
-    #     C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-    #     K = C.shape[0]
-
-    #     # Pairwise squared L2 distances
-    #     # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-    #     # Since C is L2-normalized: ||c_i||^2 = 1
-    #     dots = C @ C.t()  # (K, K)
-    #     sq_dists = 2.0 - 2.0 * dots  # (K, K)
-
-    #     # Mask out diagonal
-    #     mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-    #     sq_dists_off = sq_dists[mask]  # K*(K-1)
-
-    #     # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-    #     return loss_push
