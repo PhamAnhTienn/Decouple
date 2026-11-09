@@ -91,9 +91,19 @@ sims_agg, sims_models = aggregate_data(sims_df)
 # FIG_H = COL_W * 0.7 * 3 + 0.5         # 3 rows of panels (compact)
 
 COL_W = (6.875 - 0.3125) / 2
-LEG_H = 0.45                                  # chiều cao dành cho legend (inch)
-ROW_H = COL_W * 0.48                          # chiều cao mỗi hàng panel (inch)
-FIG_H = ROW_H * 3 + LEG_H + 0.55              # + phần title/xlabel/khoảng cách
+# --- các lề tính bằng inch ---
+EDGE   = 0.02    # khe giữa legend và mép trên figure
+LEG_H  = 0.34    # chiều cao legend (2 hàng, font 7pt)
+GAP    = 0.03    # khe giữa legend và title hàng 1
+TITLE  = 0.15    # chiều cao title (8pt + pad)
+BOT    = 0.28    # tick label + xlabel hàng dưới cùng
+
+HSPACE = 0.14    # khoảng cách giữa các hàng (tỉ lệ theo chiều cao axes)
+WSPACE = 0.19
+AX_H   = COL_W * 0.40   # chiều cao thật của MỖI panel (inch)
+
+TOP_IN = EDGE + LEG_H + GAP + TITLE
+FIG_H  = TOP_IN + BOT + AX_H * (3 + 2 * HSPACE)
 
 # Font sizes from paper_style.py "narrow" preset
 plt.rcParams.update({
@@ -179,18 +189,17 @@ axes[2, 1].set_title(r'(f) SIMS: MAE $\downarrow$')
 for ax in axes[2]:
     ax.set_xlabel(r'Missing Rate $r$')
 
-top_margin_in = LEG_H + 0.12                  # legend + title hàng đầu (title nằm trong 0.12 in)
-top = 1 - top_margin_in / FIG_H
-bottom = 0.40 / FIG_H                          # chừa chỗ cho xlabel
+top    = 1 - TOP_IN / FIG_H
+bottom = BOT / FIG_H
 
 fig.subplots_adjust(left=0.05, right=0.985, top=top, bottom=bottom,
-                    wspace=0.19, hspace=0.12)
+                    wspace=WSPACE, hspace=HSPACE)
 
-# --- shared legend ---
 handles, leg_labels = axes[0, 0].get_legend_handles_labels()
 leg = fig.legend(
-    handles, leg_labels, loc='lower center', ncol=4,
-    bbox_to_anchor=(0.5, top + 0.025),        # ngay phía trên title hàng 1
+    handles, leg_labels, loc='upper center', ncol=4,
+    bbox_to_anchor=(0.5, 1 - EDGE / FIG_H),
+    borderaxespad=0,
     frameon=True, framealpha=0.95,
     edgecolor='#CCCCCC', borderpad=0.25, labelspacing=0.2,
     handlelength=1.5, handletextpad=0.4, columnspacing=0.8,
