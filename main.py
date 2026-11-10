@@ -214,7 +214,7 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DecAlign: Multimodal Sentiment Analysis')
-    parser.add_argument('--model', type=str, default='misa', help="Model name; only 'decalign' is supported")
+    parser.add_argument('--model', type=str, default='misa', help="Model name (decalign, misa, dp, midas, ...)")
     parser.add_argument('--config_file', type=str, default='', help='Path to model config JSON')
     parser.add_argument('--dataset', type=str, default='mosi',
                         choices=['mosi', 'mosei', 'sims', 'chsims', 'ch-sims', 'ch_sims', 'iemocap'],

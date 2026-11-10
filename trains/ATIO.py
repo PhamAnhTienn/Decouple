@@ -7,6 +7,7 @@ from .DP import DP
 from .LNLN import LNLN
 from .CENET import CENET
 from .SELF_MM import SELF_MM
+from .MIDAS import MIDAS
 __all__ = ["ATIO"]
 
 logger = logging.getLogger('DecAlign')
@@ -21,7 +22,8 @@ class ATIO():
             'dp': DP,
             'lnln': LNLN,
             'cenet': CENET,
-            'self_mm': SELF_MM
+            'self_mm': SELF_MM,
+            'midas': MIDAS,
         }
 
     def getTrain(self, args):
