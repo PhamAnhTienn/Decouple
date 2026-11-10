@@ -194,7 +194,10 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
     else:
         dataset_config = {}
 
-    # Load from file if exists
+    # Dataset paths and defaults
+    default_config.update(dataset_config)
+
+    # Load from config file if exists (overrides default/dataset hyperparameters)
     if config_file and os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
@@ -203,9 +206,6 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
         except Exception as e:
             print(f"Warning: Could not load config file {config_file}: {e}")
 
-    # Dataset paths and task contracts should remain stable even when the
-    # shared config file supplies model hyperparameters.
-    default_config.update(dataset_config)
     default_config['model_name'] = model_name.lower()
     default_config['dataset_name'] = dataset_name.lower()
 

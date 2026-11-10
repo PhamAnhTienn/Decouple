@@ -18,11 +18,19 @@ class DP(nn.Module):
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 375
-        if args.dataset_name == 'mosei':
+        elif args.dataset_name == 'mosei':
             if args.need_data_aligned:
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 500
+        elif args.dataset_name == 'sims':
+            if args.need_data_aligned:
+                self.len_l, self.len_v, self.len_a = 39, 39, 39
+            else:
+                # SIMS unaligned: Text=39, Vision=55, Audio=400
+                self.len_l, self.len_v, self.len_a = 39, 55, 400
+        elif hasattr(args, 'seq_lens') and args.seq_lens:
+            self.len_l, self.len_a, self.len_v = args.seq_lens[0], args.seq_lens[1], args.seq_lens[2]
         self.orig_d_l, self.orig_d_a, self.orig_d_v = args.feature_dims
         self.d_l = self.d_a = self.d_v = dst_feature_dims
         self.num_heads = nheads
@@ -526,6 +534,36 @@ class DP(nn.Module):
         # h̃ = h_m + β * (b_{m←n} - h_m)
         return h_m + beta * (b_cross - h_m)
 
+    def _align_time_attention(self, h_src, p_tgt):
+        """
+        Dynamically aligns source shared feature h_src to target sequence length
+        via non-parametric soft cross-attention (Query = p_tgt, Key/Value = h_src).
+        Preserves 100% of source temporal information without interpolation artifacts.
+
+        Args:
+            h_src: (B, d, T_src) — source shared feature
+            p_tgt: (B, d, T_tgt) — target specific feature
+        Returns:
+            h_aligned: (B, d, T_tgt) — aligned shared feature matching T_tgt
+        """
+        if h_src.shape[-1] == p_tgt.shape[-1]:
+            return h_src
+
+        # q: (B, T_tgt, d), k: (B, T_src, d), v: (B, T_src, d)
+        q = p_tgt.transpose(1, 2)
+        k = h_src.transpose(1, 2)
+        v = k
+
+        d_k = q.size(-1)
+        # Scaled dot-product attention scores: (B, T_tgt, T_src)
+        attn_scores = torch.bmm(q, k.transpose(1, 2)) / (d_k ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # Weighted combination of ALL T_src frames: (B, T_tgt, d)
+        h_aligned = torch.bmm(attn_weights, v)
+
+        return h_aligned.transpose(1, 2)  # (B, d, T_tgt)
+
     def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
             text = self.text_model(text)
@@ -569,26 +607,32 @@ class DP(nn.Module):
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
         # ==============================================================
-        # For target L: use shared from V and A + specific from L
-        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l.expand_as(c_v)], dim=1))  # (B, d, T_v)
-        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        # For target L: use shared from V and A (aligned to T_l) + specific from L
+        c_v_l = self._align_time_attention(c_v, s_l)
+        c_a_l = self._align_time_attention(c_a, s_l)
+        x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
+        x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
         x_tilde_l = self.fusion_l(
             torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_l)
 
-        # For target V: use shared from L and A + specific from V
-        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        # For target V: use shared from L and A (aligned to T_v) + specific from V
+        c_l_v = self._align_time_attention(c_l, s_v)
+        c_a_v = self._align_time_attention(c_a, s_v)
+        x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
+        x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
         x_tilde_v = self.fusion_v(
             torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_v)
 
-        # For target A: use shared from L and V + specific from A
-        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        # For target A: use shared from L and V (aligned to T_a) + specific from A
+        c_l_a = self._align_time_attention(c_l, s_a)
+        c_v_a = self._align_time_attention(c_v, s_a)
+        x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
+        x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
         x_tilde_a = self.fusion_a(
             torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_a)
 
         # Re-disentangle reconstructed features (Eq. 9):
         #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
