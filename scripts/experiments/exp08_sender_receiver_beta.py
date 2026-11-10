@@ -40,10 +40,12 @@ from matplotlib.colors import Normalize
 import matplotlib.patheffects as pe
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import get_config_regression
 from data_loader import MMDataLoader
 from models import build_model
 from utils import assign_gpu, setup_seed
+from paper_style import apply_style, new_fig, save_fig
 
 logger = logging.getLogger("DecAlign")
 MODALITIES = ["l", "v", "a"]
@@ -223,8 +225,11 @@ def sweep_beta(model, model_args, m_recv, m_send, rates, num_workers, third_mod_
 # Plot heatmap
 # =====================================================================
 
-def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path):
-    fig, ax = plt.subplots(figsize=(8, 6))
+def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path, venue="cvpr"):
+    stem = Path(save_path).with_suffix("")
+    apply_style(venue=venue, kind="narrow")
+    fig, axes = new_fig(1, 1, height=2.85)
+    ax = axes[0]
     im = ax.imshow(beta_matrix, cmap="YlOrRd", aspect="auto", origin="lower",
                    vmin=beta_matrix.min(), vmax=beta_matrix.max())
 
@@ -233,9 +238,13 @@ def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path):
     ax.set_yticks(range(len(rates)))
     ax.set_yticklabels([f"{r:.1f}" for r in rates])
 
-    ax.set_xlabel(f"Sender ({MOD_NAMES[m_send]}) Missing Rate", fontsize=12)
-    ax.set_ylabel(f"Receiver ({MOD_NAMES[m_recv]}) Missing Rate", fontsize=12)
-    ax.set_title(f"β_{{{MOD_NAMES[m_recv]}←{MOD_NAMES[m_send]}}}", fontsize=14)
+    s_name = MOD_NAMES[m_send]
+    r_name = MOD_NAMES[m_recv]
+    s_up = m_send.upper()
+    r_up = m_recv.upper()
+    ax.set_xlabel(f"Sender ({s_name}) Missing Rate $\\eta_{m_send}$")
+    ax.set_ylabel(f"Receiver ({r_name}) Missing Rate $\\eta_{m_recv}$")
+    ax.set_title(rf"$\beta_{{{r_up} \leftarrow {s_up}}}$", pad=3, fontweight="bold")
 
     # Add readable annotations based on actual cell luminance
     norm = im.norm
@@ -244,39 +253,22 @@ def plot_heatmap(beta_matrix, rates, m_recv, m_send, save_path):
     for i in range(len(rates)):
         for j in range(len(rates)):
             value = beta_matrix[i, j]
-
-            # Actual RGBA color of this cell
             r, g, b, _ = cmap(norm(value))
-
-            # Perceived brightness (relative luminance)
-            luminance = (
-                0.2126 * r
-                + 0.7152 * g
-                + 0.0722 * b
-            )
-
-            # Dark text on light cells, white on dark cells
-            text_color = "black" if luminance > 0.5 else "white"
-
+            luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            text_color = "black" if luminance > 0.55 else "white"
             ax.text(
-                j, i, f"{value:.3f}",
+                j, i, f"{value:.2f}",
                 ha="center",
                 va="center",
                 color=text_color,
-                fontsize=9,
+                fontsize=5.0,
                 fontweight="medium",
-                path_effects=[
-                    pe.withStroke(linewidth=0.4, foreground="white")
-                    if text_color == "black"
-                    else pe.withStroke(linewidth=0.4, foreground="black")
-                ],
             )
 
-    plt.colorbar(im, ax=ax, label="Mean β")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Heatmap saved to {save_path}")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.03)
+    # cbar.set_label(rf"Mean $\beta_{{{r_up} \leftarrow {s_up}}}$", labelpad=2)
+    save_fig(fig, stem)
+    print(f"Heatmap saved to {stem}.pdf and {stem}.png [{venue}/narrow]")
 
 
 # =====================================================================
@@ -308,6 +300,8 @@ def main():
                         help="Fixed missing rate for the third modality")
     parser.add_argument("--all_pairs", action="store_true",
                         help="Run all 6 sender→receiver pairs")
+    parser.add_argument("--venue", type=str, default="cvpr", choices=["cvpr", "acl", "iccv", "iclr", "neurips", "icml"],
+                        help="Conference figure format (default: cvpr)")
     args = parser.parse_args()
 
     if args.sender == args.receiver:
@@ -367,6 +361,7 @@ def main():
         plot_heatmap(
             beta_matrix, args.rates, m_recv, m_send,
             os.path.join(args.save_dir, f"beta_heatmap_{m_send}_to_{m_recv}_{args.dataset}.png"),
+            venue=args.venue,
         )
 
         all_results[f"{m_send}_to_{m_recv}"] = {
