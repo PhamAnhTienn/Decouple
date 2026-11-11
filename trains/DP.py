@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-import wandb
 from utils import MetricsTop, dict_to_str
 
 logger = logging.getLogger('DecAlign')
@@ -58,21 +57,6 @@ class DP():
         # ---- Ablation flags (default False = full model) ----
         self.ablate_ort = getattr(args, 'ablate_ort', False)
         self.ablate_cpa = getattr(args, 'ablate_cpa', False)
-        self.ablate_shared_cal = getattr(args, 'ablate_shared_calibration', False)
-        self.ablate_specific_cal = getattr(args, 'ablate_specific_calibration', False)
-
-    def _weighted_recon_loss(self, x_tilde, x_orig, w):
-        """
-        Weighted cross-reconstruction loss (Eq. 8).
-        L_m = Σ_i w_i * ||X̃_m^i - X_m^i||^2 / Σ_i w_i
-        
-        Args:
-            x_tilde: (B, d, T) cross-reconstructed feature
-            x_orig:  (B, d, T) original projected feature
-            w:       (B,) per-sample CAW weights
-        """
-        per_sample = (x_tilde - x_orig).pow(2).flatten(1).mean(dim=1)  # (B,)
-        return (w * per_sample).sum() / w.sum().clamp(min=1e-8)
 
     def _cosine_similarity_abs(self, h, p):
         """
@@ -166,20 +150,13 @@ class DP():
                     # loss_task_shared = self.criterion(output['logits_shared'], labels)  # CRM shared branch — commented out
                     loss_task = loss_task_all + loss_task_l_homo + loss_task_v_homo + loss_task_a_homo + loss_task_l_hetero + loss_task_v_hetero + loss_task_a_hetero + loss_task_c
 
-                    # reconstruction loss (OLD uncertainty-reweighted — commented out)
+                    # # reconstruction loss (OLD uncertainty-reweighted — commented out)
                     # loss_recon_l = self.MSE(output['recon_l'], output['origin_l'])
                     # loss_recon_v = self.MSE(output['recon_v'], output['origin_v'])
                     # loss_recon_a = self.MSE(output['recon_a'], output['origin_a'])
                     # loss_recon = loss_recon_l + loss_recon_v + loss_recon_a
 
                     # --- L_recon: cross-reconstruction loss (using CRM x_tilde features) ---
-                    # # CAW-weighted version (commented out, CAW disabled):
-                    # loss_recon_l = self._weighted_recon_loss(
-                    #     output['x_tilde_l'], output['origin_l'], recon_w['l'])
-                    # loss_recon_v = self._weighted_recon_loss(
-                    #     output['x_tilde_v'], output['origin_v'], recon_w['v'])
-                    # loss_recon_a = self._weighted_recon_loss(
-                    #     output['x_tilde_a'], output['origin_a'], recon_w['a'])
                     loss_recon_l = self.MSE(output['x_tilde_l'], output['origin_l'])
                     loss_recon_v = self.MSE(output['x_tilde_v'], output['origin_v'])
                     loss_recon_a = self.MSE(output['x_tilde_a'], output['origin_a'])
@@ -217,13 +194,16 @@ class DP():
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
                     # CPA loss (Cross-modal Prototype Alignment)
-                    loss_cluster = model.compute_cpa_loss(
-                        output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
-                    )
-
                     # ---- Ablation: zero out disabled loss terms ----
                     ort_weight = 0.0 if self.ablate_ort else LAMBDA_ORT_INNER
                     cpa_weight = 0.0 if self.ablate_cpa else LAMBDA_CLUSTER
+
+                    if cpa_weight > 0.0:
+                        loss_cluster = model.compute_cpa_loss(
+                            output, tau=0.1, epsilon=0.05, sinkhorn_iterations=3
+                        )
+                    else:
+                        loss_cluster = 0.0
 
                     combined_loss = loss_task + \
                                         (loss_p + loss_recon + loss_ort * ort_weight) * LAMBDA_RECON_GROUP \
@@ -276,7 +256,7 @@ class DP():
                         train_dataloader=dataloader['train'],
                         device=self.args.device,
                     )
-                    logger.info(f">> Train bank updated: {model._train_bank_z_c['l'].shape[0]} samples.")
+                    logger.info(f">> Train bank updated: {len(dataloader['train'].dataset)} samples.")
 
                 # validation
                 val_results = self.do_test(model, dataloader['valid'], mode="VAL")

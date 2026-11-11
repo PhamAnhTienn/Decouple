@@ -5,79 +5,6 @@ from .subNets2 import BertTextEncoder
 from .subNets2.transformers_encoder.transformer import TransformerEncoder
 
 
-class FSR(nn.Module):
-    """
-    Fine-grained Sentiment Refinement module (Section 3.4).
-    
-    Extracts fine-grained emotional cues from visual- and audio-specific
-    features and uses text-guided cross-attention to supplement textual semantics.
-    """
-
-    def __init__(self, d_model, num_heads, attn_dropout=0.1, relu_dropout=0.1, res_dropout=0.1):
-        super(FSR, self).__init__()
-        # Feature refinement layers for P_V and P_A
-        self.refine_v = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-        self.refine_a = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, d_model),
-        )
-
-        # Text-guided cross-attention: P_L as query, [P'_V; P'_A] as key/value
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=attn_dropout,
-            batch_first=False,
-        )
-        self.layer_norm1 = nn.LayerNorm(d_model)
-        self.layer_norm2 = nn.LayerNorm(d_model)
-
-        # FFN after cross-attention
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.ReLU(inplace=True),
-            nn.Dropout(relu_dropout),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(res_dropout),
-        )
-
-    def forward(self, p_l, p_v, p_a):
-        """
-        Args:
-            p_l: (T_l, B, d) language specific features
-            p_v: (T_v, B, d) visual specific features
-            p_a: (T_a, B, d) audio specific features
-        Returns:
-            p_l_prime: (T_l, B, d) enhanced language features
-            p_v_prime: (T_v, B, d) refined visual features
-            p_a_prime: (T_a, B, d) refined audio features
-        """
-        # Refine visual and audio specific features
-        p_v_prime = p_v + self.refine_v(p_v)  # (T_v, B, d)
-        p_a_prime = p_a + self.refine_a(p_a)  # (T_a, B, d)
-
-        # Concatenate refined V and A as key/value for cross-attention
-        kv = torch.cat([p_v_prime, p_a_prime], dim=0)  # (T_v + T_a, B, d)
-
-        # Text-guided cross-attention: P_L queries [P'_V; P'_A]
-        residual = p_l
-        p_l_norm = self.layer_norm1(p_l)
-        attn_out, _ = self.cross_attn(query=p_l_norm, key=kv, value=kv)
-        p_l_enhanced = residual + attn_out  # (T_l, B, d)
-
-        # FFN
-        residual = p_l_enhanced
-        p_l_enhanced = self.layer_norm2(p_l_enhanced)
-        p_l_prime = residual + self.ffn(p_l_enhanced)  # (T_l, B, d)
-
-        return p_l_prime, p_v_prime, p_a_prime
-
-
 class DP(nn.Module):
     def __init__(self, args):
         super(DP, self).__init__()
@@ -91,11 +18,19 @@ class DP(nn.Module):
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 375
-        if args.dataset_name == 'mosei':
+        elif args.dataset_name == 'mosei':
             if args.need_data_aligned:
                 self.len_l, self.len_v, self.len_a = 50, 50, 50
             else:
                 self.len_l, self.len_v, self.len_a = 50, 500, 500
+        elif args.dataset_name == 'sims':
+            if args.need_data_aligned:
+                self.len_l, self.len_v, self.len_a = 39, 39, 39
+            else:
+                # SIMS unaligned: Text=39, Vision=55, Audio=400
+                self.len_l, self.len_v, self.len_a = 39, 55, 400
+        elif hasattr(args, 'seq_lens') and args.seq_lens:
+            self.len_l, self.len_a, self.len_v = args.seq_lens[0], args.seq_lens[1], args.seq_lens[2]
         self.orig_d_l, self.orig_d_a, self.orig_d_v = args.feature_dims
         self.d_l = self.d_a = self.d_v = dst_feature_dims
         self.num_heads = nheads
@@ -112,24 +47,37 @@ class DP(nn.Module):
 
         # Uncertainty hyperparameters
         self.tau_c = getattr(args, 'tau_c', 1.0)    # temperature for shared reliability
-        self.tau_s = getattr(args, 'tau_s', 1.0)    # temperature for specific reliability
-        self.tau_f = getattr(args, 'tau_f', 1.0)    # temperature for shared fusion softmax
-        self.r_min = getattr(args, 'r_min', 0.1)    # minimum reliability floor
+        self.tau_s = getattr(args, 'tau_s', 0.5)    # temperature for specific reliability
         self.K_neighbors = getattr(args, 'K_neighbors', 10)  # neighbors for specific uncertainty
 
-        # ---- Ablation flags ----
+        # ---- Ablation flags (default False = full model) ----
         self.ablate_shared_cal = getattr(args, 'ablate_shared_calibration', False)
         self.ablate_specific_cal = getattr(args, 'ablate_specific_calibration', False)
+        self.ablate_residual_cal = getattr(args, 'ablate_residual_calibration', False)
 
-        # Train-set memory bank for KNN neighbor uncertainty
-        # Populated by update_train_bank() after each epoch; None until first update.
-        # Keys: 'l', 'v', 'a'  →  Tensor (N_train, D) on CPU (moved to device on use)
-        self._train_bank_z_c: dict = {}   # shared representations of full train set
-        self._train_bank_z_s: dict = {}   # specific representations of full train set
+        # ── Role-conditioned reliability ablation ──
+        # Controls how r_shared / r_specific scores are routed to the
+        # shared-consensus and specific-exchange modules.
+        # Modes:
+        #   'full'          – default: shared→r^c, specific→r^s  (Full SARM)
+        #   'uniform'       – r^c = r^s = 1 for both modules
+        #   'shared_only'   – both modules use r^c
+        #   'specific_only' – both modules use r^s
+        #   'averaged'      – both modules use (r^c + r^s) / 2
+        #   'swapped'       – shared→r^s, specific→r^c  (role-swapped)
+        self.reliability_mode = getattr(args, 'reliability_mode', 'full')
 
-        # # CAW hyperparameters (Conflict-Aware Weighting, Section 3.2)
-        # self.tau = getattr(args, 'tau', 0.5)
-        # self.omega_min = getattr(args, 'omega_min', 0.1)
+        # Population statistics for ABTT (Axis-Based Tangent Transform) Subspace
+        # Populated by update_train_bank() after each epoch; empty until first update.
+        # Keys: 'l', 'v', 'a'
+        # Shared subspace (q=c)
+        self._train_mu_dir_c: dict = {}  # m -> (1, D) unit cone axis μ̂_m^c on S^{d-1}
+        self._train_sigma_c: dict = {}   # m -> scalar mean projection length σ_m^c
+        # Specific subspace (q=s)
+        self._train_mu_dir_s: dict = {}  # m -> (1, D) unit cone axis μ̂_m^s on S^{d-1}
+        self._train_sigma_s: dict = {}   # m -> scalar mean projection length σ_m^s
+        # ABTT unit bank for specific neighbor lookup
+        self._train_bank_z_s: dict = {}  # m -> (N_train, D) Norm(p_{m,j}^{s,bank})
 
         combined_dim_low = self.d_a
         combined_dim_high = 2 * self.d_a
@@ -178,17 +126,6 @@ class DP(nn.Module):
         self.fusion_v = nn.Linear(self.d_v * 2, self.d_v)
         self.fusion_a = nn.Linear(self.d_a * 2, self.d_a)
 
-        # =====================================================================
-        # 3c. Fine-grained Sentiment Refinement (FSR) (Section 3.4)
-        # =====================================================================
-        self.fsr = FSR(
-            d_model=self.d_l,
-            num_heads=self.num_heads,
-            attn_dropout=self.attn_dropout,
-            relu_dropout=self.relu_dropout,
-            res_dropout=self.res_dropout,
-        )
-
         # init prototype
         self.nmb_prototypes = args.nmb_prototypes
         self.prototypes = nn.Linear(self.d_a, args.nmb_prototypes, bias=False)
@@ -198,10 +135,6 @@ class DP(nn.Module):
         self.self_attentions_c_v = self.get_network(self_type='v')
         self.self_attentions_c_a = self.get_network(self_type='a')
 
-        # --- OLD: shared concat projection (3*D) ---
-        # self.proj1_c = nn.Linear(self.d_l * 3, self.d_l * 3)
-        # self.proj2_c = nn.Linear(self.d_l * 3, self.d_l * 3)
-        # self.out_layer_c = nn.Linear(self.d_l * 3, output_dim)
         # --- NEW: shared consensus sum projection (D) ---
         self.proj1_c = nn.Linear(self.d_l, self.d_l)
         self.proj2_c = nn.Linear(self.d_l, self.d_l)
@@ -254,8 +187,6 @@ class DP(nn.Module):
         self.weight_l = nn.Linear(2 * self.d_l, 2 * self.d_l)
         self.weight_v = nn.Linear(2 * self.d_v, 2 * self.d_v)
         self.weight_a = nn.Linear(2 * self.d_a, 2 * self.d_a)
-        # --- OLD: shared concat weight (3*D) ---
-        # self.weight_c = nn.Linear(3 * self.d_l, 3 * self.d_l)
         # --- NEW: shared consensus sum weight (D) ---
         self.weight_c = nn.Linear(self.d_l, self.d_l)
         # final project
@@ -303,161 +234,143 @@ class DP(nn.Module):
         """
         return F.normalize(h.mean(dim=2), dim=1)
 
-    def _shared_consensus(self, z_c_dict):
+    def _abtt_soft_normalize(self, v_bar_dict, mu_dir_bank, sigma_bank, eps=1e-8):
         """
-        u_m^{c,con,i} = 1 - (1/(|M|-1)) * Σ_{n≠m} cos(z_m^c, z_n^c)
+        ABTT Orthogonal Projection + Soft Tikhonov Normalization.
+
+        Step 1 (ABTT Orthogonal Projection):
+            p_{m,i} = v̄_{m,i} - (v̄_{m,i}^T μ̂_m) μ̂_m
+        Step 2 (Soft Unit-Ball Normalization):
+            z̊_{m,i} = p_{m,i} / sqrt(||p_{m,i}||_2^2 + σ_m^2)
+
+        Properties:
+        - When v̄ = 0 (100% frame loss): p = 0 → z̊ = 0
+        - When norm small (heavy masking / collapse to [UNK]): ||z̊|| → 0 smoothly
+        - When norm very large (outlier): ||z̊|| bounded above by 1.0
+
+        Falls back to in-batch statistics when training-set stats are unavailable.
 
         Args:
-            z_c_dict: dict m → (B, D) — L2-normed shared pooled repr
+            v_bar_dict:  dict m → (B, D)  — unnormalized mean-pooled repr
+            mu_dir_bank: dict m → (1, D)  — unit cone axis from training set
+            sigma_bank:  dict m → scalar  — mean ABTT projection length from training set
+            eps: numerical stability constant
         Returns:
-            dict m → (B,) consensus uncertainty
+            dict m → (B, D) ABTT soft-normalized vectors z̊, ||z̊|| ∈ [0, 1)
         """
-        modalities = list(z_c_dict.keys())
+        if self.ablate_residual_cal:
+            # Ablation: standard unit normalization without residual projection & soft Tikhonov scaling
+            return {m: F.normalize(v_bar, dim=1, eps=eps) for m, v_bar in v_bar_dict.items()}
+
+        z_ring = {}
+        has_stats = bool(mu_dir_bank) and all(m in mu_dir_bank for m in v_bar_dict)
+
+        for m, v_bar in v_bar_dict.items():
+            if has_stats:
+                mu_dir = mu_dir_bank[m].to(v_bar.device)                # (1, D)
+                sigma = sigma_bank[m].to(v_bar.device)                  # scalar
+            else:
+                # Fallback in Epoch 1 before update_train_bank() runs
+                z_unit = F.normalize(v_bar.detach(), dim=1, eps=eps)
+                mu_dir = F.normalize(z_unit.mean(dim=0, keepdim=True), dim=1, eps=eps)
+                p_batch = v_bar.detach() - (v_bar.detach() * mu_dir).sum(dim=1, keepdim=True) * mu_dir
+                sigma = p_batch.norm(p=2, dim=1).mean().clamp(min=eps)
+
+            # ABTT orthogonal projection
+            proj_coeff = (v_bar * mu_dir).sum(dim=1, keepdim=True)      # (B, 1)
+            p_m = v_bar - proj_coeff * mu_dir                           # (B, D)
+
+            # Soft Tikhonov normalization into unit ball
+            p_norm_sq = p_m.pow(2).sum(dim=1, keepdim=True)             # (B, 1)
+            denom = torch.sqrt(p_norm_sq + sigma.pow(2) + eps)          # (B, 1)
+            z_ring[m] = p_m / denom                                     # (B, D), ||z̊|| ∈ [0, 1)
+
+        return z_ring
+
+    def _shared_consensus(self, c_bar_dict, eps=1e-8):
+        """
+        Shared Uncertainty via cross-modality consensus on ABTT-projected vectors.
+
+            z̊_m^c = ABTT_soft_normalize(c̄_m)
+            u_m^c  = 1 - (z̊_m^c)^T Norm(Σ_{n≠m} z̊_n^c)
+
+        Args:
+            c_bar_dict: dict m → (B, D) — unnormalized mean-pooled shared repr
+        Returns:
+            dict m → (B,) consensus uncertainty in [0, 2]
+        """
+        z_ring_c = self._abtt_soft_normalize(
+            c_bar_dict, self._train_mu_dir_c, self._train_sigma_c, eps=eps
+        )
+        modalities = list(z_ring_c.keys())
         scores = {}
         for m in modalities:
-            others = [n for n in modalities if n != m]
-            cos_sum = sum(
-                F.cosine_similarity(z_c_dict[m], z_c_dict[n], dim=1)
-                for n in others
-            )
-            scores[m] = 1.0 - cos_sum / len(others)
+            others_sum = sum(z_ring_c[n] for n in modalities if n != m)  # (B, D)
+            consensus_dir = F.normalize(others_sum, dim=1, eps=eps)     # (B, D)
+            scores[m] = 1.0 - (z_ring_c[m] * consensus_dir).sum(dim=1) # (B,)
         return scores
 
-    def _cycle_uncertainty(self, z_dict, zt_dict):
+    def _specific_uncertainty(self, s_bar_dict, eps=1e-8):
         """
-        u_m^{*,cy,i} = 1 - cos(z_m, z̃_m)
-        Works for both shared and specific.
+        Specific Uncertainty via neighbor support in ABTT-projected space.
+
+            z̊_m^s = ABTT_soft_normalize(s̄_m)
+            N_K^m(i) = TopK_j [ (z̊_{m,i}^s)^T ẑ_{m,j}^{s,bank} ]
+            u_m^s = 1 - (1/K) Σ_{j∈N_K^m(i)} (z̊_{m,i}^s)^T ẑ_{m,j}^{s,bank}
+
+        where ẑ_{m,j}^{s,bank} = Norm(p_{m,j}^{s,bank}) are unit-norm ABTT-projected
+        neighbor vectors from the training-set memory bank.
+
+        Fallback (before first update_train_bank): uses radial energy
+            u_m^s = 1 / (1 + ||z̊_m^s||_2)  ∈ (0, 1]
 
         Args:
-            z_dict:  dict m → (B, D) — original pooled repr
-            zt_dict: dict m → (B, D) — cycle-reconstructed pooled repr
+            s_bar_dict: dict m → (B, D) — unnormalized mean-pooled specific repr
         Returns:
-            dict m → (B,) cycle uncertainty
+            dict m → (B,) specific uncertainty
         """
-        return {
-            m: 1.0 - F.cosine_similarity(z_dict[m], zt_dict[m], dim=1)
-            for m in z_dict
-        }
+        z_ring_s = self._abtt_soft_normalize(
+            s_bar_dict, self._train_mu_dir_s, self._train_sigma_s, eps=eps
+        )
 
-    def _neighbor_uncertainty(self, z_c_dict, z_s_dict, K):
-        """
-        In-batch neighbor uncertainty for specific representations.
-        Used as fallback when train bank is not yet populated.
+        # If bank not yet populated, fall back to radial energy uncertainty
+        if not self._train_bank_z_s:
+            return {
+                m: 1.0 / (1.0 + z_ring_s[m].norm(p=2, dim=1))
+                for m in z_ring_s
+            }
 
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)
-        N_K^m(i) = TopK_{j≠i}[cos(z_{-m}^{c,i}, z_{-m}^{c,j})]
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(z_m^{s,j}))
-
-        Args:
-            z_c_dict: dict m → (B, D) — shared pooled repr (normed)
-            z_s_dict: dict m → (B, D) — specific pooled repr (normed)
-            K: number of neighbors
-        Returns:
-            dict m → (B,) neighbor uncertainty
-        """
-        modalities = list(z_c_dict.keys())
-        B = z_c_dict[modalities[0]].shape[0]
+        modalities = list(z_ring_s.keys())
+        device = z_ring_s[modalities[0]].device
+        K = self.K_neighbors
         scores = {}
 
         for m in modalities:
-            # Leave-one-out shared feature
-            others = [n for n in modalities if n != m]
-            z_minus_m = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
+            z_q = z_ring_s[m]                                           # (B, D)
+            bank_z_hat = self._train_bank_z_s[m].to(device)             # (N_train, D)
 
-            # Pairwise cosine similarity (B, B); already L2-normed
-            sim_matrix = z_minus_m @ z_minus_m.t()
-            sim_matrix.fill_diagonal_(-float('inf'))  # mask self
+            # Dot-product similarity: (z̊_{m,i}^s)^T ẑ_{m,j}^{s,bank}
+            sim_matrix = z_q @ bank_z_hat.t()                           # (B, N_train)
 
-            k_actual = min(K, B - 1)
-            if k_actual <= 0:
-                scores[m] = torch.zeros(B, device=z_c_dict[m].device)
-                continue
-
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
-
-            z_s_m = z_s_dict[m]                    # (B, D)
-            z_s_neighbors = z_s_m[topk_idx]         # (B, K, D)
-
-            cos_neighbors = F.cosine_similarity(
-                z_s_m.unsqueeze(1),
-                z_s_neighbors.detach(),  # stop-gradient on neighbors
-                dim=2,
-            )  # (B, K)
-            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
-
-        return scores
-
-    def _neighbor_uncertainty_bank(self, z_c_dict, z_s_dict, K):
-        """
-        Train-set KNN neighbor uncertainty for specific representations.
-
-        Uses the full-train memory bank (_train_bank_z_c / _train_bank_z_s)
-        to find K nearest neighbors for every query sample (train or test).
-        This avoids the in-batch bias and makes uncertainty comparable across
-        train/test splits.
-
-        z_{-m}^c = Norm(Σ_{n≠m} z_n^c)  — query leave-one-out shared feature
-        N_K^m(i) = TopK_j [cos(z_{-m}^{c,i}, bank_z_{-m}^{c,j})]   (no self-mask needed)
-        u_m^{s,nei,i} = 1 - (1/K) Σ_{j∈N_K} cos(z_m^{s,i}, sg(bank_z_m^{s,j}))
-
-        Args:
-            z_c_dict: dict m → (B, D) — query shared pooled repr (normed)
-            z_s_dict: dict m → (B, D) — query specific pooled repr (normed)
-            K: number of neighbors
-        Returns:
-            dict m → (B,) neighbor uncertainty
-        """
-        modalities = list(z_c_dict.keys())
-        device = z_c_dict[modalities[0]].device
-        scores = {}
-
-        for m in modalities:
-            others = [n for n in modalities if n != m]
-
-            # --- Query: leave-one-out shared feature (B, D) ---
-            z_minus_m_query = F.normalize(
-                sum(z_c_dict[n] for n in others), dim=1
-            )  # (B, D)
-
-            # --- Bank: leave-one-out shared feature (N, D) ---
-            bank_z_minus_m = F.normalize(
-                sum(self._train_bank_z_c[n].to(device) for n in others), dim=1
-            )  # (N, D)
-
-            # Cosine similarity between query and bank: (B, N)
-            sim_matrix = z_minus_m_query @ bank_z_minus_m.t()
-
-            N_bank = bank_z_minus_m.shape[0]
-            k_actual = min(K, N_bank)
-            if k_actual <= 0:
-                scores[m] = torch.zeros(
-                    z_c_dict[m].shape[0], device=device
-                )
-                continue
-
-            _, topk_idx = sim_matrix.topk(k_actual, dim=1)  # (B, K)
-
-            # Specific features from bank: (N, D)
-            bank_z_s_m = self._train_bank_z_s[m].to(device)  # (N, D)
-            z_s_neighbors = bank_z_s_m[topk_idx]              # (B, K, D)
-
-            z_s_m = z_s_dict[m]  # (B, D)
-            cos_neighbors = F.cosine_similarity(
-                z_s_m.unsqueeze(1),
-                z_s_neighbors.detach(),  # stop-gradient on bank
-                dim=2,
-            )  # (B, K)
-            scores[m] = 1.0 - cos_neighbors.mean(dim=1)  # (B,)
+            k_actual = min(K, bank_z_hat.shape[0])
+            topk_vals, _ = sim_matrix.topk(k_actual, dim=1)             # (B, K)
+            scores[m] = 1.0 - topk_vals.mean(dim=1)                     # (B,)
 
         return scores
 
     @torch.no_grad()
-    def update_train_bank(self, model_forward_fn, train_dataloader, device):
+    def update_train_bank(self, model_forward_fn, train_dataloader, device,
+                          eps=1e-8):
         """
-        Rebuild the full-train memory bank by passing the entire training set
-        through the encoder in eval mode (no gradients).
+        Compute ABTT population statistics for both subspaces (q ∈ {c, s}).
+
+        Passes the entire training set through the encoder in eval mode
+        (no gradients) and records per modality m, per subspace q:
+            μ̂_m^q = Norm(E_j[Norm(v̄_{m,j}^q)])             — unit cone axis
+            σ_m^q = E_j[||p_{m,j}^q||_2]                    — mean ABTT projection length
+
+        Additionally for specific branch (q=s):
+            bank_z_s[m] = Norm(p_{m,j}^s)                    — ABTT unit neighbor bank
 
         Should be called once after each training epoch (before validation).
 
@@ -467,54 +380,61 @@ class DP(nn.Module):
                               Typically just `model` itself.
             train_dataloader: DataLoader for the training split.
             device: torch device.
+            eps: small constant to avoid division by zero in normalization.
         """
         self.eval()
-        bank_z_c = {'l': [], 'v': [], 'a': []}
-        bank_z_s = {'l': [], 'v': [], 'a': []}
+        bank_c = {'l': [], 'v': [], 'a': []}
+        bank_s = {'l': [], 'v': [], 'a': []}
 
         for batch_data in train_dataloader:
-            text    = batch_data['text'].to(device)
-            text_m  = batch_data['text_m'].to(device)
-            audio   = batch_data['audio'].to(device)
-            audio_m = batch_data['audio_m'].to(device)
-            vision  = batch_data['vision'].to(device)
+            text     = batch_data['text'].to(device)
+            text_m   = batch_data['text_m'].to(device)
+            audio    = batch_data['audio'].to(device)
+            audio_m  = batch_data['audio_m'].to(device)
+            vision   = batch_data['vision'].to(device)
             vision_m = batch_data['vision_m'].to(device)
 
             output = model_forward_fn(text_m, audio_m, vision_m, text, audio, vision)
 
-            # c_l, c_v, c_a are (T, B, D) in output (after permute in forward)
-            c_l = output['c_l']  # (T, B, D)
-            c_v = output['c_v']
-            c_a = output['c_a']
-            s_l = output['s_l']  # (T, B, D)
-            s_v = output['s_v']
-            s_a = output['s_a']
+            for m in ['l', 'v', 'a']:
+                bank_c[m].append(output[f'c_{m}'].mean(dim=0).cpu())
+                bank_s[m].append(output[f's_{m}'].mean(dim=0).cpu())
 
-            # Pool over time dim and L2-normalize  → (B, D)
-            # c_* are already (T, B, D), mean over dim=0 gives (B, D)
-            for m, feat_c, feat_s in [
-                ('l', c_l, s_l),
-                ('v', c_v, s_v),
-                ('a', c_a, s_a),
-            ]:
-                z_c_m = F.normalize(feat_c.mean(dim=0), dim=1)  # (B, D)
-                z_s_m = F.normalize(feat_s.mean(dim=0), dim=1)  # (B, D)
-                bank_z_c[m].append(z_c_m.cpu())
-                bank_z_s[m].append(z_s_m.cpu())
-
-        # Concatenate all batches → (N_train, D) on CPU
         for m in ['l', 'v', 'a']:
-            self._train_bank_z_c[m] = torch.cat(bank_z_c[m], dim=0)
-            self._train_bank_z_s[m] = torch.cat(bank_z_s[m], dim=0)
+            all_s = torch.cat(bank_s[m], dim=0)                        # (N, D)
+            if self.ablate_residual_cal:
+                # Ablation: unit-normalized specific feature bank without residual projection
+                self._train_bank_z_s[m] = F.normalize(all_s, dim=1, eps=eps)  # (N, D)
+                continue
+
+            # ── Shared stats (q=c) ──
+            all_c = torch.cat(bank_c[m], dim=0)                        # (N, D)
+            z_c_unit = F.normalize(all_c, dim=1, eps=eps)              # (N, D)
+            mu_dir_c = F.normalize(
+                z_c_unit.mean(dim=0, keepdim=True), dim=1, eps=eps
+            )                                                          # (1, D)
+            p_c = all_c - (all_c * mu_dir_c).sum(dim=1, keepdim=True) * mu_dir_c  # (N, D)
+            self._train_mu_dir_c[m] = mu_dir_c
+            self._train_sigma_c[m] = p_c.norm(p=2, dim=1).mean().clamp(min=eps)
+
+            # ── Specific stats (q=s) + ABTT unit bank ──
+            z_s_unit = F.normalize(all_s, dim=1, eps=eps)              # (N, D)
+            mu_dir_s = F.normalize(
+                z_s_unit.mean(dim=0, keepdim=True), dim=1, eps=eps
+            )                                                          # (1, D)
+            p_s = all_s - (all_s * mu_dir_s).sum(dim=1, keepdim=True) * mu_dir_s  # (N, D)
+            self._train_mu_dir_s[m] = mu_dir_s
+            self._train_sigma_s[m] = p_s.norm(p=2, dim=1).mean().clamp(min=eps)
+            self._train_bank_z_s[m] = F.normalize(p_s, dim=1, eps=eps) # (N, D)
 
         self.train()
 
-    def _compute_reliability(self, u_consensus, u_cycle_c, u_neighbor, u_cycle_s):
+    def _compute_reliability(self, u_consensus, u_cycle_c, u_specific, u_cycle_s):
         """
         Aggregate per-modality uncertainties into reliability scores.
 
-        u_m^c = 0.5 * (u_con + u_cy_c)
-        u_m^s = 0.5 * (u_nei + u_cy_s)
+        u_m^c = u_consensus (or 0.5 * (u_con + u_cy_c) when cycle is used)
+        u_m^s = u_specific  (or 0.5 * (u_spec + u_cy_s) when cycle is used)
         r_m^c = clamp(exp(-u_m^c / tau_c), r_min, 1)
         r_m^s = clamp(exp(-u_m^s / tau_s), r_min, 1)
 
@@ -527,126 +447,18 @@ class DP(nn.Module):
         r_shared, r_specific = {}, {}
         for m in u_consensus:
             # u_c = 0.5 * (u_consensus[m] + u_cycle_c[m])
-            # u_s = 0.5 * (u_neighbor[m] + u_cycle_s[m])
+            # u_s = 0.5 * (u_specific[m] + u_cycle_s[m])
             u_c = u_consensus[m]
-            u_s = u_neighbor[m]
-            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=self.r_min, max=1.0)
-            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=self.r_min, max=1.0)
+            u_s = u_specific[m]
+            r_c = torch.clamp(torch.exp(-u_c / self.tau_c), min=1e-4, max=1.0)
+            r_s = torch.clamp(torch.exp(-u_s / self.tau_s), min=1e-4, max=1.0)
             r_shared[m] = r_c.detach()      # stop-gradient
             r_specific[m] = r_s.detach()     # stop-gradient
         return r_shared, r_specific
 
-    # def _reliability_weighted_shared_fusion(self, c_att_dict, r_shared):
-    #     """
-    #     Uncertainty-aware shared fusion (closed-form weighted average).
-    #
-    #     Formula:
-    #         h̄^c = Σ_m [ r_m^c / (Σ_n r_n^c) * h_m^{c,att} ]
-    #
-    #     For backbone compatibility the output is a concat of per-modality
-    #     reliability-scaled features: each modality is multiplied by its
-    #     normalized weight w_m = r_m^c / Σ_n r_n^c, then concatenated to
-    #     keep the (B, 3*D) shape expected by the downstream projection layer.
-    #
-    #     Args:
-    #         c_att_dict: dict m → (B, D) — self-attention shared output
-    #         r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
-    #     Returns:
-    #         c_fusion: (B, 3*D) — reliability-scaled concat
-    #     """
-    #     modalities = list(c_att_dict.keys())
-    #
-    #     # Normalized reliability weights w_m = r_m / Σ_n r_n
-    #     r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
-    #     r_sum = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)         # (B, 1)
-    #     w = r_stack / r_sum                                               # (B, |M|)
-    #     # w is already detached because r_shared is stop-gradient
-    #
-    #     reweighted = []
-    #     for i, m in enumerate(modalities):
-    #         wi = w[:, i].unsqueeze(1)            # (B, 1)
-    #         reweighted.append(wi * c_att_dict[m])  # (B, D)
-    #
-    #     return torch.cat(reweighted, dim=1)  # (B, 3*D)
-
-    # def _calibrate_cross_attention(self, h_m, h_cross, r_specific, m_query, m_kv):
-    #     """
-    #     Reliability-aware complementary exchange for specific representations.
-    #
-    #     Closed-form solution of:
-    #         tilde_h_{m←n} = argmin_x [ r_m ||x - h_m||^2 + r_n ||x - b_{m←n}||^2 ]
-    #
-    #     which gives:
-    #         tilde_h_{m←n} = (r_m * h_m + r_n * b_{m←n}) / (r_m + r_n)
-    #
-    #     A reliable sender (high r_n) exerts stronger influence; a reliable
-    #     receiver (high r_m) is less affected by potentially noisy messages.
-    #
-    #     Args:
-    #         h_m:         (T, B, D) — receiver's own specific representation
-    #         h_cross:     (T, B, D) — cross-attention message b_{m←n}
-    #         r_specific:  dict m → (B,) — specific reliability (stop-grad)
-    #         m_query:     str — receiver modality key (m)
-    #         m_kv:        str — sender modality key (n)
-    #     Returns:
-    #         h_calibrated: (T, B, D)
-    #     """
-    #     r_m = r_specific[m_query].unsqueeze(0).unsqueeze(2)  # (1, B, 1)
-    #     r_n = r_specific[m_kv].unsqueeze(0).unsqueeze(2)     # (1, B, 1)
-    #     denom = (r_m + r_n).clamp(min=1e-8)
-    #     return (r_m * h_m + r_n * h_cross) / denom
-
     # ==================================================================
     # Reliability-Aware Information Flow (Section 3.X)
     # ==================================================================
-
-    def _reliability_gated_consensus(self, c_att_dict, r_shared):
-        """
-        Reliability-gated consensus for shared representations.
-
-        Joint reliability gate:
-            γ^{c,i} = 1 - Π_{m ∈ M} (1 - r_m^{c,i})
-
-        Consensus representation (closed-form):
-            h̄^{c,i} = γ^{c,i} * Σ_m [ r_m^{c,i} / Σ_n r_n^{c,i} ] * h_m^{c,i}
-
-        When all modalities have low reliability, γ suppresses the overall
-        shared message instead of allowing normalization to restore magnitude.
-
-        For backbone compatibility the output keeps (B, 3*D) shape: each
-        modality slot receives γ * w_m * h_m^c so that the downstream
-        projection layer remains compatible.
-
-        Args:
-            c_att_dict: dict m → (B, D) — self-attention shared output
-            r_shared:   dict m → (B,) — shared reliability weights (stop-grad)
-        Returns:
-            c_fusion: (B, 3*D) — reliability-gated concat
-        """
-        modalities = list(c_att_dict.keys())
-        M = len(modalities)  # number of modalities (3)
-
-        # Joint reliability gate: γ^c = 1 - Π_m (1 - r_m^c)
-        gamma_c = torch.ones_like(r_shared[modalities[0]])  # (B,)
-        for m in modalities:
-            gamma_c = gamma_c * (1.0 - r_shared[m])         # accumulate product
-        gamma_c = 1.0 - gamma_c                             # (B,)
-
-        # Total shared reliability: R^c = Σ_m r_m^c
-        r_stack = torch.stack([r_shared[m] for m in modalities], dim=1)  # (B, |M|)
-        R_c = r_stack.sum(dim=1, keepdim=True).clamp(min=1e-8)           # (B, 1)
-
-        gamma_c_expand = gamma_c.unsqueeze(1)  # (B, 1)
-
-        # ĥ_m = M * γ^c * (r_m^c / R^c) * h_m^{c,att}
-        # When r_l=r_v=r_a=1: γ=1, M*(1/3)=1 → recovers original concat
-        reweighted = []
-        for i, m in enumerate(modalities):
-            r_m = r_stack[:, i].unsqueeze(1)                  # (B, 1)
-            scale = M * gamma_c_expand * r_m / R_c            # (B, 1)
-            reweighted.append(scale * c_att_dict[m])          # (B, D)
-
-        return torch.cat(reweighted, dim=1)  # (B, 3*D)
 
     def _reliability_gated_consensus_sum(self, c_att_dict, r_shared):
         """
@@ -736,46 +548,35 @@ class DP(nn.Module):
         # h̃ = h_m + β * (b_{m←n} - h_m)
         return h_m + beta * (b_cross - h_m)
 
-    def compute_conflict_weights(self, h_l, h_v, h_a):
+    def _align_time_attention(self, h_src, p_tgt):
         """
-        Conflict-Aware Weighting (CAW) strategy (Section 3.2).
-        
-        Computes per-sample conflict scores from shared features and maps
-        them to cross-reconstruction weights via exponential decay.
-        
+        Dynamically aligns source shared feature h_src to target sequence length
+        via non-parametric soft cross-attention (Query = p_tgt, Key/Value = h_src).
+        Preserves 100% of source temporal information without interpolation artifacts.
+
         Args:
-            h_l: (B, d) global shared feature for language (temporal-pooled)
-            h_v: (B, d) global shared feature for visual
-            h_a: (B, d) global shared feature for audio
+            h_src: (B, d, T_src) — source shared feature
+            p_tgt: (B, d, T_tgt) — target specific feature
         Returns:
-            w_l, w_v, w_a: (B,) per-sample weights for each modality
+            h_aligned: (B, d, T_tgt) — aligned shared feature matching T_tgt
         """
-        # Normalize for cosine similarity
-        h_l_norm = F.normalize(h_l, dim=-1)
-        h_v_norm = F.normalize(h_v, dim=-1)
-        h_a_norm = F.normalize(h_a, dim=-1)
+        if h_src.shape[-1] == p_tgt.shape[-1]:
+            return h_src
 
-        # Pairwise cosine similarities
-        s_lv = (h_l_norm * h_v_norm).sum(dim=-1)  # (B,)
-        s_la = (h_l_norm * h_a_norm).sum(dim=-1)
-        s_va = (h_v_norm * h_a_norm).sum(dim=-1)
+        # q: (B, T_tgt, d), k: (B, T_src, d), v: (B, T_src, d)
+        q = p_tgt.transpose(1, 2)
+        k = h_src.transpose(1, 2)
+        v = k
 
-        # Conflict scores: d_{m,n} = 1 - s_{m,n}
-        d_lv = 1.0 - s_lv
-        d_la = 1.0 - s_la
-        d_va = 1.0 - s_va
+        d_k = q.size(-1)
+        # Scaled dot-product attention scores: (B, T_tgt, T_src)
+        attn_scores = torch.bmm(q, k.transpose(1, 2)) / (d_k ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
 
-        # Overall conflict score per modality: C_m = mean of d_{m,n} for n != m
-        c_l = (d_lv + d_la) / 2.0  # (B,)
-        c_v = (d_lv + d_va) / 2.0
-        c_a = (d_la + d_va) / 2.0
+        # Weighted combination of ALL T_src frames: (B, T_tgt, d)
+        h_aligned = torch.bmm(attn_weights, v)
 
-        # Exponential decay: ω̂_m = exp(-C_m / τ), ω_m = max(ω̂_m, ω_min)
-        w_l = torch.exp(-c_l / self.tau).clamp(min=self.omega_min)
-        w_v = torch.exp(-c_v / self.tau).clamp(min=self.omega_min)
-        w_a = torch.exp(-c_a / self.tau).clamp(min=self.omega_min)
-
-        return w_l, w_v, w_a
+        return h_aligned.transpose(1, 2)  # (B, d, T_tgt)
 
     def forward(self, text, audio, video, text_c, audio_c, video_c):
         if self.use_bert:
@@ -820,26 +621,32 @@ class DP(nn.Module):
         #   X̃_{nm} = D_{nm}([H_n ⊕ P_m])
         #   X̃_m = F_m(X̃_{n1,m}, X̃_{n2,m})
         # ==============================================================
-        # For target L: use shared from V and A + specific from L
-        x_tilde_vl = self.decoder_vl(torch.cat([c_v, s_l.expand_as(c_v)], dim=1))  # (B, d, T_v)
-        x_tilde_al = self.decoder_al(torch.cat([c_a, s_l.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        # For target L: use shared from V and A (aligned to T_l) + specific from L
+        c_v_l = self._align_time_attention(c_v, s_l)
+        c_a_l = self._align_time_attention(c_a, s_l)
+        x_tilde_vl = self.decoder_vl(torch.cat([c_v_l, s_l], dim=1))  # (B, d, T_l)
+        x_tilde_al = self.decoder_al(torch.cat([c_a_l, s_l], dim=1))  # (B, d, T_l)
         x_tilde_l = self.fusion_l(
             torch.cat([x_tilde_vl.permute(0, 2, 1), x_tilde_al.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_l)
 
-        # For target V: use shared from L and A + specific from V
-        x_tilde_lv = self.decoder_lv(torch.cat([c_l, s_v.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_av = self.decoder_av(torch.cat([c_a, s_v.expand_as(c_a)], dim=1))  # (B, d, T_a)
+        # For target V: use shared from L and A (aligned to T_v) + specific from V
+        c_l_v = self._align_time_attention(c_l, s_v)
+        c_a_v = self._align_time_attention(c_a, s_v)
+        x_tilde_lv = self.decoder_lv(torch.cat([c_l_v, s_v], dim=1))  # (B, d, T_v)
+        x_tilde_av = self.decoder_av(torch.cat([c_a_v, s_v], dim=1))  # (B, d, T_v)
         x_tilde_v = self.fusion_v(
             torch.cat([x_tilde_lv.permute(0, 2, 1), x_tilde_av.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_v)
 
-        # For target A: use shared from L and V + specific from A
-        x_tilde_la = self.decoder_la(torch.cat([c_l, s_a.expand_as(c_l)], dim=1))  # (B, d, T_l)
-        x_tilde_va = self.decoder_va(torch.cat([c_v, s_a.expand_as(c_v)], dim=1))  # (B, d, T_v)
+        # For target A: use shared from L and V (aligned to T_a) + specific from A
+        c_l_a = self._align_time_attention(c_l, s_a)
+        c_v_a = self._align_time_attention(c_v, s_a)
+        x_tilde_la = self.decoder_la(torch.cat([c_l_a, s_a], dim=1))  # (B, d, T_a)
+        x_tilde_va = self.decoder_va(torch.cat([c_v_a, s_a], dim=1))  # (B, d, T_a)
         x_tilde_a = self.fusion_a(
             torch.cat([x_tilde_la.permute(0, 2, 1), x_tilde_va.permute(0, 2, 1)], dim=-1)
-        ).permute(0, 2, 1)  # (B, d, T)
+        ).permute(0, 2, 1)  # (B, d, T_a)
 
         # Re-disentangle reconstructed features (Eq. 9):
         #   H̃_m = E_H(X̃_m),  P̃_m = E_P^m(X̃_m)
@@ -852,54 +659,58 @@ class DP(nn.Module):
         p_tilde_a = self.encoder_s_a(x_tilde_a)
 
         # ==============================================================
-        # Conflict-Aware Weighting (CAW) (Section 3.2) — commented out,
-        # already covered by existing uncertainty (u_shared)
-        # ==============================================================
-        # c_l_global = c_l.mean(dim=2)  # (B, d)
-        # c_v_global = c_v.mean(dim=2)
-        # c_a_global = c_a.mean(dim=2)
-        # w_l, w_v, w_a = self.compute_conflict_weights(c_l_global, c_v_global, c_a_global)
-
-        # ==============================================================
         # Online Uncertainty Computation
         # ==============================================================
-        # Pool + normalize shared and specific features (Conv1d format: B,D,T)
-        z_c = {
-            'l': self._pool_norm(c_l),  # (B, D)
-            'v': self._pool_norm(c_v),
-            'a': self._pool_norm(c_a),
+        # Unnormalized mean-pooled features (Conv1d format: B,D,T → B,D)
+        c_bar = {
+            'l': c_l.mean(dim=2),  # (B, D) — NOT L2-normalized
+            'v': c_v.mean(dim=2),
+            'a': c_a.mean(dim=2),
         }
-        z_s = {
-            'l': self._pool_norm(s_l),  # (B, D)
-            'v': self._pool_norm(s_v),
-            'a': self._pool_norm(s_a),
+        s_bar = {
+            'l': s_l.mean(dim=2),  # (B, D) — NOT L2-normalized
+            'v': s_v.mean(dim=2),
+            'a': s_a.mean(dim=2),
         }
 
-        # Shared consensus uncertainty: u_m^c = 1 - (1/(|M|-1)) Σ_{n≠m} cos(z_m^c, z_n^c)
-        u_consensus = self._shared_consensus(z_c)
-        # Specific neighbor uncertainty: u_m^s via leave-one-out KNN
-        # Use train-set memory bank if populated, otherwise fall back to in-batch KNN
-        if self._train_bank_z_c and all(m in self._train_bank_z_c for m in ['l', 'v', 'a']):
-            u_neighbor = self._neighbor_uncertainty_bank(z_c, z_s, self.K_neighbors)
-        else:
-            u_neighbor = self._neighbor_uncertainty(z_c, z_s, self.K_neighbors)
+        # Shared uncertainty: ABTT Consensus
+        # u_m^c = 1 - (z̊_m^c)^T Norm(Σ_{n≠m} z̊_n^c)
+        u_consensus = self._shared_consensus(c_bar)
+        # Specific uncertainty: ABTT Neighbor Support
+        # u_m^s = 1 - (1/K) Σ_{j∈N_K} (z̊_m^s)^T ẑ_{m,j}^{s,bank}
+        u_specific = self._specific_uncertainty(s_bar)
 
         # Reliability scores (all stop-gradient): r = clamp(exp(-u/tau), r_min, 1)
         r_shared, r_specific = self._compute_reliability(
-            u_consensus, None, u_neighbor, None
+            u_consensus, None, u_specific, None
         )
 
-        # ==============================================================
-        # Fine-grained Sentiment Refinement (FSR) (Section 3.4)
-        #   Using original P_m (specific) features
-        #   — commented out for now, testing CRM first
-        # ==============================================================
-        # # Convert specific features to (T, B, D) for FSR
-        # s_l_seq = s_l.permute(2, 0, 1)  # (T, B, D)
-        # s_v_seq = s_v.permute(2, 0, 1)
-        # s_a_seq = s_a.permute(2, 0, 1)
-        # s_l_prime, s_v_prime, s_a_prime = self.fsr(s_l_seq, s_v_seq, s_a_seq)
-        # # s_l_prime: (T, B, d), s_v_prime: (T, B, d), s_a_prime: (T, B, d)
+        # ── Role-conditioned reliability routing ──
+        # Re-assign r_shared / r_specific based on ablation mode.
+        # After this block, r_shared is fed to shared-consensus,
+        # r_specific is fed to specific-exchange.
+        if self.reliability_mode == 'uniform':
+            # r^c = r^s = 1 → no reliability gating at all
+            ones = {m: torch.ones_like(r_shared[m]) for m in r_shared}
+            r_shared, r_specific = ones, {m: v.clone() for m, v in ones.items()}
+        elif self.reliability_mode == 'shared_only':
+            # Both modules use r^c
+            r_specific = {m: r_shared[m].clone() for m in r_shared}
+        elif self.reliability_mode == 'specific_only':
+            # Both modules use r^s
+            r_shared = {m: r_specific[m].clone() for m in r_specific}
+        elif self.reliability_mode == 'averaged':
+            # Both modules use (r^c + r^s) / 2
+            avg = {m: ((r_shared[m] + r_specific[m]) / 2.0).detach() for m in r_shared}
+            r_shared = avg
+            r_specific = {m: v.clone() for m, v in avg.items()}
+        elif self.reliability_mode == 'swapped':
+            # Role-swapped: shared module gets r^s, specific module gets r^c
+            r_shared, r_specific = (
+                {m: r_specific[m].clone() for m in r_specific},
+                {m: r_shared[m].clone() for m in r_shared},
+            )
+        # elif self.reliability_mode == 'full':  → default, no change needed
 
         # ==============================================================
         # Permute to (T, B, D) for transformer layers
@@ -955,17 +766,11 @@ class DP(nn.Module):
         c_a_att = c_a_att[-1]
 
         c_att_dict = {'l': c_l_att, 'v': c_v_att, 'a': c_a_att}
-        # --- OLD: plain concat (no reliability gating) ---
-        # c_fusion = torch.cat([c_l_att, c_v_att, c_a_att], dim=1)  # (B, 3*D)
-        # --- OLD: simple reliability-weighted fusion ---
-        # c_fusion = self._reliability_weighted_shared_fusion(c_att_dict, r_shared)  # (B, 3*D)
-        # --- OLD: reliability-gated consensus (concat version, scale per slot) ---
-        # c_fusion = self._reliability_gated_consensus(c_att_dict, r_shared)  # (B, 3*D)
-        # --- NEW: reliability-gated consensus (sum version, single vector) ---
         if self.ablate_shared_cal:
             # Ablation: equal-weight mean (no reliability gating)
             c_fusion = (c_att_dict['l'] + c_att_dict['v'] + c_att_dict['a']) / 3.0  # (B, D)
         else:
+            # Reliability-gated consensus (sum version, single vector)
             c_fusion = self._reliability_gated_consensus_sum(c_att_dict, r_shared)  # (B, D)
 
         c_proj = self.proj2_c(
@@ -984,10 +789,6 @@ class DP(nn.Module):
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)  # (T, B, D): b_{l←a}
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  # (T, B, D): b_{l←v}
         if not self.ablate_specific_cal:
-            # # --- OLD: simple weighted average calibration ---
-            # h_l_with_as = self._calibrate_cross_attention(s_l, h_l_with_as, r_specific, 'l', 'a')
-            # h_l_with_vs = self._calibrate_cross_attention(s_l, h_l_with_vs, r_specific, 'l', 'v')
-            # # --- NEW: reliability-gated complementary exchange ---
             h_l_with_as = self._reliability_gated_complementary_exchange(s_l, h_l_with_as, r_specific, 'l', 'a')
             h_l_with_vs = self._reliability_gated_complementary_exchange(s_l, h_l_with_vs, r_specific, 'l', 'v')
         h_ls = torch.cat([h_l_with_as, h_l_with_vs], dim=2)
@@ -1000,10 +801,6 @@ class DP(nn.Module):
         h_a_with_ls = self.trans_a_with_l(s_a, s_l, s_l)  # (T, B, D): b_{a←l}
         h_a_with_vs = self.trans_a_with_v(s_a, s_v, s_v)  # (T, B, D): b_{a←v}
         if not self.ablate_specific_cal:
-            # # --- OLD: simple weighted average calibration ---
-            # h_a_with_ls = self._calibrate_cross_attention(s_a, h_a_with_ls, r_specific, 'a', 'l')
-            # h_a_with_vs = self._calibrate_cross_attention(s_a, h_a_with_vs, r_specific, 'a', 'v')
-            # # --- NEW: reliability-gated complementary exchange ---
             h_a_with_ls = self._reliability_gated_complementary_exchange(s_a, h_a_with_ls, r_specific, 'a', 'l')
             h_a_with_vs = self._reliability_gated_complementary_exchange(s_a, h_a_with_vs, r_specific, 'a', 'v')
         h_as = torch.cat([h_a_with_ls, h_a_with_vs], dim=2)
@@ -1016,10 +813,6 @@ class DP(nn.Module):
         h_v_with_ls = self.trans_v_with_l(s_v, s_l, s_l)  # (T, B, D): b_{v←l}
         h_v_with_as = self.trans_v_with_a(s_v, s_a, s_a)  # (T, B, D): b_{v←a}
         if not self.ablate_specific_cal:
-            # # --- OLD: simple weighted average calibration ---
-            # h_v_with_ls = self._calibrate_cross_attention(s_v, h_v_with_ls, r_specific, 'v', 'l')
-            # h_v_with_as = self._calibrate_cross_attention(s_v, h_v_with_as, r_specific, 'v', 'a')
-            # --- NEW: reliability-gated complementary exchange ---
             h_v_with_ls = self._reliability_gated_complementary_exchange(s_v, h_v_with_ls, r_specific, 'v', 'l')
             h_v_with_as = self._reliability_gated_complementary_exchange(s_v, h_v_with_as, r_specific, 'v', 'a')
         h_vs = torch.cat([h_v_with_ls, h_v_with_as], dim=2)
@@ -1043,24 +836,6 @@ class DP(nn.Module):
                       training=self.training))
         hs_proj_a_high += last_h_a
         logits_a_high = self.out_layer_a_high(hs_proj_a_high)
-
-        # ==============================================================
-        # Shared branch: self-attention on H̃ (re-disentangled shared features)
-        #   — commented out for now, testing CRM first
-        # ==============================================================
-        # h_tilde_l_seq = h_tilde_l.permute(2, 0, 1)  # (T, B, d)
-        # h_tilde_v_seq = h_tilde_v.permute(2, 0, 1)
-        # h_tilde_a_seq = h_tilde_a.permute(2, 0, 1)
-        # h_tilde_concat = torch.cat([h_tilde_l_seq, h_tilde_v_seq, h_tilde_a_seq], dim=2)
-        # t_h_tilde = self.trans_shared(h_tilde_concat)
-        # if type(t_h_tilde) == tuple:
-        #     t_h_tilde = t_h_tilde[0]
-        # t_h_tilde_last = t_h_tilde[-1]  # (B, 3d)
-        # hs_shared = self.proj2_shared(
-        #     F.dropout(F.relu(self.proj1_shared(t_h_tilde_last), inplace=True),
-        #               p=self.output_dropout, training=self.training))
-        # hs_shared += t_h_tilde_last
-        # logits_shared = self.out_layer_shared(hs_shared)
 
         last_h_l = torch.sigmoid(self.weight_l(last_h_l))
         last_h_v = torch.sigmoid(self.weight_v(last_h_v))
@@ -1225,26 +1000,3 @@ class DP(nn.Module):
 
         loss_cpa /= 6.0  # average over 6 cross-modal pairs
         return loss_cpa
-
-    # def compute_push_loss(self, margin=2.0):
-    #     """
-    #     Compute L_push: margin-based prototype separation loss.
-    #     L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     Encourages prototypes to be at least sqrt(margin) apart in L2 distance.
-    #     """
-    #     C = F.normalize(self.prototypes.weight, dim=1, p=2)  # (K, D)
-    #     K = C.shape[0]
-
-    #     # Pairwise squared L2 distances
-    #     # ||c_i - c_j||^2 = ||c_i||^2 + ||c_j||^2 - 2 * c_i^T c_j
-    #     # Since C is L2-normalized: ||c_i||^2 = 1
-    #     dots = C @ C.t()  # (K, K)
-    #     sq_dists = 2.0 - 2.0 * dots  # (K, K)
-
-    #     # Mask out diagonal
-    #     mask = ~torch.eye(K, dtype=torch.bool, device=C.device)
-    #     sq_dists_off = sq_dists[mask]  # K*(K-1)
-
-    #     # L_push = (1 / K(K-1)) * sum_{i!=j} max(0, m - ||c_i - c_j||^2)
-    #     loss_push = torch.clamp(margin - sq_dists_off, min=0.0).sum() / (K * (K - 1))
-    #     return loss_push
