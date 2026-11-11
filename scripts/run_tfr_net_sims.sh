@@ -9,7 +9,7 @@
 #   ./scripts/run_tfr_net_sims.sh 0 ./data "1111" 16
 #
 #   # Run 5 seeds (1111 to 1115):
-#   ./scripts/run_tfr_net_sims.sh 0 ./data "1111 1112 1113 1114 1115" 128
+#   ./scripts/run_tfr_net_sims.sh 0 ./data "1111 1112 1113 1114 1115" 64
 # ==============================================================================
 
 set -e
@@ -17,7 +17,7 @@ set -e
 GPU_ID=${1:-0}
 DATA_DIR=${2:-./data}
 SEEDS_ARG=${3:-"1111 1112 1113 1114 1115"}
-BATCH_SIZE=${4:-128}
+BATCH_SIZE=${4:-64}
 DATASET="sims"
 
 # Split seeds argument into array

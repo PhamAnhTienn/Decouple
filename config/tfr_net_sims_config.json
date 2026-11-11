@@ -44,7 +44,7 @@
     "cls_hidden_dim":  128,
     "cls_dropout":  0.1,
     "grad_clip":  0.8,
-    "batch_size":  128,
+    "batch_size":  64,
     "learning_rate_bert":  1E-05,
     "learning_rate_other":  0.002,
     "patience":  10,

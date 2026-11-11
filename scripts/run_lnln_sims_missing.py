@@ -24,6 +24,12 @@ def parse_args():
     )
     parser.add_argument("--python_exec", default=sys.executable)
     parser.add_argument("--num_workers", type=int, default=0 if os.name == "nt" else 4)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Training batch size (default: 64)",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Print commands without running")
     return parser.parse_args()
 
@@ -54,6 +60,7 @@ def main():
                 "--seeds", str(seed),
                 "--gpu_ids", *map(str, args.gpu_ids),
                 "--num_workers", str(args.num_workers),
+                "--batch_size", str(args.batch_size),
                 "--model_save_dir", str(repo_root / "pt" / seed_dir),
                 "--res_save_dir", str(repo_root / "result" / seed_dir),
                 "--log_dir", str(repo_root / "log" / seed_dir),
