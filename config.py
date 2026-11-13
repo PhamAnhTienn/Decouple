@@ -137,7 +137,7 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
         }
     elif dataset_name.lower() == 'sims':
         chsims_path = os.path.join(data_dir, 'CH-SIMS/chsims.pkl')
-        mmsa_path = os.path.join(data_dir, 'SIMS/Processed/unaligned_39.pkl')
+        mmsa_path = os.path.join(data_dir, 'SIMS/unaligned_39.pkl')
         dataset_config = {
             # DecAlign README uses CH-SIMS/chsims.pkl, while MMSA stores the same
             # preprocessed feature file as SIMS/Processed/unaligned_39.pkl.
@@ -194,6 +194,8 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
     else:
         dataset_config = {}
 
+    default_config.update(dataset_config)
+    
     # Load from file if exists
     if config_file and os.path.exists(config_file):
         try:
@@ -205,7 +207,6 @@ def get_config_regression(model_name, dataset_name, config_file="", data_dir=Non
 
     # Dataset paths and task contracts should remain stable even when the
     # shared config file supplies model hyperparameters.
-    default_config.update(dataset_config)
     default_config['model_name'] = model_name.lower()
     default_config['dataset_name'] = dataset_name.lower()
 
