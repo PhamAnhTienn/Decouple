@@ -503,7 +503,7 @@ class MIDAS(nn.Module):
 
         # ── Prediction head ──────────────────────────────────────────
         classifier_hidden = [int(d_model), int(d_model / 2)]
-        output_size = getattr(args, 'num_classes', 1)
+        output_size = getattr(args, 'num_classes', 1) if getattr(args, 'train_mode', 'regression') == 'classification' else 1
         self.TVA_decoder = Classifier(int(d_model * 3), classifier_hidden, output_size, 0.0)
 
         # ── Loss functions (kept inside model for trainer access) ─────
