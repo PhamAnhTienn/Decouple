@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,42 +9,49 @@ import matplotlib.pyplot as plt
 mosi_df = pd.read_csv('result/normal/mosi-final.csv')
 mosei_df = pd.read_csv('result/normal/mosei-final.csv')
 
+# Load midas from report_grouped_mosi.csv if not present in mosi_df
+if 'midas' not in mosi_df['Model'].unique() and os.path.exists('result/normal/report_grouped_mosi.csv'):
+    grouped_df = pd.read_csv('result/normal/report_grouped_mosi.csv')
+    midas_rows = grouped_df[grouped_df['Model'] == 'midas']
+    mosi_df = pd.concat([mosi_df, midas_rows], ignore_index=True)
+
 # Normalize model names
 for df in [mosi_df, mosei_df]:
-    df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net'})
+    df['Model'] = df['Model'].replace({'tfr_net': 'tfr-net', 'sarm': 'dp', 'mirror': 'dp', 'MIDAS': 'midas'})
 
 # ---------------------------------------------------------------------------
-# 1b. Mock SIMS data (no real CSV yet)
+# 1b. Mock SIMS data (no real CSV yet) - COMMENTED OUT
 # ---------------------------------------------------------------------------
-_rng = np.random.RandomState(42)
-_missing_rates = np.arange(0.0, 0.8 + 1e-9, 0.1).round(2)
-_sims_rows = []
-for model in ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']:
-    for mr in _missing_rates:
-        # Baseline F1 and MAE that degrade with missing rate; model-specific offsets
-        offsets = {
-            'decalign': (82, 52), 'dp': (80, 54), 'lnln': (78, 56),
-            'dmd': (76, 58), 'dar': (74, 60), 'misa': (72, 62),
-            'tfr-net': (70, 64),
-        }
-        f1_base, mae_base = offsets[model]
-        f1_val = f1_base - 18 * mr + _rng.normal(0, 1.0)
-        mae_val = mae_base + 15 * mr + _rng.normal(0, 0.8)
-        _sims_rows.append({
-            'Model': model,
-            'Missing Rate': mr,
-            'F1_score Mean': f1_val,
-            'MAE Mean': mae_val,
-        })
-sims_df = pd.DataFrame(_sims_rows)
+# _rng = np.random.RandomState(42)
+# _missing_rates = np.arange(0.0, 0.8 + 1e-9, 0.1).round(2)
+# _sims_rows = []
+# for model in ['decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp']:
+#     for mr in _missing_rates:
+#         # Baseline F1 and MAE that degrade with missing rate; model-specific offsets
+#         offsets = {
+#             'decalign': (82, 52), 'dp': (80, 54), 'lnln': (78, 56),
+#             'dmd': (76, 58), 'dar': (74, 60), 'misa': (72, 62),
+#             'tfr-net': (70, 64),
+#         }
+#         f1_base, mae_base = offsets[model]
+#         f1_val = f1_base - 18 * mr + _rng.normal(0, 1.0)
+#         mae_val = mae_base + 15 * mr + _rng.normal(0, 0.8)
+#         _sims_rows.append({
+#             'Model': model,
+#             'Missing Rate': mr,
+#             'F1_score Mean': f1_val,
+#             'MAE Mean': mae_val,
+#         })
+# sims_df = pd.DataFrame(_sims_rows)
 
 # ---------------------------------------------------------------------------
-# 2. Model order and color palette (unchanged from original)
+# 2. Model order and color palette
 # ---------------------------------------------------------------------------
-# SARM uses the dark blue #4e79a7
+# MIRROR uses the dark blue #4e79a7
+# MIDAS uses Okabe-Ito black #000000 (CVPR colorblind-safe, high contrast)
 # ---------------------------------------------------------------------------
 desired_model_order = [
-    'decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'dp'
+    'decalign', 'dmd', 'lnln', 'tfr-net', 'misa', 'dar', 'midas', 'dp'
 ]
 
 style_map = {
@@ -53,7 +61,10 @@ style_map = {
     'tfr-net':  {'label': 'TFR-Net',  'color': '#76b7b2', 'zorder': 5},
     'misa':     {'label': 'MISA',     'color': '#b07aa1', 'zorder': 6},
     'dar':      {'label': 'DAR',      'color': '#ababab', 'zorder': 7},
-    'dp':       {'label': 'SARM',     'color': '#4e79a7', 'zorder': 11},
+    'midas':    {'label': 'MIDAS',    'color': '#555555', 'zorder': 7},
+    'dp':       {'label': 'MIRROR',   'color': '#4e79a7', 'zorder': 11},
+    'sarm':     {'label': 'MIRROR',   'color': '#4e79a7', 'zorder': 11},
+    'mirror':   {'label': 'MIRROR',   'color': '#4e79a7', 'zorder': 11},
 }
 
 # ---------------------------------------------------------------------------
@@ -81,7 +92,7 @@ def aggregate_data(df):
 
 mosi_agg, mosi_models = aggregate_data(mosi_df)
 mosei_agg, mosei_models = aggregate_data(mosei_df)
-sims_agg, sims_models = aggregate_data(sims_df)
+# sims_agg, sims_models = aggregate_data(sims_df)
 
 # ---------------------------------------------------------------------------
 # 4. CVPR two-column (narrow) configuration from paper_style.py
@@ -103,7 +114,8 @@ WSPACE = 0.19
 AX_H   = COL_W * 0.40   # chiều cao thật của MỖI panel (inch)
 
 TOP_IN = EDGE + LEG_H + GAP + TITLE
-FIG_H  = TOP_IN + BOT + AX_H * (3 + 2 * HSPACE)
+FIG_H  = TOP_IN + BOT + AX_H * (2 + 1 * HSPACE)
+# FIG_H  = TOP_IN + BOT + AX_H * (3 + 2 * HSPACE)  # for 3 rows (MOSI, MOSEI, SIMS)
 
 # Font sizes from paper_style.py "narrow" preset
 plt.rcParams.update({
@@ -135,14 +147,15 @@ plt.rcParams.update({
 })
 
 # ---------------------------------------------------------------------------
-# 5. Figure — 3 rows × 2 cols (MOSI, MOSEI, SIMS)
+# 5. Figure — 2 rows × 2 cols (MOSI, MOSEI)
 # ---------------------------------------------------------------------------
-fig, axes = plt.subplots(3, 2, figsize=(COL_W, FIG_H), sharex=True)
+fig, axes = plt.subplots(2, 2, figsize=(COL_W, FIG_H), sharex=True)
+# fig, axes = plt.subplots(3, 2, figsize=(COL_W, FIG_H), sharex=True)
 
 mr_all = sorted(
     set(mosi_agg['Missing Rate'])
     | set(mosei_agg['Missing Rate'])
-    | set(sims_agg['Missing Rate'])
+    # | set(sims_agg['Missing Rate'])
 )
 xmin, xmax = min(mr_all), max(mr_all)
 
@@ -167,27 +180,29 @@ def plot_row(ax_f1, ax_mae, agg_df, models):
 
 plot_row(axes[0, 0], axes[0, 1], mosi_agg, mosi_models)
 plot_row(axes[1, 0], axes[1, 1], mosei_agg, mosei_models)
-plot_row(axes[2, 0], axes[2, 1], sims_agg, sims_models)
+# plot_row(axes[2, 0], axes[2, 1], sims_agg, sims_models)
 
 # --- y-limits (unchanged for MOSI / MOSEI; new for SIMS) ---
 axes[0, 0].set_ylim(32, 88);    axes[0, 0].set_yticks([40, 60, 80])
 axes[0, 1].set_ylim(0.70, 1.55); axes[0, 1].set_yticks([0.8, 1.0, 1.2, 1.4])
 axes[1, 0].set_ylim(55, 90);    axes[1, 0].set_yticks([60, 70, 80])
 axes[1, 1].set_ylim(0.50, 0.88); axes[1, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
-axes[2, 0].set_ylim(55, 90);    axes[2, 0].set_yticks([60, 70, 80])
-axes[2, 1].set_ylim(0.50, 0.88); axes[2, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
+# axes[2, 0].set_ylim(55, 90);    axes[2, 0].set_yticks([60, 70, 80])
+# axes[2, 1].set_ylim(0.50, 0.88); axes[2, 1].set_yticks([0.55, 0.65, 0.75, 0.85])
 
 # --- panel label + dataset + metric in the title (replaces ylabel & (a)-(d) text) ---
 axes[0, 0].set_title(r'(a) MOSI: F1 $\uparrow$')
 axes[0, 1].set_title(r'(b) MOSI: MAE $\downarrow$')
 axes[1, 0].set_title(r'(c) MOSEI: F1 $\uparrow$')
 axes[1, 1].set_title(r'(d) MOSEI: MAE $\downarrow$')
-axes[2, 0].set_title(r'(e) SIMS: F1 $\uparrow$')
-axes[2, 1].set_title(r'(f) SIMS: MAE $\downarrow$')
+# axes[2, 0].set_title(r'(e) SIMS: F1 $\uparrow$')
+# axes[2, 1].set_title(r'(f) SIMS: MAE $\downarrow$')
 
 # --- x label only on bottom row ---
-for ax in axes[2]:
+for ax in axes[1]:
     ax.set_xlabel(r'Missing Rate $r$')
+# for ax in axes[2]:
+#     ax.set_xlabel(r'Missing Rate $r$')
 
 top    = 1 - TOP_IN / FIG_H
 bottom = BOT / FIG_H
