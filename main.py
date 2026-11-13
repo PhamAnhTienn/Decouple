@@ -244,6 +244,9 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate')
     parser.add_argument('--missing_rate_eval_test', type=float, default=0.0, help='Missing rate for evaluation and testing')
     parser.add_argument('--data_missing', action='store_true', help='Enable missing modality simulation')
+    parser.add_argument('--residual_calib_mode', type=str, default=None,
+                        choices=['uncalibrated', 'only_proj', 'only_soft_norm', 'full'],
+                        help='Residual geometric calibration mode (uncalibrated, only_proj, only_soft_norm, full)')
     parser.add_argument(
         '--config_override',
         action='append',
@@ -265,6 +268,7 @@ def main():
             'missing_rate_eval_test': args.missing_rate_eval_test,
             'data_missing': args.data_missing,
             'K_neighbors': args.K_neighbors,
+            'residual_calib_mode': args.residual_calib_mode,
         }.items()
         if value is not None
     })

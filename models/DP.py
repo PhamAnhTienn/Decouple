@@ -55,6 +55,19 @@ class DP(nn.Module):
         self.ablate_specific_cal = getattr(args, 'ablate_specific_calibration', False)
         self.ablate_residual_cal = getattr(args, 'ablate_residual_calibration', False)
 
+        # Residual calibration mode: 'uncalibrated', 'only_proj', 'only_soft_norm', 'full'
+        self.residual_calib_mode = getattr(args, 'residual_calib_mode', None)
+        if self.residual_calib_mode is None:
+            if self.ablate_residual_cal:
+                self.residual_calib_mode = 'uncalibrated'
+            else:
+                self.residual_calib_mode = 'full'
+        valid_calib_modes = ('uncalibrated', 'only_proj', 'only_soft_norm', 'full')
+        assert self.residual_calib_mode in valid_calib_modes, (
+            f"Invalid residual_calib_mode '{self.residual_calib_mode}'. Choose from {valid_calib_modes}"
+        )
+        self.ablate_residual_cal = (self.residual_calib_mode == 'uncalibrated')
+
         # ── Role-conditioned reliability ablation ──
         # Controls how r_shared / r_specific scores are routed to the
         # shared-consensus and specific-exchange modules.
@@ -258,32 +271,45 @@ class DP(nn.Module):
         Returns:
             dict m → (B, D) ABTT soft-normalized vectors z̊, ||z̊|| ∈ [0, 1)
         """
-        if self.ablate_residual_cal:
+        if self.residual_calib_mode == 'uncalibrated':
             # Ablation: standard unit normalization without residual projection & soft Tikhonov scaling
             return {m: F.normalize(v_bar, dim=1, eps=eps) for m, v_bar in v_bar_dict.items()}
 
         z_ring = {}
-        has_stats = bool(mu_dir_bank) and all(m in mu_dir_bank for m in v_bar_dict)
-
         for m, v_bar in v_bar_dict.items():
-            if has_stats:
-                mu_dir = mu_dir_bank[m].to(v_bar.device)                # (1, D)
-                sigma = sigma_bank[m].to(v_bar.device)                  # scalar
+            if self.residual_calib_mode == 'only_soft_norm':
+                # Ablation: Soft Tikhonov normalization without orthogonal projection
+                if sigma_bank and m in sigma_bank:
+                    sigma = sigma_bank[m].to(v_bar.device)
+                else:
+                    sigma = v_bar.detach().norm(p=2, dim=1).mean().clamp(min=eps)
+                p_norm_sq = v_bar.pow(2).sum(dim=1, keepdim=True)
+                denom = torch.sqrt(p_norm_sq + sigma.pow(2) + eps)
+                z_ring[m] = v_bar / denom
             else:
-                # Fallback in Epoch 1 before update_train_bank() runs
-                z_unit = F.normalize(v_bar.detach(), dim=1, eps=eps)
-                mu_dir = F.normalize(z_unit.mean(dim=0, keepdim=True), dim=1, eps=eps)
-                p_batch = v_bar.detach() - (v_bar.detach() * mu_dir).sum(dim=1, keepdim=True) * mu_dir
-                sigma = p_batch.norm(p=2, dim=1).mean().clamp(min=eps)
+                has_stats = bool(mu_dir_bank) and (m in mu_dir_bank)
+                if has_stats:
+                    mu_dir = mu_dir_bank[m].to(v_bar.device)                # (1, D)
+                    sigma = sigma_bank[m].to(v_bar.device) if (sigma_bank and m in sigma_bank) else None
+                else:
+                    # Fallback in Epoch 1 before update_train_bank() runs
+                    z_unit = F.normalize(v_bar.detach(), dim=1, eps=eps)
+                    mu_dir = F.normalize(z_unit.mean(dim=0, keepdim=True), dim=1, eps=eps)
+                    p_batch = v_bar.detach() - (v_bar.detach() * mu_dir).sum(dim=1, keepdim=True) * mu_dir
+                    sigma = p_batch.norm(p=2, dim=1).mean().clamp(min=eps)
 
-            # ABTT orthogonal projection
-            proj_coeff = (v_bar * mu_dir).sum(dim=1, keepdim=True)      # (B, 1)
-            p_m = v_bar - proj_coeff * mu_dir                           # (B, D)
+                # ABTT orthogonal projection
+                proj_coeff = (v_bar * mu_dir).sum(dim=1, keepdim=True)      # (B, 1)
+                p_m = v_bar - proj_coeff * mu_dir                           # (B, D)
 
-            # Soft Tikhonov normalization into unit ball
-            p_norm_sq = p_m.pow(2).sum(dim=1, keepdim=True)             # (B, 1)
-            denom = torch.sqrt(p_norm_sq + sigma.pow(2) + eps)          # (B, 1)
-            z_ring[m] = p_m / denom                                     # (B, D), ||z̊|| ∈ [0, 1)
+                if self.residual_calib_mode == 'only_proj':
+                    # Ablation: Orthogonal projection + hard unit normalization
+                    z_ring[m] = F.normalize(p_m, dim=1, eps=eps)
+                else:
+                    # Full: Orthogonal projection + soft Tikhonov normalization into unit ball
+                    p_norm_sq = p_m.pow(2).sum(dim=1, keepdim=True)             # (B, 1)
+                    denom = torch.sqrt(p_norm_sq + sigma.pow(2) + eps)          # (B, 1)
+                    z_ring[m] = p_m / denom                                     # (B, D), ||z̊|| ∈ [0, 1)
 
         return z_ring
 
@@ -402,13 +428,20 @@ class DP(nn.Module):
 
         for m in ['l', 'v', 'a']:
             all_s = torch.cat(bank_s[m], dim=0)                        # (N, D)
-            if self.ablate_residual_cal:
+            all_c = torch.cat(bank_c[m], dim=0)                        # (N, D)
+            if self.residual_calib_mode == 'uncalibrated':
                 # Ablation: unit-normalized specific feature bank without residual projection
                 self._train_bank_z_s[m] = F.normalize(all_s, dim=1, eps=eps)  # (N, D)
                 continue
 
+            if self.residual_calib_mode == 'only_soft_norm':
+                # Ablation: soft norm without projection
+                self._train_sigma_c[m] = all_c.norm(p=2, dim=1).mean().clamp(min=eps)
+                self._train_sigma_s[m] = all_s.norm(p=2, dim=1).mean().clamp(min=eps)
+                self._train_bank_z_s[m] = F.normalize(all_s, dim=1, eps=eps)
+                continue
+
             # ── Shared stats (q=c) ──
-            all_c = torch.cat(bank_c[m], dim=0)                        # (N, D)
             z_c_unit = F.normalize(all_c, dim=1, eps=eps)              # (N, D)
             mu_dir_c = F.normalize(
                 z_c_unit.mean(dim=0, keepdim=True), dim=1, eps=eps

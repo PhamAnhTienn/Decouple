@@ -136,5 +136,8 @@ temp/
 transformers_cache/
 paper
 
-results
+result/
 pt/
+checkpoint/
+ablation_role_matched/
+*.crdownload
