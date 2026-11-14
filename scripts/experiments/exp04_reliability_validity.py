@@ -436,3 +436,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python scripts/experiments/exp04_reliability_validity.py \
+#     --dataset mosei \
+#     --data_dir ./ \
+#     --checkpoint_dir ./checkpoint
